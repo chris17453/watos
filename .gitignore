@@ -1,0 +1,88 @@
+# Build outputs
+/target/
+**/target/
+/output/
+*.bin
+*.EFI
+*.efi
+
+# UEFI test structure (generated)
+/uefi_test/
+
+# Rust
+Cargo.lock
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.ico
+*.svg
+*.webp
+
+# Archives and large files
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+*.rar
+*.gz
+*.bz2
+*.xz
+
+# Disk images
+*.img
+*.iso
+*.vhd
+*.vmdk
+*.qcow2
+*.raw
+
+# Firmware files
+*.fd
+
+# Object files and libraries
+*.o
+*.a
+*.so
+*.dll
+*.lib
+*.dylib
+
+# Logs
+*.log
+/ai-temp/logs/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.yml
+Dockerfile
+
+# VMware files (generated)
+/vmware/*.vmdk
+/vmware/*.nvram
+/vmware/*.vmsd
+/vmware/*.vmxf
+/vmware/*.log
+
+# DOS files (if large/binary)
+/dos-6.22/
+
+# Temporary files
+*.tmp
+*.temp

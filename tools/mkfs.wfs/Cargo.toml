@@ -1,0 +1,15 @@
+[package]
+name = "mkfs-wfs"
+version = "0.1.0"
+edition = "2021"
+description = "Create WFS (WATOS File System) disk images"
+
+[workspace]
+
+[[bin]]
+name = "mkfs_wfs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+wfs-common = { path = "../../crates/wfs-common", default-features = true }

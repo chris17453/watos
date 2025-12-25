@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="http://schemas.dmtf.org/ovf/envelope/1"
+          xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1"
+          xmlns:vssd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData"
+          xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData">
+  <References>
+    <File ovf:id="watos-disk" ovf:href="watos.vmdk"/>
+  </References>
+  <DiskSection>
+    <Info>Virtual disk</Info>
+    <Disk ovf:diskId="watos-disk" ovf:capacity="67108864" ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html"/>
+  </DiskSection>
+  <VirtualSystem ovf:id="WATOS">
+    <Info>WATOS DOS64 - 64-bit DOS-compatible OS</Info>
+    <Name>WATOS DOS64</Name>
+    <OperatingSystemSection ovf:id="100">
+      <Info>64-bit OS</Info>
+    </OperatingSystemSection>
+    <VirtualHardwareSection>
+      <Info>Virtual Hardware</Info>
+      <System>
+        <vssd:VirtualSystemType>vmx-19</vssd:VirtualSystemType>
+      </System>
+      <Item>
+        <rasd:Description>256MB RAM</rasd:Description>
+        <rasd:ResourceType>4</rasd:ResourceType>
+        <rasd:VirtualQuantity>256</rasd:VirtualQuantity>
+      </Item>
+      <Item>
+        <rasd:Description>2 vCPUs</rasd:Description>
+        <rasd:ResourceType>3</rasd:ResourceType>
+        <rasd:VirtualQuantity>2</rasd:VirtualQuantity>
+      </Item>
+    </VirtualHardwareSection>
+  </VirtualSystem>
+</Envelope>
