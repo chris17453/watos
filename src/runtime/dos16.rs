@@ -27,6 +27,26 @@ const FLAG_IF: u16 = 0x0200;  // Interrupt enable
 const FLAG_DF: u16 = 0x0400;  // Direction
 const FLAG_OF: u16 = 0x0800;  // Overflow
 
+// DOS Memory Control Block (MCB) constants
+// MCB structure (16 bytes at start of each memory block):
+//   Offset 0x00: Type - 'M' (0x4D) = more blocks, 'Z' (0x5A) = last block
+//   Offset 0x01-0x02: Owner PSP segment (0 = free, 8 = DOS)
+//   Offset 0x03-0x04: Size in paragraphs (not including MCB header)
+//   Offset 0x05-0x07: Reserved
+//   Offset 0x08-0x0F: Owner name (DOS 4+, optional)
+const MCB_TYPE_MORE: u8 = 0x4D;  // 'M' - more blocks follow
+const MCB_TYPE_LAST: u8 = 0x5A;  // 'Z' - last block in chain
+const MCB_OWNER_FREE: u16 = 0x0000;  // Free block
+const MCB_OWNER_DOS: u16 = 0x0008;   // DOS system block
+
+// Memory layout:
+// 0x00000 - 0x003FF: Interrupt Vector Table (256 vectors × 4 bytes)
+// 0x00400 - 0x005FF: BIOS Data Area + DOS Data
+// 0x00600 - onwards: First MCB, then allocatable memory
+// 0xA0000 - 0xFFFFF: Video memory, ROM, etc. (not allocatable)
+const FIRST_MCB_SEG: u16 = 0x0060;  // First MCB at segment 0x60 (linear 0x600)
+const CONV_MEM_END_SEG: u16 = 0xA000;  // Conventional memory ends at 640KB
+
 #[derive(Clone)]
 pub struct Cpu16 {
     // General purpose registers
@@ -218,6 +238,8 @@ pub struct DosTask {
     // Instruction trace/debug
     trace_enabled: bool,
     instruction_count: u64,
+    // PSP segment for this task
+    psp_seg: u16,
 }
 
 #[derive(Clone)]
@@ -242,6 +264,9 @@ impl DosTask {
 
         let mut memory = vec![0u8; 1024 * 1024]; // 1 MiB
 
+        // Initialize the MCB chain for memory management
+        Self::init_mcb_chain(&mut memory);
+
         // Check if MZ (EXE) or COM
         let is_exe = data.len() >= 2 && data[0] == b'M' && data[1] == b'Z';
         serial_write_bytes(if is_exe { b"Format: EXE\r\n" } else { b"Format: COM\r\n" });
@@ -253,26 +278,57 @@ impl DosTask {
         // Switch to the new console
         console::manager().switch_to(console_id);
 
+        let psp_seg: u16;
         if is_exe {
-            // Parse MZ header and load EXE
-            Self::load_exe(&mut memory, &mut cpu, data);
+            // Parse MZ header and load EXE with proper memory allocation
+            psp_seg = Self::load_exe(&mut memory, &mut cpu, data);
         } else {
-            // Load COM at offset 0x100
-            let load_addr = 0x100usize;
+            // For COM files, allocate memory and load at PSP:0100
+            // COM files get all available memory (we'll allocate a reasonable amount)
+            let com_paragraphs: u16 = 0x1000;  // 64KB should be enough for most COM files
+            psp_seg = FIRST_MCB_SEG + 1;  // First available segment after MCB
+
+            // Update MCB to allocate this block
+            let mcb_addr = (FIRST_MCB_SEG as usize) << 4;
+            let size = u16::from_le_bytes([memory[mcb_addr + 3], memory[mcb_addr + 4]]);
+            if size >= com_paragraphs {
+                let remaining = size - com_paragraphs - 1;
+                memory[mcb_addr] = MCB_TYPE_MORE;
+                memory[mcb_addr + 1] = (psp_seg & 0xFF) as u8;
+                memory[mcb_addr + 2] = ((psp_seg >> 8) & 0xFF) as u8;
+                memory[mcb_addr + 3] = (com_paragraphs & 0xFF) as u8;
+                memory[mcb_addr + 4] = ((com_paragraphs >> 8) & 0xFF) as u8;
+
+                // Create new free MCB
+                let new_mcb_seg = FIRST_MCB_SEG + 1 + com_paragraphs;
+                let new_mcb_addr = (new_mcb_seg as usize) << 4;
+                memory[new_mcb_addr] = MCB_TYPE_LAST;
+                memory[new_mcb_addr + 1] = 0;
+                memory[new_mcb_addr + 2] = 0;
+                memory[new_mcb_addr + 3] = (remaining & 0xFF) as u8;
+                memory[new_mcb_addr + 4] = ((remaining >> 8) & 0xFF) as u8;
+            }
+
+            // Load COM at PSP:0100
+            let psp_addr = (psp_seg as usize) << 4;
+            let load_addr = psp_addr + 0x100;
             let copy_len = core::cmp::min(data.len(), memory.len() - load_addr);
             memory[load_addr..load_addr + copy_len].copy_from_slice(&data[..copy_len]);
-            cpu.ip = 0x100;
-            // Set up segment registers for COM file
-            // All segments point to PSP segment (0x0000 for simplicity)
-            cpu.cs = 0;
-            cpu.ds = 0;
-            cpu.es = 0;
-            cpu.ss = 0;
-        }
 
-        // Set up minimal PSP at offset 0
-        memory[0] = 0xCD; // INT 20h at PSP:0000
-        memory[1] = 0x20;
+            // Set up PSP
+            memory[psp_addr] = 0xCD;  // INT 20h at PSP:0000
+            memory[psp_addr + 1] = 0x20;
+            let mem_top = psp_seg + com_paragraphs;
+            memory[psp_addr + 2] = (mem_top & 0xFF) as u8;
+            memory[psp_addr + 3] = ((mem_top >> 8) & 0xFF) as u8;
+
+            cpu.ip = 0x100;
+            cpu.cs = psp_seg;
+            cpu.ds = psp_seg;
+            cpu.es = psp_seg;
+            cpu.ss = psp_seg;
+            cpu.sp = 0xFFFE;  // Stack at top of segment
+        }
 
         DosTask {
             id,
@@ -285,7 +341,179 @@ impl DosTask {
             console_id,
             trace_enabled: true,  // Enable tracing by default for debugging
             instruction_count: 0,
+            psp_seg,
         }
+    }
+
+    // ============ MCB (Memory Control Block) Methods ============
+
+    /// Initialize the MCB chain with a single free block covering all conventional memory
+    fn init_mcb_chain(memory: &mut [u8]) {
+        // Create initial MCB at FIRST_MCB_SEG
+        let mcb_addr = (FIRST_MCB_SEG as usize) << 4;
+        // Calculate size: from (FIRST_MCB_SEG + 1) to CONV_MEM_END_SEG
+        // The MCB takes 1 paragraph, usable memory starts at FIRST_MCB_SEG + 1
+        let free_paragraphs = CONV_MEM_END_SEG - FIRST_MCB_SEG - 1;
+
+        memory[mcb_addr] = MCB_TYPE_LAST;  // 'Z' - last block
+        memory[mcb_addr + 1] = 0;  // Owner low byte (free)
+        memory[mcb_addr + 2] = 0;  // Owner high byte
+        memory[mcb_addr + 3] = (free_paragraphs & 0xFF) as u8;  // Size low
+        memory[mcb_addr + 4] = ((free_paragraphs >> 8) & 0xFF) as u8;  // Size high
+        // Bytes 5-15 are reserved/name, leave as zero
+
+        serial_write_bytes(b"MCB chain initialized: first MCB at ");
+        serial_write_hex16(FIRST_MCB_SEG);
+        serial_write_bytes(b", free paragraphs: ");
+        serial_write_hex16(free_paragraphs);
+        serial_write_bytes(b"\r\n");
+    }
+
+    /// Read MCB at given segment
+    fn read_mcb(&self, seg: u16) -> (u8, u16, u16) {
+        let addr = (seg as usize) << 4;
+        let mcb_type = self.memory[addr];
+        let owner = u16::from_le_bytes([self.memory[addr + 1], self.memory[addr + 2]]);
+        let size = u16::from_le_bytes([self.memory[addr + 3], self.memory[addr + 4]]);
+        (mcb_type, owner, size)
+    }
+
+    /// Write MCB at given segment
+    fn write_mcb(&mut self, seg: u16, mcb_type: u8, owner: u16, size: u16) {
+        let addr = (seg as usize) << 4;
+        self.memory[addr] = mcb_type;
+        self.memory[addr + 1] = (owner & 0xFF) as u8;
+        self.memory[addr + 2] = ((owner >> 8) & 0xFF) as u8;
+        self.memory[addr + 3] = (size & 0xFF) as u8;
+        self.memory[addr + 4] = ((size >> 8) & 0xFF) as u8;
+    }
+
+    /// Allocate memory block of given size in paragraphs
+    /// Returns segment of allocated block (block starts at segment + 1, MCB is at segment)
+    /// On failure, returns None and sets largest_free to the largest available block
+    fn alloc_memory(&mut self, paragraphs: u16) -> Option<u16> {
+        let mut mcb_seg = FIRST_MCB_SEG;
+
+        loop {
+            let (mcb_type, owner, size) = self.read_mcb(mcb_seg);
+
+            // Is this block free and big enough?
+            if owner == MCB_OWNER_FREE && size >= paragraphs {
+                // Found a suitable block
+                let block_seg = mcb_seg + 1;  // Usable memory starts after MCB
+
+                if size > paragraphs + 1 {
+                    // Split the block: create a new MCB after our allocation
+                    let new_mcb_seg = mcb_seg + 1 + paragraphs;
+                    let remaining = size - paragraphs - 1;  // -1 for new MCB paragraph
+
+                    // Update current MCB
+                    self.write_mcb(mcb_seg, MCB_TYPE_MORE, self.psp_seg, paragraphs);
+
+                    // Create new MCB for remaining free space
+                    self.write_mcb(new_mcb_seg, mcb_type, MCB_OWNER_FREE, remaining);
+                } else {
+                    // Use entire block (no split needed)
+                    self.write_mcb(mcb_seg, mcb_type, self.psp_seg, size);
+                }
+
+                serial_write_bytes(b"Allocated ");
+                serial_write_hex16(paragraphs);
+                serial_write_bytes(b" paragraphs at segment ");
+                serial_write_hex16(block_seg);
+                serial_write_bytes(b"\r\n");
+
+                return Some(block_seg);
+            }
+
+            // Move to next MCB
+            if mcb_type == MCB_TYPE_LAST {
+                break;  // No more blocks
+            }
+            mcb_seg = mcb_seg + size + 1;  // +1 for MCB paragraph
+        }
+
+        serial_write_bytes(b"Memory allocation failed: need ");
+        serial_write_hex16(paragraphs);
+        serial_write_bytes(b" paragraphs\r\n");
+        None
+    }
+
+    /// Free memory block at given segment
+    fn free_memory(&mut self, seg: u16) -> bool {
+        // The segment should point to a memory block, MCB is at seg - 1
+        let mcb_seg = seg.wrapping_sub(1);
+
+        if mcb_seg < FIRST_MCB_SEG {
+            return false;  // Invalid segment
+        }
+
+        let (mcb_type, _owner, size) = self.read_mcb(mcb_seg);
+
+        // Mark as free
+        self.write_mcb(mcb_seg, mcb_type, MCB_OWNER_FREE, size);
+
+        // TODO: Coalesce adjacent free blocks
+        serial_write_bytes(b"Freed memory at segment ");
+        serial_write_hex16(seg);
+        serial_write_bytes(b"\r\n");
+
+        true
+    }
+
+    /// Resize memory block at given segment
+    /// Returns true on success, false on failure (sets BX to max available)
+    fn resize_memory(&mut self, seg: u16, new_paragraphs: u16) -> Result<(), u16> {
+        let mcb_seg = seg.wrapping_sub(1);
+
+        if mcb_seg < FIRST_MCB_SEG {
+            return Err(0);
+        }
+
+        let (mcb_type, owner, current_size) = self.read_mcb(mcb_seg);
+
+        if new_paragraphs <= current_size {
+            // Shrinking - always succeeds
+            if current_size > new_paragraphs + 1 && mcb_type == MCB_TYPE_MORE {
+                // Create free block with extra space
+                let new_mcb_seg = mcb_seg + 1 + new_paragraphs;
+                let remaining = current_size - new_paragraphs - 1;
+
+                self.write_mcb(mcb_seg, MCB_TYPE_MORE, owner, new_paragraphs);
+                self.write_mcb(new_mcb_seg, mcb_type, MCB_OWNER_FREE, remaining);
+            } else {
+                self.write_mcb(mcb_seg, mcb_type, owner, new_paragraphs);
+            }
+            return Ok(());
+        }
+
+        // Growing - check if next block is free and big enough
+        if mcb_type == MCB_TYPE_MORE {
+            let next_mcb_seg = mcb_seg + current_size + 1;
+            let (next_type, next_owner, next_size) = self.read_mcb(next_mcb_seg);
+
+            if next_owner == MCB_OWNER_FREE {
+                let _extra_needed = new_paragraphs - current_size;
+                let total_available = current_size + 1 + next_size;  // +1 for absorbed MCB
+
+                if total_available >= new_paragraphs {
+                    // Can expand into next block
+                    if total_available > new_paragraphs + 1 {
+                        // Split remaining
+                        let new_mcb_seg = mcb_seg + 1 + new_paragraphs;
+                        let remaining = total_available - new_paragraphs - 1;
+                        self.write_mcb(mcb_seg, MCB_TYPE_MORE, owner, new_paragraphs);
+                        self.write_mcb(new_mcb_seg, next_type, MCB_OWNER_FREE, remaining);
+                    } else {
+                        self.write_mcb(mcb_seg, next_type, owner, total_available);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Cannot resize - return max available
+        Err(current_size)
     }
 
     /// Write a character to this task's console
@@ -302,15 +530,17 @@ impl DosTask {
         }
     }
 
-    fn load_exe(memory: &mut [u8], cpu: &mut Cpu16, data: &[u8]) {
-        if data.len() < 28 { return; }
+    /// Load an EXE file with proper memory allocation
+    /// Returns the PSP segment on success
+    fn load_exe(memory: &mut [u8], cpu: &mut Cpu16, data: &[u8]) -> u16 {
+        if data.len() < 28 { return 0; }
 
         // MZ header parsing
         let last_page_size = u16::from_le_bytes([data[2], data[3]]);
         let page_count = u16::from_le_bytes([data[4], data[5]]);
         let reloc_count = u16::from_le_bytes([data[6], data[7]]) as usize;
         let header_paras = u16::from_le_bytes([data[8], data[9]]) as usize;
-        let _min_alloc = u16::from_le_bytes([data[10], data[11]]);
+        let min_alloc = u16::from_le_bytes([data[10], data[11]]);
         let _max_alloc = u16::from_le_bytes([data[12], data[13]]);
         let init_ss = u16::from_le_bytes([data[14], data[15]]);
         let init_sp = u16::from_le_bytes([data[16], data[17]]);
@@ -319,19 +549,86 @@ impl DosTask {
         let init_cs = u16::from_le_bytes([data[22], data[23]]);
         let reloc_offset = u16::from_le_bytes([data[24], data[25]]) as usize;
 
-        // Calculate code size
+        // Calculate code size in bytes and paragraphs
         let header_size = header_paras * 16;
         let code_size = if last_page_size == 0 {
             (page_count as usize) * 512 - header_size
         } else {
             ((page_count as usize) - 1) * 512 + (last_page_size as usize) - header_size
         };
+        let code_paragraphs = ((code_size + 15) / 16) as u16;
 
-        // Load segment (after PSP)
-        let load_seg: u16 = 0x0010; // Load at segment 0x10 (linear 0x100)
+        // Total memory needed: PSP (0x10 paragraphs) + code + min_alloc
+        // min_alloc is extra memory the program needs beyond its code
+        let psp_paragraphs: u16 = 0x10;  // PSP is 256 bytes = 16 paragraphs
+        let total_paragraphs = psp_paragraphs + code_paragraphs + min_alloc;
+
+        serial_write_bytes(b"EXE memory: code=");
+        serial_write_hex16(code_paragraphs);
+        serial_write_bytes(b" min_alloc=");
+        serial_write_hex16(min_alloc);
+        serial_write_bytes(b" total=");
+        serial_write_hex16(total_paragraphs);
+        serial_write_bytes(b" paragraphs\r\n");
+
+        // Allocate memory from the MCB chain
+        // Find a free block big enough
+        let mut mcb_seg = FIRST_MCB_SEG;
+        let mut psp_seg: u16 = 0;
+
+        loop {
+            let mcb_addr = (mcb_seg as usize) << 4;
+            let mcb_type = memory[mcb_addr];
+            let owner = u16::from_le_bytes([memory[mcb_addr + 1], memory[mcb_addr + 2]]);
+            let size = u16::from_le_bytes([memory[mcb_addr + 3], memory[mcb_addr + 4]]);
+
+            if owner == MCB_OWNER_FREE && size >= total_paragraphs {
+                // Found a suitable block - allocate it
+                psp_seg = mcb_seg + 1;  // PSP starts right after MCB
+
+                if size > total_paragraphs + 1 {
+                    // Split the block
+                    let new_mcb_seg = mcb_seg + 1 + total_paragraphs;
+                    let remaining = size - total_paragraphs - 1;
+
+                    // Update current MCB (allocated to program, PSP is owner)
+                    memory[mcb_addr] = MCB_TYPE_MORE;
+                    memory[mcb_addr + 1] = (psp_seg & 0xFF) as u8;
+                    memory[mcb_addr + 2] = ((psp_seg >> 8) & 0xFF) as u8;
+                    memory[mcb_addr + 3] = (total_paragraphs & 0xFF) as u8;
+                    memory[mcb_addr + 4] = ((total_paragraphs >> 8) & 0xFF) as u8;
+
+                    // Create new free MCB for remaining space
+                    let new_mcb_addr = (new_mcb_seg as usize) << 4;
+                    memory[new_mcb_addr] = mcb_type;  // Keep original type (Z if last)
+                    memory[new_mcb_addr + 1] = 0;  // Free
+                    memory[new_mcb_addr + 2] = 0;
+                    memory[new_mcb_addr + 3] = (remaining & 0xFF) as u8;
+                    memory[new_mcb_addr + 4] = ((remaining >> 8) & 0xFF) as u8;
+                } else {
+                    // Use entire block
+                    memory[mcb_addr + 1] = (psp_seg & 0xFF) as u8;
+                    memory[mcb_addr + 2] = ((psp_seg >> 8) & 0xFF) as u8;
+                }
+
+                serial_write_bytes(b"Allocated EXE block: PSP at segment ");
+                serial_write_hex16(psp_seg);
+                serial_write_bytes(b"\r\n");
+                break;
+            }
+
+            if mcb_type == MCB_TYPE_LAST {
+                serial_write_bytes(b"ERROR: Not enough memory for EXE!\r\n");
+                return 0;
+            }
+            mcb_seg = mcb_seg + size + 1;
+        }
+
+        // Load segment is right after PSP (PSP is 0x10 paragraphs)
+        let load_seg = psp_seg + psp_paragraphs;
         let load_addr = (load_seg as usize) << 4;
 
-        // Copy code
+        // Copy code to load address
         if header_size < data.len() {
             let code_start = header_size;
             let code_end = core::cmp::min(code_start + code_size, data.len());
@@ -340,7 +637,7 @@ impl DosTask {
                 .copy_from_slice(&data[code_start..code_start + copy_len]);
         }
 
-        // Apply relocations
+        // Apply relocations (using load_seg as base)
         for i in 0..reloc_count {
             let rel_off = reloc_offset + i * 4;
             if rel_off + 4 <= data.len() {
@@ -356,13 +653,23 @@ impl DosTask {
             }
         }
 
-        // Set up registers
+        // Set up PSP at psp_seg
+        let psp_addr = (psp_seg as usize) << 4;
+        // INT 20h at PSP:0000
+        memory[psp_addr] = 0xCD;
+        memory[psp_addr + 1] = 0x20;
+        // Memory size at PSP:0002 (segment of first byte beyond allocated memory)
+        let mem_top = psp_seg + total_paragraphs;
+        memory[psp_addr + 2] = (mem_top & 0xFF) as u8;
+        memory[psp_addr + 3] = ((mem_top >> 8) & 0xFF) as u8;
+
+        // Set up registers - segments relative to load_seg, not psp_seg
         cpu.cs = load_seg.wrapping_add(init_cs);
         cpu.ip = init_ip;
         cpu.ss = load_seg.wrapping_add(init_ss);
         cpu.sp = init_sp;
-        cpu.ds = load_seg;
-        cpu.es = load_seg;
+        cpu.ds = psp_seg;  // DS and ES point to PSP
+        cpu.es = psp_seg;
 
         // Log initial EXE state
         serial_write_bytes(b"EXE load: pages=");
@@ -372,14 +679,21 @@ impl DosTask {
         serial_write_bytes(b" hdr_paras=");
         serial_write_hex16(header_paras as u16);
         serial_write_bytes(b"\r\n");
-        serial_write_bytes(b"EXE init: CS=");
+        serial_write_bytes(b"EXE init: PSP=");
+        serial_write_hex16(psp_seg);
+        serial_write_bytes(b" load_seg=");
+        serial_write_hex16(load_seg);
+        serial_write_bytes(b" CS=");
         serial_write_hex16(cpu.cs);
         serial_write_bytes(b" IP=");
         serial_write_hex16(cpu.ip);
-        serial_write_bytes(b" SS=");
+        serial_write_bytes(b"\r\n");
+        serial_write_bytes(b"SS=");
         serial_write_hex16(cpu.ss);
         serial_write_bytes(b" SP=");
         serial_write_hex16(cpu.sp);
+        serial_write_bytes(b" DS/ES=");
+        serial_write_hex16(cpu.ds);
         serial_write_bytes(b"\r\n");
         serial_write_bytes(b"First 8 bytes at CS:IP: ");
         let start_addr = ((cpu.cs as usize) << 4) + (cpu.ip as usize);
@@ -390,6 +704,8 @@ impl DosTask {
             }
         }
         serial_write_bytes(b"\r\n");
+
+        psp_seg
     }
 
     // Linear address calculation
@@ -557,8 +873,8 @@ impl DosTask {
         if !has_seg_prefix {
             self.instruction_count += 1;
         }
-        // Trace first 20 instructions in detail, then every 100th, BUT always trace when CS=0x2619 (decompressor target)
-        let trace_decompressor = trace_cs == 0x2619;
+        // Trace first 20 instructions in detail, then every 100th, BUT always trace decompressor
+        let trace_decompressor = trace_cs == 0x267A;  // PKLITE decompressor segment
         if self.trace_enabled && !has_seg_prefix && (trace_decompressor || self.instruction_count <= 20 || self.instruction_count % 100 == 0) {
             serial_write_bytes(b"[");
             serial_write_hex16(trace_cs);
@@ -566,10 +882,22 @@ impl DosTask {
             serial_write_hex16(trace_ip);
             serial_write_bytes(b"] op=");
             serial_write_hex8(opcode);
-            serial_write_bytes(b" AX=");
-            serial_write_hex16(self.cpu.ax);
-            serial_write_bytes(b" SP=");
-            serial_write_hex16(self.cpu.sp);
+            // For decompressor, show BP (bit buffer), DS:SI (data pointer)
+            if trace_decompressor {
+                serial_write_bytes(b" DS=");
+                serial_write_hex16(self.cpu.ds);
+                serial_write_bytes(b" SI=");
+                serial_write_hex16(self.cpu.si);
+                serial_write_bytes(b" BP=");
+                serial_write_hex16(self.cpu.bp);
+                serial_write_bytes(b" AX=");
+                serial_write_hex16(self.cpu.ax);
+            } else {
+                serial_write_bytes(b" AX=");
+                serial_write_hex16(self.cpu.ax);
+                serial_write_bytes(b" SP=");
+                serial_write_hex16(self.cpu.sp);
+            }
             serial_write_bytes(b" SS:SP=");
             serial_write_hex16(self.cpu.ss);
             serial_write_bytes(b":");
@@ -2360,7 +2688,23 @@ impl DosTask {
         serial_write_hex16(self.cpu.es);
         serial_write_bytes(b":");
         serial_write_hex16(self.cpu.di);
+        serial_write_bytes(b" DF=");
+        serial_write_hex8(if self.cpu.get_flag(FLAG_DF) { 1 } else { 0 });
         serial_write_bytes(b"\r\n");
+
+        // Dump source at offset 0000 BEFORE the copy (for MOVSW/MOVSB)
+        if matches!(opcode, 0xA4 | 0xA5) {
+            let src_seg = self.get_seg(self.cpu.ds);
+            serial_write_bytes(b"  BEFORE Src@0000 (");
+            serial_write_hex16(src_seg);
+            serial_write_bytes(b":0000): ");
+            for i in 0..8 {
+                let b = self.read_u8(src_seg, i);
+                serial_write_hex8(b);
+                serial_write_bytes(b" ");
+            }
+            serial_write_bytes(b"\r\n");
+        }
 
         loop {
             if self.cpu.cx == 0 { break; }
@@ -2393,10 +2737,21 @@ impl DosTask {
         serial_write_bytes(b"  REP done SI=");
         serial_write_hex16(self.cpu.si);
 
-        // Dump first 16 bytes of destination if ES=0x2619 and MOVSW/MOVSB
-        if matches!(opcode, 0xA4 | 0xA5) && self.cpu.es == 0x2619 {
-            serial_write_bytes(b"\r\n  Dest dump ES:0000: ");
-            for i in 0..16 {
+        // Dump source and destination for MOVSW/MOVSB operations
+        if matches!(opcode, 0xA4 | 0xA5) {
+            let src_seg = self.get_seg(self.cpu.ds);
+            serial_write_bytes(b"\r\n  Src @0000 (");
+            serial_write_hex16(src_seg);
+            serial_write_bytes(b":0000): ");
+            for i in 0..8 {
+                let b = self.read_u8(src_seg, i);
+                serial_write_hex8(b);
+                serial_write_bytes(b" ");
+            }
+            serial_write_bytes(b"\r\n  Dst @0000 (");
+            serial_write_hex16(self.cpu.es);
+            serial_write_bytes(b":0000): ");
+            for i in 0..8 {
                 let b = self.read_u8(self.cpu.es, i);
                 serial_write_hex8(b);
                 serial_write_bytes(b" ");
@@ -2799,19 +3154,69 @@ impl DosTask {
                 }
             }
             0x48 => {
-                // Allocate memory: BX = paragraphs
-                // Return a fake segment
+                // Allocate memory: BX = paragraphs requested
+                // Returns: AX = segment of allocated block, or CF=1 and BX = largest available
                 let paras = self.cpu.bx;
-                self.cpu.ax = 0x2000; // Return segment 0x2000
-                self.cpu.set_flag(FLAG_CF, false);
+                serial_write_bytes(b"INT 21h/48h: Allocate ");
+                serial_write_hex16(paras);
+                serial_write_bytes(b" paragraphs\r\n");
+
+                if let Some(seg) = self.alloc_memory(paras) {
+                    self.cpu.ax = seg;
+                    self.cpu.set_flag(FLAG_CF, false);
+                } else {
+                    // Find largest available block for error return
+                    let mut mcb_seg = FIRST_MCB_SEG;
+                    let mut largest: u16 = 0;
+                    loop {
+                        let (mcb_type, owner, size) = self.read_mcb(mcb_seg);
+                        if owner == MCB_OWNER_FREE && size > largest {
+                            largest = size;
+                        }
+                        if mcb_type == MCB_TYPE_LAST { break; }
+                        mcb_seg = mcb_seg + size + 1;
+                    }
+                    self.cpu.ax = 0x08;  // Not enough memory
+                    self.cpu.bx = largest;
+                    self.cpu.set_flag(FLAG_CF, true);
+                }
             }
             0x49 => {
-                // Free memory - just succeed
-                self.cpu.set_flag(FLAG_CF, false);
+                // Free memory: ES = segment of block to free
+                // Returns: CF=1 on error
+                let seg = self.cpu.es;
+                serial_write_bytes(b"INT 21h/49h: Free segment ");
+                serial_write_hex16(seg);
+                serial_write_bytes(b"\r\n");
+
+                if self.free_memory(seg) {
+                    self.cpu.set_flag(FLAG_CF, false);
+                } else {
+                    self.cpu.ax = 0x09;  // Invalid memory block
+                    self.cpu.set_flag(FLAG_CF, true);
+                }
             }
             0x4A => {
-                // Resize memory block - just succeed
-                self.cpu.set_flag(FLAG_CF, false);
+                // Resize memory block: ES = segment, BX = new size in paragraphs
+                // Returns: CF=1 on error, BX = largest available if can't grow
+                let seg = self.cpu.es;
+                let new_size = self.cpu.bx;
+                serial_write_bytes(b"INT 21h/4Ah: Resize segment ");
+                serial_write_hex16(seg);
+                serial_write_bytes(b" to ");
+                serial_write_hex16(new_size);
+                serial_write_bytes(b" paragraphs\r\n");
+
+                match self.resize_memory(seg, new_size) {
+                    Ok(()) => {
+                        self.cpu.set_flag(FLAG_CF, false);
+                    }
+                    Err(max_available) => {
+                        self.cpu.ax = 0x08;  // Not enough memory
+                        self.cpu.bx = max_available;
+                        self.cpu.set_flag(FLAG_CF, true);
+                    }
+                }
             }
             0x4B => {
                 // EXEC - load and execute program
@@ -2846,7 +3251,7 @@ impl DosTask {
             }
             0x51 | 0x62 => {
                 // Get PSP address
-                self.cpu.bx = 0x1000; // PSP at segment 0x1000
+                self.cpu.bx = self.psp_seg;
             }
             0x52 => {
                 // Get DOS internal pointer - return dummy
