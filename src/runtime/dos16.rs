@@ -3,9 +3,10 @@
 //! Implements a 16-bit x86 CPU interpreter for running DOS COM/EXE programs.
 
 extern crate alloc;
-use alloc::{string::String, vec::Vec, vec};
+use alloc::{string::{String, ToString}, vec::Vec, vec, format};
 use super::{Runtime, BinaryFormat, RunResult, schedule_task_record};
 use crate::disk;
+use crate::console;
 
 pub struct Dos16Runtime;
 impl Dos16Runtime {
@@ -212,6 +213,11 @@ pub struct DosTask {
     seg_override: Option<u16>,
     // File handles (maps DOS handle to internal state)
     file_handles: [Option<FileHandle>; 20],
+    // Console ID for this task's display
+    pub console_id: u8,
+    // Instruction trace/debug
+    trace_enabled: bool,
+    instruction_count: u64,
 }
 
 #[derive(Clone)]
@@ -225,25 +231,32 @@ struct FileHandle {
 
 impl DosTask {
     fn new(id: u32, filename: String, data: &[u8]) -> Self {
+        // Log program start to serial
+        serial_write_bytes(b"\r\n=== DOS TASK START: ");
+        serial_write_bytes(filename.as_bytes());
+        serial_write_bytes(b" (0x");
+        serial_write_hex16((data.len() >> 16) as u16);
+        serial_write_hex16(data.len() as u16);
+        serial_write_bytes(b" bytes) ===\r\n");
+        serial_write_bytes(b"Instruction tracing ENABLED (every 100 instr)\r\n");
+
         let mut memory = vec![0u8; 1024 * 1024]; // 1 MiB
 
         // Check if MZ (EXE) or COM
         let is_exe = data.len() >= 2 && data[0] == b'M' && data[1] == b'Z';
+        serial_write_bytes(if is_exe { b"Format: EXE\r\n" } else { b"Format: COM\r\n" });
 
         let mut cpu = Cpu16::new();
 
-        serial_write_bytes(b"[DOS16] Loading ");
-        serial_write_bytes(filename.as_bytes());
-        serial_write_bytes(b" (");
-        serial_write_u16(data.len() as u16);
-        serial_write_bytes(b" bytes)\r\n");
+        // Create a console for this DOS task
+        let console_id = console::manager().create_console(&filename, id);
+        // Switch to the new console
+        console::manager().switch_to(console_id);
 
         if is_exe {
-            serial_write_bytes(b"[DOS16] Format: MZ EXE\r\n");
             // Parse MZ header and load EXE
             Self::load_exe(&mut memory, &mut cpu, data);
         } else {
-            serial_write_bytes(b"[DOS16] Format: COM, loading at 0x100\r\n");
             // Load COM at offset 0x100
             let load_addr = 0x100usize;
             let copy_len = core::cmp::min(data.len(), memory.len() - load_addr);
@@ -269,6 +282,23 @@ impl DosTask {
             state: TaskState::Running,
             seg_override: None,
             file_handles: [NONE_FILE; 20],
+            console_id,
+            trace_enabled: true,  // Enable tracing by default for debugging
+            instruction_count: 0,
+        }
+    }
+
+    /// Write a character to this task's console
+    fn console_putchar(&self, ch: u8) {
+        if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
+            con.putchar(ch);
+        }
+    }
+
+    /// Write bytes to this task's console
+    fn console_write(&self, data: &[u8]) {
+        if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
+            con.print(data);
         }
     }
 
@@ -333,6 +363,33 @@ impl DosTask {
         cpu.sp = init_sp;
         cpu.ds = load_seg;
         cpu.es = load_seg;
+
+        // Log initial EXE state
+        serial_write_bytes(b"EXE load: pages=");
+        serial_write_hex16(page_count);
+        serial_write_bytes(b" relocs=");
+        serial_write_hex16(reloc_count as u16);
+        serial_write_bytes(b" hdr_paras=");
+        serial_write_hex16(header_paras as u16);
+        serial_write_bytes(b"\r\n");
+        serial_write_bytes(b"EXE init: CS=");
+        serial_write_hex16(cpu.cs);
+        serial_write_bytes(b" IP=");
+        serial_write_hex16(cpu.ip);
+        serial_write_bytes(b" SS=");
+        serial_write_hex16(cpu.ss);
+        serial_write_bytes(b" SP=");
+        serial_write_hex16(cpu.sp);
+        serial_write_bytes(b"\r\n");
+        serial_write_bytes(b"First 8 bytes at CS:IP: ");
+        let start_addr = ((cpu.cs as usize) << 4) + (cpu.ip as usize);
+        for i in 0..8 {
+            if start_addr + i < memory.len() {
+                serial_write_hex8(memory[start_addr + i]);
+                serial_write_bytes(b" ");
+            }
+        }
+        serial_write_bytes(b"\r\n");
     }
 
     // Linear address calculation
@@ -396,17 +453,17 @@ impl DosTask {
         self.seg_override.unwrap_or(default)
     }
 
-    // ModR/M decoding - returns (reg field, effective address or register value, is_memory)
-    fn decode_modrm(&mut self, wide: bool) -> (u8, u16, bool) {
+    // ModR/M decoding - returns (reg field, effective address or register value, rm field, is_memory)
+    fn decode_modrm(&mut self, wide: bool) -> (u8, u16, u8, bool) {
         let modrm = self.fetch_u8();
         let mode = (modrm >> 6) & 3;
         let reg = (modrm >> 3) & 7;
         let rm = modrm & 7;
 
         if mode == 3 {
-            // Register mode
+            // Register mode - ea holds register value, rm is register index for writes
             let val = if wide { self.cpu.get_reg16(rm) } else { self.cpu.get_reg8(rm) as u16 };
-            return (reg, val, false);
+            return (reg, val, rm, false);
         }
 
         // Memory mode - calculate effective address
@@ -430,36 +487,36 @@ impl DosTask {
         }
 
         // Default segment
-        let default_seg = if rm == 2 || rm == 3 || (rm == 6 && mode != 0) {
+        let _default_seg = if rm == 2 || rm == 3 || (rm == 6 && mode != 0) {
             self.cpu.ss // BP-based addressing uses SS
         } else {
             self.cpu.ds
         };
 
-        (reg, ea, true)
+        (reg, ea, rm, true)
     }
 
-    // Read operand from ModR/M
-    fn read_rm8(&mut self) -> (u8, u8, u16, bool) {
-        let (reg, ea, is_mem) = self.decode_modrm(false);
+    // Read operand from ModR/M - returns (reg, val, ea, rm, is_mem)
+    fn read_rm8(&mut self) -> (u8, u8, u16, u8, bool) {
+        let (reg, ea, rm, is_mem) = self.decode_modrm(false);
         let val = if is_mem {
             let seg = self.get_seg(self.cpu.ds);
             self.read_u8(seg, ea)
         } else {
             ea as u8
         };
-        (reg, val, ea, is_mem)
+        (reg, val, ea, rm, is_mem)
     }
 
-    fn read_rm16(&mut self) -> (u8, u16, u16, bool) {
-        let (reg, ea, is_mem) = self.decode_modrm(true);
+    fn read_rm16(&mut self) -> (u8, u16, u16, u8, bool) {
+        let (reg, ea, rm, is_mem) = self.decode_modrm(true);
         let val = if is_mem {
             let seg = self.get_seg(self.cpu.ds);
             self.read_u16(seg, ea)
         } else {
             ea
         };
-        (reg, val, ea, is_mem)
+        (reg, val, ea, rm, is_mem)
     }
 
     // Write to ModR/M destination
@@ -484,36 +541,69 @@ impl DosTask {
     // Execute one instruction
     pub fn step(&mut self) {
         if self.state != TaskState::Running { return; }
-
         self.seg_override = None;
+        self.step_inner(false);
+    }
+
+    // Inner step that handles segment override prefixes
+    fn step_inner(&mut self, has_seg_prefix: bool) {
+        // Trace: print CS:IP and opcode
+        let trace_cs = self.cpu.cs;
+        let trace_ip = self.cpu.ip;
+
         let opcode = self.fetch_u8();
 
+        // Debug trace output - enable for instruction tracing (only count once per full instruction)
+        if !has_seg_prefix {
+            self.instruction_count += 1;
+        }
+        // Trace first 20 instructions in detail, then every 100th, BUT always trace when CS=0x2619 (decompressor target)
+        let trace_decompressor = trace_cs == 0x2619;
+        if self.trace_enabled && !has_seg_prefix && (trace_decompressor || self.instruction_count <= 20 || self.instruction_count % 100 == 0) {
+            serial_write_bytes(b"[");
+            serial_write_hex16(trace_cs);
+            serial_write_bytes(b":");
+            serial_write_hex16(trace_ip);
+            serial_write_bytes(b"] op=");
+            serial_write_hex8(opcode);
+            serial_write_bytes(b" AX=");
+            serial_write_hex16(self.cpu.ax);
+            serial_write_bytes(b" SP=");
+            serial_write_hex16(self.cpu.sp);
+            serial_write_bytes(b" SS:SP=");
+            serial_write_hex16(self.cpu.ss);
+            serial_write_bytes(b":");
+            serial_write_hex16(self.cpu.sp);
+            serial_write_bytes(b"\r\n");
+        }
+        let _ = (trace_cs, trace_ip); // Silence unused warnings
+
         match opcode {
-            // Segment override prefixes
-            0x26 => { self.seg_override = Some(self.cpu.es); self.step(); }
-            0x2E => { self.seg_override = Some(self.cpu.cs); self.step(); }
-            0x36 => { self.seg_override = Some(self.cpu.ss); self.step(); }
-            0x3E => { self.seg_override = Some(self.cpu.ds); self.step(); }
+            // Segment override prefixes - set override and continue with the actual instruction
+            0x26 => { self.seg_override = Some(self.cpu.es); self.step_inner(true); }
+            0x2E => { self.seg_override = Some(self.cpu.cs); self.step_inner(true); }
+            0x36 => { self.seg_override = Some(self.cpu.ss); self.step_inner(true); }
+            0x3E => { self.seg_override = Some(self.cpu.ds); self.step_inner(true); }
 
             // ADD r/m8, r8
             0x00 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = (val as u16).wrapping_add(src as u16);
                 self.cpu.update_flags_add8(val, src, result);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             // ADD r/m16, r16
             0x01 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = (val as u32).wrapping_add(src as u32);
                 self.cpu.update_flags_add16(val, src, result);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             // ADD r8, r/m8
             0x02 => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = (dst as u16).wrapping_add(val as u16);
                 self.cpu.update_flags_add8(dst, val, result);
@@ -521,7 +611,7 @@ impl DosTask {
             }
             // ADD r16, r/m16
             0x03 => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = (dst as u32).wrapping_add(val as u32);
                 self.cpu.update_flags_add16(dst, val, result);
@@ -540,6 +630,14 @@ impl DosTask {
                 let imm = self.fetch_u16();
                 let ax = self.cpu.ax;
                 let result = (ax as u32).wrapping_add(imm as u32);
+                // Debug: log ADD AX details
+                serial_write_bytes(b"  ADD AX: ");
+                serial_write_hex16(ax);
+                serial_write_bytes(b" + ");
+                serial_write_hex16(imm);
+                serial_write_bytes(b" = ");
+                serial_write_hex16(result as u16);
+                serial_write_bytes(b"\r\n");
                 self.cpu.update_flags_add16(ax, imm, result);
                 self.cpu.ax = result as u16;
             }
@@ -551,23 +649,23 @@ impl DosTask {
 
             // OR r/m8, r8
             0x08 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = val | src;
                 self.cpu.update_flags_logic8(result);
-                self.write_rm8(ea, is_mem, ea as u8, result);
+                self.write_rm8(ea, is_mem, rm, result);
             }
             // OR r/m16, r16
             0x09 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = val | src;
                 self.cpu.update_flags_logic16(result);
-                self.write_rm16(ea, is_mem, ea as u8, result);
+                self.write_rm16(ea, is_mem, rm, result);
             }
             // OR r8, r/m8
             0x0A => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = dst | val;
                 self.cpu.update_flags_logic8(result);
@@ -575,7 +673,7 @@ impl DosTask {
             }
             // OR r16, r/m16
             0x0B => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = dst | val;
                 self.cpu.update_flags_logic16(result);
@@ -617,23 +715,23 @@ impl DosTask {
 
             // AND r/m8, r8
             0x20 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = val & src;
                 self.cpu.update_flags_logic8(result);
-                self.write_rm8(ea, is_mem, ea as u8, result);
+                self.write_rm8(ea, is_mem, rm, result);
             }
             // AND r/m16, r16
             0x21 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = val & src;
                 self.cpu.update_flags_logic16(result);
-                self.write_rm16(ea, is_mem, ea as u8, result);
+                self.write_rm16(ea, is_mem, rm, result);
             }
             // AND r8, r/m8
             0x22 => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = dst & val;
                 self.cpu.update_flags_logic8(result);
@@ -641,7 +739,7 @@ impl DosTask {
             }
             // AND r16, r/m16
             0x23 => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = dst & val;
                 self.cpu.update_flags_logic16(result);
@@ -667,23 +765,23 @@ impl DosTask {
 
             // SUB r/m8, r8
             0x28 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = (val as u16).wrapping_sub(src as u16);
                 self.cpu.update_flags_sub8(val, src, result);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             // SUB r/m16, r16
             0x29 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = (val as u32).wrapping_sub(src as u32);
                 self.cpu.update_flags_sub16(val, src, result);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             // SUB r8, r/m8
             0x2A => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = (dst as u16).wrapping_sub(val as u16);
                 self.cpu.update_flags_sub8(dst, val, result);
@@ -691,7 +789,7 @@ impl DosTask {
             }
             // SUB r16, r/m16
             0x2B => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = (dst as u32).wrapping_sub(val as u32);
                 self.cpu.update_flags_sub16(dst, val, result);
@@ -719,23 +817,23 @@ impl DosTask {
 
             // XOR r/m8, r8
             0x30 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = val ^ src;
                 self.cpu.update_flags_logic8(result);
-                self.write_rm8(ea, is_mem, ea as u8, result);
+                self.write_rm8(ea, is_mem, rm, result);
             }
             // XOR r/m16, r16
             0x31 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = val ^ src;
                 self.cpu.update_flags_logic16(result);
-                self.write_rm16(ea, is_mem, ea as u8, result);
+                self.write_rm16(ea, is_mem, rm, result);
             }
             // XOR r8, r/m8
             0x32 => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = dst ^ val;
                 self.cpu.update_flags_logic8(result);
@@ -743,7 +841,7 @@ impl DosTask {
             }
             // XOR r16, r/m16
             0x33 => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = dst ^ val;
                 self.cpu.update_flags_logic16(result);
@@ -769,28 +867,28 @@ impl DosTask {
 
             // CMP r/m8, r8
             0x38 => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = (val as u16).wrapping_sub(src as u16);
                 self.cpu.update_flags_sub8(val, src, result);
             }
             // CMP r/m16, r16
             0x39 => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = (val as u32).wrapping_sub(src as u32);
                 self.cpu.update_flags_sub16(val, src, result);
             }
             // CMP r8, r/m8
             0x3A => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = (dst as u16).wrapping_sub(val as u16);
                 self.cpu.update_flags_sub8(dst, val, result);
             }
             // CMP r16, r/m16
             0x3B => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = (dst as u32).wrapping_sub(val as u32);
                 self.cpu.update_flags_sub16(dst, val, result);
@@ -998,14 +1096,14 @@ impl DosTask {
 
             // TEST r/m8, r8
             0x84 => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = val & src;
                 self.cpu.update_flags_logic8(result);
             }
             // TEST r/m16, r16
             0x85 => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = val & src;
                 self.cpu.update_flags_logic16(result);
@@ -1013,39 +1111,39 @@ impl DosTask {
 
             // XCHG r/m8, r8
             0x86 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 self.cpu.set_reg8(reg, val);
-                self.write_rm8(ea, is_mem, ea as u8, src);
+                self.write_rm8(ea, is_mem, rm, src);
             }
             // XCHG r/m16, r16
             0x87 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 self.cpu.set_reg16(reg, val);
-                self.write_rm16(ea, is_mem, ea as u8, src);
+                self.write_rm16(ea, is_mem, rm, src);
             }
 
             // MOV r/m8, r8
             0x88 => {
-                let (reg, _, ea, is_mem) = self.read_rm8();
+                let (reg, _, ea, rm, is_mem) = self.read_rm8();
                 let val = self.cpu.get_reg8(reg);
-                self.write_rm8(ea, is_mem, ea as u8, val);
+                self.write_rm8(ea, is_mem, rm, val);
             }
             // MOV r/m16, r16
             0x89 => {
-                let (reg, _, ea, is_mem) = self.read_rm16();
+                let (reg, _, ea, rm, is_mem) = self.read_rm16();
                 let val = self.cpu.get_reg16(reg);
-                self.write_rm16(ea, is_mem, ea as u8, val);
+                self.write_rm16(ea, is_mem, rm, val);
             }
             // MOV r8, r/m8
             0x8A => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 self.cpu.set_reg8(reg, val);
             }
             // MOV r16, r/m16
             0x8B => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 self.cpu.set_reg16(reg, val);
             }
             // MOV r/m16, Sreg
@@ -1060,25 +1158,25 @@ impl DosTask {
                 } else {
                     // Rewind and use full decode
                     self.cpu.ip = self.cpu.ip.wrapping_sub(1);
-                    let (_, _, ea, is_mem) = self.read_rm16();
-                    self.write_rm16(ea, is_mem, ea as u8, val);
+                    let (_, _, ea, rm, is_mem) = self.read_rm16();
+                    self.write_rm16(ea, is_mem, rm, val);
                 }
             }
             // LEA r16, m
             0x8D => {
-                let (reg, ea, _) = self.decode_modrm(true);
+                let (reg, ea, _, _) = self.decode_modrm(true);
                 self.cpu.set_reg16(reg, ea);
             }
             // MOV Sreg, r/m16
             0x8E => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 self.cpu.set_seg(reg, val);
             }
             // POP r/m16
             0x8F => {
-                let (_, _, ea, is_mem) = self.read_rm16();
+                let (_, _, ea, rm, is_mem) = self.read_rm16();
                 let val = self.pop16();
-                self.write_rm16(ea, is_mem, ea as u8, val);
+                self.write_rm16(ea, is_mem, rm, val);
             }
 
             // NOP (XCHG AX, AX)
@@ -1219,7 +1317,7 @@ impl DosTask {
 
             // LES r16, m16:16
             0xC4 => {
-                let (reg, ea, _) = self.decode_modrm(true);
+                let (reg, ea, _, _) = self.decode_modrm(true);
                 let seg = self.get_seg(self.cpu.ds);
                 let off = self.read_u16(seg, ea);
                 let new_seg = self.read_u16(seg, ea.wrapping_add(2));
@@ -1228,7 +1326,7 @@ impl DosTask {
             }
             // LDS r16, m16:16
             0xC5 => {
-                let (reg, ea, _) = self.decode_modrm(true);
+                let (reg, ea, _, _) = self.decode_modrm(true);
                 let seg = self.get_seg(self.cpu.ds);
                 let off = self.read_u16(seg, ea);
                 let new_seg = self.read_u16(seg, ea.wrapping_add(2));
@@ -1238,15 +1336,15 @@ impl DosTask {
 
             // MOV r/m8, imm8
             0xC6 => {
-                let (_, _, ea, is_mem) = self.read_rm8();
+                let (_, _, ea, rm, is_mem) = self.read_rm8();
                 let imm = self.fetch_u8();
-                self.write_rm8(ea, is_mem, ea as u8, imm);
+                self.write_rm8(ea, is_mem, rm, imm);
             }
             // MOV r/m16, imm16
             0xC7 => {
-                let (_, _, ea, is_mem) = self.read_rm16();
+                let (_, _, ea, rm, is_mem) = self.read_rm16();
                 let imm = self.fetch_u16();
-                self.write_rm16(ea, is_mem, ea as u8, imm);
+                self.write_rm16(ea, is_mem, rm, imm);
             }
 
             // RETF imm16
@@ -1260,6 +1358,12 @@ impl DosTask {
             0xCB => {
                 self.cpu.ip = self.pop16();
                 self.cpu.cs = self.pop16();
+                // Debug: log RETF destination
+                serial_write_bytes(b"  RETF -> ");
+                serial_write_hex16(self.cpu.cs);
+                serial_write_bytes(b":");
+                serial_write_hex16(self.cpu.ip);
+                serial_write_bytes(b"\r\n");
             }
 
             // INT 3
@@ -1387,8 +1491,17 @@ impl DosTask {
             }
             // JMP rel16
             0xE9 => {
+                let ip_before = self.cpu.ip;
                 let rel = self.fetch_u16();
-                self.cpu.ip = self.cpu.ip.wrapping_add(rel);
+                let new_ip = self.cpu.ip.wrapping_add(rel);
+                serial_write_bytes(b"  JMP rel16: IP=");
+                serial_write_hex16(ip_before);
+                serial_write_bytes(b" rel=");
+                serial_write_hex16(rel);
+                serial_write_bytes(b" -> ");
+                serial_write_hex16(new_ip);
+                serial_write_bytes(b"\r\n");
+                self.cpu.ip = new_ip;
             }
             // JMP far ptr
             0xEA => {
@@ -1420,8 +1533,8 @@ impl DosTask {
                 self.port_out16(self.cpu.dx, self.cpu.ax);
             }
 
-            // LOCK prefix
-            0xF0 => { self.step(); }
+            // LOCK prefix - preserve segment override state
+            0xF0 => { self.step_inner(has_seg_prefix); }
 
             // REPNE/REPNZ
             0xF2 => self.exec_rep(false),
@@ -1464,7 +1577,43 @@ impl DosTask {
 
             // Unhandled opcode
             _ => {
-                // Skip unknown instruction
+                // Log unhandled opcode and terminate
+                serial_write_bytes(b"\r\n!!! UNKNOWN OPCODE ");
+                serial_write_hex8(opcode);
+                serial_write_bytes(b"h at ");
+                serial_write_hex16(trace_cs);
+                serial_write_bytes(b":");
+                serial_write_hex16(trace_ip);
+                serial_write_bytes(b" - HALTING\r\n");
+                serial_write_bytes(b"CPU: AX=");
+                serial_write_hex16(self.cpu.ax);
+                serial_write_bytes(b" BX=");
+                serial_write_hex16(self.cpu.bx);
+                serial_write_bytes(b" CX=");
+                serial_write_hex16(self.cpu.cx);
+                serial_write_bytes(b" DX=");
+                serial_write_hex16(self.cpu.dx);
+                serial_write_bytes(b" SP=");
+                serial_write_hex16(self.cpu.sp);
+                serial_write_bytes(b" BP=");
+                serial_write_hex16(self.cpu.bp);
+                serial_write_bytes(b" SI=");
+                serial_write_hex16(self.cpu.si);
+                serial_write_bytes(b" DI=");
+                serial_write_hex16(self.cpu.di);
+                serial_write_bytes(b"\r\n");
+                serial_write_bytes(b"     CS=");
+                serial_write_hex16(self.cpu.cs);
+                serial_write_bytes(b" DS=");
+                serial_write_hex16(self.cpu.ds);
+                serial_write_bytes(b" ES=");
+                serial_write_hex16(self.cpu.es);
+                serial_write_bytes(b" SS=");
+                serial_write_hex16(self.cpu.ss);
+                serial_write_bytes(b" FLAGS=");
+                serial_write_hex16(self.cpu.flags);
+                serial_write_bytes(b"\r\n");
+                self.state = TaskState::Terminated;
             }
         }
     }
@@ -1474,28 +1623,28 @@ impl DosTask {
         let carry = if self.cpu.get_flag(FLAG_CF) { 1 } else { 0 };
         match opcode {
             0x10 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg);
                 let result = (val as u16).wrapping_add(src as u16).wrapping_add(carry);
                 self.cpu.update_flags_add8(val, src.wrapping_add(carry as u8), result);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             0x11 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg);
                 let result = (val as u32).wrapping_add(src as u32).wrapping_add(carry as u32);
                 self.cpu.update_flags_add16(val, src.wrapping_add(carry), result);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             0x12 => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let result = (dst as u16).wrapping_add(val as u16).wrapping_add(carry);
                 self.cpu.update_flags_add8(dst, val.wrapping_add(carry as u8), result);
                 self.cpu.set_reg8(reg, result as u8);
             }
             0x13 => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let result = (dst as u32).wrapping_add(val as u32).wrapping_add(carry as u32);
                 self.cpu.update_flags_add16(dst, val.wrapping_add(carry), result);
@@ -1523,21 +1672,21 @@ impl DosTask {
         let borrow = if self.cpu.get_flag(FLAG_CF) { 1 } else { 0 };
         match opcode {
             0x18 => {
-                let (reg, val, ea, is_mem) = self.read_rm8();
+                let (reg, val, ea, rm, is_mem) = self.read_rm8();
                 let src = self.cpu.get_reg8(reg).wrapping_add(borrow as u8);
                 let result = (val as u16).wrapping_sub(src as u16);
                 self.cpu.update_flags_sub8(val, src, result);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             0x19 => {
-                let (reg, val, ea, is_mem) = self.read_rm16();
+                let (reg, val, ea, rm, is_mem) = self.read_rm16();
                 let src = self.cpu.get_reg16(reg).wrapping_add(borrow);
                 let result = (val as u32).wrapping_sub(src as u32);
                 self.cpu.update_flags_sub16(val, src, result);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             0x1A => {
-                let (reg, val, _, _) = self.read_rm8();
+                let (reg, val, _, _, _) = self.read_rm8();
                 let dst = self.cpu.get_reg8(reg);
                 let src = val.wrapping_add(borrow as u8);
                 let result = (dst as u16).wrapping_sub(src as u16);
@@ -1545,7 +1694,7 @@ impl DosTask {
                 self.cpu.set_reg8(reg, result as u8);
             }
             0x1B => {
-                let (reg, val, _, _) = self.read_rm16();
+                let (reg, val, _, _, _) = self.read_rm16();
                 let dst = self.cpu.get_reg16(reg);
                 let src = val.wrapping_add(borrow);
                 let result = (dst as u32).wrapping_sub(src as u32);
@@ -1649,7 +1798,7 @@ impl DosTask {
     }
 
     fn exec_group1_8(&mut self, _sign_extend: bool) {
-        let (op, val, ea, is_mem) = self.read_rm8();
+        let (op, val, ea, rm, is_mem) = self.read_rm8();
         let imm = self.fetch_u8();
 
         let result = match op {
@@ -1699,11 +1848,11 @@ impl DosTask {
             _ => val,
         };
 
-        self.write_rm8(ea, is_mem, ea as u8, result);
+        self.write_rm8(ea, is_mem, rm, result);
     }
 
     fn exec_group1_16(&mut self, sign_extend: bool) {
-        let (op, val, ea, is_mem) = self.read_rm16();
+        let (op, val, ea, rm, is_mem) = self.read_rm16();
         let imm = if sign_extend {
             self.fetch_i8() as i16 as u16
         } else {
@@ -1757,11 +1906,11 @@ impl DosTask {
             _ => val,
         };
 
-        self.write_rm16(ea, is_mem, ea as u8, result);
+        self.write_rm16(ea, is_mem, rm, result);
     }
 
     fn exec_group2_8(&mut self, count: u8) {
-        let (op, val, ea, is_mem) = self.read_rm8();
+        let (op, val, ea, rm, is_mem) = self.read_rm8();
         let count = count & 0x1F;
         if count == 0 { return; }
 
@@ -1815,11 +1964,11 @@ impl DosTask {
             _ => val,
         };
 
-        self.write_rm8(ea, is_mem, ea as u8, result);
+        self.write_rm8(ea, is_mem, rm, result);
     }
 
     fn exec_group2_16(&mut self, count: u8) {
-        let (op, val, ea, is_mem) = self.read_rm16();
+        let (op, val, ea, rm, is_mem) = self.read_rm16();
         let count = count & 0x1F;
         if count == 0 { return; }
 
@@ -1873,11 +2022,11 @@ impl DosTask {
             _ => val,
         };
 
-        self.write_rm16(ea, is_mem, ea as u8, result);
+        self.write_rm16(ea, is_mem, rm, result);
     }
 
     fn exec_group3_8(&mut self) {
-        let (op, val, ea, is_mem) = self.read_rm8();
+        let (op, val, ea, rm, is_mem) = self.read_rm8();
 
         match op {
             0 | 1 => { // TEST r/m8, imm8
@@ -1886,12 +2035,12 @@ impl DosTask {
                 self.cpu.update_flags_logic8(result);
             }
             2 => { // NOT
-                self.write_rm8(ea, is_mem, ea as u8, !val);
+                self.write_rm8(ea, is_mem, rm, !val);
             }
             3 => { // NEG
                 let result = (0u16).wrapping_sub(val as u16);
                 self.cpu.update_flags_sub8(0, val, result);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             4 => { // MUL
                 let result = (self.cpu.ax as u8 as u16) * (val as u16);
@@ -1941,7 +2090,7 @@ impl DosTask {
     }
 
     fn exec_group3_16(&mut self) {
-        let (op, val, ea, is_mem) = self.read_rm16();
+        let (op, val, ea, rm, is_mem) = self.read_rm16();
 
         match op {
             0 | 1 => { // TEST r/m16, imm16
@@ -1950,12 +2099,12 @@ impl DosTask {
                 self.cpu.update_flags_logic16(result);
             }
             2 => { // NOT
-                self.write_rm16(ea, is_mem, ea as u8, !val);
+                self.write_rm16(ea, is_mem, rm, !val);
             }
             3 => { // NEG
                 let result = (0u32).wrapping_sub(val as u32);
                 self.cpu.update_flags_sub16(0, val, result);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             4 => { // MUL
                 let result = (self.cpu.ax as u32) * (val as u32);
@@ -2009,7 +2158,7 @@ impl DosTask {
     }
 
     fn exec_group4(&mut self) {
-        let (op, val, ea, is_mem) = self.read_rm8();
+        let (op, val, ea, rm, is_mem) = self.read_rm8();
         let cf = self.cpu.get_flag(FLAG_CF);
 
         match op {
@@ -2017,20 +2166,20 @@ impl DosTask {
                 let result = (val as u16).wrapping_add(1);
                 self.cpu.update_flags_add8(val, 1, result);
                 self.cpu.set_flag(FLAG_CF, cf);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             1 => { // DEC
                 let result = (val as u16).wrapping_sub(1);
                 self.cpu.update_flags_sub8(val, 1, result);
                 self.cpu.set_flag(FLAG_CF, cf);
-                self.write_rm8(ea, is_mem, ea as u8, result as u8);
+                self.write_rm8(ea, is_mem, rm, result as u8);
             }
             _ => {}
         }
     }
 
     fn exec_group5(&mut self) {
-        let (op, val, ea, is_mem) = self.read_rm16();
+        let (op, val, ea, rm, is_mem) = self.read_rm16();
 
         match op {
             0 => { // INC
@@ -2038,14 +2187,14 @@ impl DosTask {
                 let result = (val as u32).wrapping_add(1);
                 self.cpu.update_flags_add16(val, 1, result);
                 self.cpu.set_flag(FLAG_CF, cf);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             1 => { // DEC
                 let cf = self.cpu.get_flag(FLAG_CF);
                 let result = (val as u32).wrapping_sub(1);
                 self.cpu.update_flags_sub16(val, 1, result);
                 self.cpu.set_flag(FLAG_CF, cf);
-                self.write_rm16(ea, is_mem, ea as u8, result as u16);
+                self.write_rm16(ea, is_mem, rm, result as u16);
             }
             2 => { // CALL near indirect
                 self.push16(self.cpu.ip);
@@ -2197,6 +2346,22 @@ impl DosTask {
 
     fn exec_rep(&mut self, repe: bool) {
         let opcode = self.fetch_u8();
+
+        // Debug: log REP operation start
+        serial_write_bytes(b"  REP op=");
+        serial_write_hex8(opcode);
+        serial_write_bytes(b" CX=");
+        serial_write_hex16(self.cpu.cx);
+        serial_write_bytes(b" DS:SI=");
+        serial_write_hex16(self.cpu.ds);
+        serial_write_bytes(b":");
+        serial_write_hex16(self.cpu.si);
+        serial_write_bytes(b" ES:DI=");
+        serial_write_hex16(self.cpu.es);
+        serial_write_bytes(b":");
+        serial_write_hex16(self.cpu.di);
+        serial_write_bytes(b"\r\n");
+
         loop {
             if self.cpu.cx == 0 { break; }
 
@@ -2223,6 +2388,24 @@ impl DosTask {
                 if !repe && zf { break; }  // REPNE/REPNZ: stop if equal
             }
         }
+
+        // Debug: log REP operation end
+        serial_write_bytes(b"  REP done SI=");
+        serial_write_hex16(self.cpu.si);
+
+        // Dump first 16 bytes of destination if ES=0x2619 and MOVSW/MOVSB
+        if matches!(opcode, 0xA4 | 0xA5) && self.cpu.es == 0x2619 {
+            serial_write_bytes(b"\r\n  Dest dump ES:0000: ");
+            for i in 0..16 {
+                let b = self.read_u8(self.cpu.es, i);
+                serial_write_hex8(b);
+                serial_write_bytes(b" ");
+            }
+            serial_write_bytes(b"\r\n");
+        }
+        serial_write_bytes(b" DI=");
+        serial_write_hex16(self.cpu.di);
+        serial_write_bytes(b"\r\n");
     }
 
     // I/O port access (stubbed - can be extended)
@@ -2231,22 +2414,62 @@ impl DosTask {
     fn port_out8(&self, _port: u16, _val: u8) {}
     fn port_out16(&self, _port: u16, _val: u16) {}
 
+    // Log to serial (shows in QEMU serial log)
+    fn log_serial(&mut self, msg: &str) {
+        serial_write_bytes(msg.as_bytes());
+        serial_write_bytes(b"\r\n");
+    }
+
+    // Log unhandled interrupt/function
+    fn log_unhandled(&mut self, msg: &str) {
+        serial_write_bytes(b"!!! ");
+        serial_write_bytes(msg.as_bytes());
+        serial_write_bytes(b"\r\n");
+    }
+
     // Interrupt handling
     fn handle_int(&mut self, int_no: u8) {
+        // Log all interrupts
+        serial_write_bytes(b"INT ");
+        serial_write_hex8(int_no);
+        serial_write_bytes(b"h AX=");
+        serial_write_hex16(self.cpu.ax);
+        serial_write_bytes(b"\r\n");
+
         match int_no {
             0x00 => {
                 // Division by zero - terminate
+                serial_write_bytes(b"  -> DIV BY ZERO, terminating\r\n");
                 self.state = TaskState::Terminated;
             }
             0x10 => self.handle_int10(),
+            0x11 => {
+                // Equipment list - return basic config
+                self.cpu.ax = 0x0021; // Math coprocessor, 80x25 color
+            }
+            0x12 => {
+                // Memory size - return 640KB conventional
+                self.cpu.ax = 640;
+            }
             0x16 => self.handle_int16(),
+            0x1A => self.handle_int1a(),
             0x20 => {
                 // DOS terminate
+                serial_write_bytes(b"  -> TERMINATE\r\n");
                 self.state = TaskState::Terminated;
             }
             0x21 => self.handle_int21(),
+            0x2F => {
+                // Multiplex interrupt - just return
+                self.cpu.ax = 0;
+            }
+            0x33 => {
+                // Mouse - not present
+                self.cpu.ax = 0;
+            }
             _ => {
-                // Unhandled interrupt - ignore for now
+                // Log unhandled interrupt
+                self.log_unhandled(&format!("[INT {:02X}h unhandled]", int_no));
             }
         }
     }
@@ -2255,23 +2478,134 @@ impl DosTask {
     fn handle_int10(&mut self) {
         let ah = (self.cpu.ax >> 8) as u8;
         match ah {
-            0x0E => {
-                // Teletype output
-                let ch = self.cpu.ax as u8;
-                serial_write_bytes(&[ch]);
-            }
             0x00 => {
-                // Set video mode - ignore
+                // Set video mode - pretend success
+                self.cpu.ax = (self.cpu.ax & 0xFF00) | 0x03; // 80x25 color
+            }
+            0x01 => {
+                // Set cursor shape - ignore
             }
             0x02 => {
-                // Set cursor position - ignore for now
+                // Set cursor position
+                let row = (self.cpu.dx >> 8) as u8;
+                let col = self.cpu.dx as u8;
+                if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
+                    con.set_cursor(col, row);
+                }
             }
             0x03 => {
                 // Get cursor position
-                self.cpu.dx = 0; // Row 0, col 0
+                if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
+                    self.cpu.dx = ((con.cursor_y as u16) << 8) | (con.cursor_x as u16);
+                } else {
+                    self.cpu.dx = 0;
+                }
                 self.cpu.cx = 0x0607; // Default cursor shape
             }
-            _ => {}
+            0x05 => {
+                // Set active display page - ignore (single page)
+            }
+            0x06 => {
+                // Scroll up window
+                let lines = self.cpu.ax as u8;
+                let attr = (self.cpu.bx >> 8) as u8;
+                let top = (self.cpu.cx >> 8) as u8;
+                let left = self.cpu.cx as u8;
+                let bottom = (self.cpu.dx >> 8) as u8;
+                let right = self.cpu.dx as u8;
+                if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
+                    con.scroll_up(lines, attr, top, left, bottom, right);
+                }
+            }
+            0x07 => {
+                // Scroll down window - similar to scroll up
+                let lines = self.cpu.ax as u8;
+                let attr = (self.cpu.bx >> 8) as u8;
+                let top = (self.cpu.cx >> 8) as u8;
+                let left = self.cpu.cx as u8;
+                let bottom = (self.cpu.dx >> 8) as u8;
+                let right = self.cpu.dx as u8;
+                if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
+                    con.scroll_down(lines, attr, top, left, bottom, right);
+                }
+            }
+            0x08 => {
+                // Read character and attribute at cursor
+                self.cpu.ax = 0x0720; // Space with white on black
+            }
+            0x09 => {
+                // Write character and attribute at cursor
+                let ch = self.cpu.ax as u8;
+                let count = self.cpu.cx;
+                for _ in 0..count {
+                    self.console_putchar(ch);
+                }
+            }
+            0x0A => {
+                // Write character only at cursor
+                let ch = self.cpu.ax as u8;
+                let count = self.cpu.cx;
+                for _ in 0..count {
+                    self.console_putchar(ch);
+                }
+            }
+            0x0E => {
+                // Teletype output
+                let ch = self.cpu.ax as u8;
+                self.console_putchar(ch);
+            }
+            0x0F => {
+                // Get video mode
+                self.cpu.ax = 0x5003; // 80 columns, mode 3
+                self.cpu.bx = 0; // Page 0
+            }
+            0x10 => {
+                // Set/get palette - ignore
+            }
+            0x11 => {
+                // Character generator - ignore
+            }
+            0x12 => {
+                // Video subsystem config - return EGA/VGA info
+                self.cpu.bx = 0x0003; // 256KB, color
+            }
+            0x1A => {
+                // Get/set display combination
+                self.cpu.ax = 0x001A; // Function supported
+                self.cpu.bx = 0x0008; // VGA with color
+            }
+            _ => {
+                self.log_unhandled(&alloc::format!("[INT 10h AH={:02X}h]", ah));
+            }
+        }
+    }
+
+    // INT 1Ah - Time/Date services
+    fn handle_int1a(&mut self) {
+        let ah = (self.cpu.ax >> 8) as u8;
+        match ah {
+            0x00 => {
+                // Get system time (ticks since midnight)
+                // Return a fake time - about 12:00 noon
+                self.cpu.cx = 0x000F; // High word
+                self.cpu.dx = 0x4240; // Low word (~12:00)
+                self.cpu.ax = 0; // Midnight flag
+            }
+            0x02 => {
+                // Get RTC time - return 12:00:00
+                self.cpu.cx = 0x1200; // 12:00 in BCD
+                self.cpu.dx = 0x0000; // 00 seconds
+                self.cpu.set_flag(FLAG_CF, false);
+            }
+            0x04 => {
+                // Get RTC date - return 2025-12-25
+                self.cpu.cx = 0x2025; // Year in BCD
+                self.cpu.dx = 0x1225; // Month/Day in BCD
+                self.cpu.set_flag(FLAG_CF, false);
+            }
+            _ => {
+                self.log_unhandled(&alloc::format!("[INT 1Ah AH={:02X}h]", ah));
+            }
         }
     }
 
@@ -2279,20 +2613,29 @@ impl DosTask {
     fn handle_int16(&mut self) {
         let ah = (self.cpu.ax >> 8) as u8;
         match ah {
-            0x00 => {
+            0x00 | 0x10 => {
                 // Get key - return 0 for now (no key)
+                // TODO: Hook into actual keyboard input
                 self.cpu.ax = 0;
             }
-            0x01 => {
+            0x01 | 0x11 => {
                 // Check key status
                 self.cpu.set_flag(FLAG_ZF, true); // No key available
                 self.cpu.ax = 0;
             }
-            0x02 => {
+            0x02 | 0x12 => {
                 // Get shift flags
                 self.cpu.ax = (self.cpu.ax & 0xFF00) | 0; // No shift keys
             }
-            _ => {}
+            0x03 => {
+                // Set typematic rate - ignore
+            }
+            0x05 => {
+                // Store key in buffer - ignore
+            }
+            _ => {
+                self.log_unhandled(&alloc::format!("[INT 16h AH={:02X}h]", ah));
+            }
         }
     }
 
@@ -2307,7 +2650,7 @@ impl DosTask {
             0x02 => {
                 // Display character
                 let ch = self.cpu.dx as u8;
-                serial_write_bytes(&[ch]);
+                self.console_putchar(ch);
             }
             0x06 => {
                 // Direct console I/O
@@ -2318,7 +2661,7 @@ impl DosTask {
                     self.cpu.ax = (self.cpu.ax & 0xFF00) | 0;
                 } else {
                     // Output
-                    serial_write_bytes(&[dl]);
+                    self.console_putchar(dl);
                 }
             }
             0x09 => {
@@ -2328,7 +2671,7 @@ impl DosTask {
                 loop {
                     let ch = self.read_u8(ds, off);
                     if ch == b'$' { break; }
-                    serial_write_bytes(&[ch]);
+                    self.console_putchar(ch);
                     off = off.wrapping_add(1);
                 }
             }
@@ -2409,10 +2752,10 @@ impl DosTask {
                 let dx = self.cpu.dx;
 
                 if handle == 1 || handle == 2 {
-                    // stdout or stderr
+                    // stdout or stderr - write to console
                     for i in 0..count {
                         let ch = self.read_u8(ds, dx.wrapping_add(i as u16));
-                        serial_write_bytes(&[ch]);
+                        self.console_putchar(ch);
                     }
                     self.cpu.ax = count as u16;
                     self.cpu.set_flag(FLAG_CF, false);
@@ -2440,20 +2783,132 @@ impl DosTask {
                     self.cpu.ax = 0x06; // Invalid handle
                 }
             }
+            0x44 => {
+                // IOCTL - device control
+                let al = self.cpu.ax as u8;
+                match al {
+                    0x00 => {
+                        // Get device info - return char device
+                        self.cpu.dx = 0x80D3; // Char device, not EOF
+                        self.cpu.set_flag(FLAG_CF, false);
+                    }
+                    _ => {
+                        self.cpu.set_flag(FLAG_CF, false);
+                        self.cpu.ax = 0;
+                    }
+                }
+            }
+            0x48 => {
+                // Allocate memory: BX = paragraphs
+                // Return a fake segment
+                let paras = self.cpu.bx;
+                self.cpu.ax = 0x2000; // Return segment 0x2000
+                self.cpu.set_flag(FLAG_CF, false);
+            }
+            0x49 => {
+                // Free memory - just succeed
+                self.cpu.set_flag(FLAG_CF, false);
+            }
             0x4A => {
                 // Resize memory block - just succeed
                 self.cpu.set_flag(FLAG_CF, false);
             }
+            0x4B => {
+                // EXEC - load and execute program
+                // This is complex - log and fail for now
+                let filename = self.read_asciiz_string(self.cpu.ds, self.cpu.dx);
+                self.log_unhandled(&alloc::format!("[EXEC: {}]", filename));
+                self.cpu.set_flag(FLAG_CF, true);
+                self.cpu.ax = 0x02; // File not found
+            }
             0x4C => {
                 // Terminate with return code
                 self.state = TaskState::Terminated;
+                // Remove console and switch to parent
+                console::manager().remove_console(self.console_id);
             }
-            0x62 => {
+            0x4D => {
+                // Get return code of child
+                self.cpu.ax = 0; // No child, return 0
+            }
+            0x4E => {
+                // Find first file (FCB) - not implemented
+                self.cpu.set_flag(FLAG_CF, true);
+                self.cpu.ax = 0x12; // No more files
+            }
+            0x4F => {
+                // Find next file (FCB) - not implemented
+                self.cpu.set_flag(FLAG_CF, true);
+                self.cpu.ax = 0x12; // No more files
+            }
+            0x50 => {
+                // Set PSP - ignore
+            }
+            0x51 | 0x62 => {
                 // Get PSP address
-                self.cpu.bx = 0; // PSP at segment 0
+                self.cpu.bx = 0x1000; // PSP at segment 0x1000
+            }
+            0x52 => {
+                // Get DOS internal pointer - return dummy
+                self.cpu.es = 0;
+                self.cpu.bx = 0;
+            }
+            0x57 => {
+                // Get/Set file date/time
+                let al = self.cpu.ax as u8;
+                if al == 0 {
+                    // Get - return current date/time
+                    self.cpu.cx = 0x6000; // 12:00:00
+                    self.cpu.dx = 0x5B39; // 2025-12-25
+                    self.cpu.set_flag(FLAG_CF, false);
+                } else {
+                    // Set - just succeed
+                    self.cpu.set_flag(FLAG_CF, false);
+                }
+            }
+            0x58 => {
+                // Get/Set memory allocation strategy
+                self.cpu.ax = 0;
+                self.cpu.set_flag(FLAG_CF, false);
+            }
+            0x59 => {
+                // Get extended error info
+                self.cpu.ax = 0; // No error
+                self.cpu.bx = 0;
+                self.cpu.cx = 0;
+            }
+            0x5A => {
+                // Create temp file - create in current dir
+                let handle = self.alloc_handle();
+                if let Some(h) = handle {
+                    self.file_handles[h as usize] = Some(FileHandle {
+                        filename: String::from("TEMP.$$$"),
+                        position: 0,
+                        size: 0,
+                        data: Vec::new(),
+                        writable: true,
+                    });
+                    self.cpu.ax = h;
+                    self.cpu.set_flag(FLAG_CF, false);
+                } else {
+                    self.cpu.set_flag(FLAG_CF, true);
+                    self.cpu.ax = 0x04; // Too many files
+                }
+            }
+            0x5B => {
+                // Create new file - fail if exists
+                let filename = self.read_asciiz_string(self.cpu.ds, self.cpu.dx);
+                if let Some(handle) = self.dos_create_file(&filename) {
+                    self.cpu.ax = handle;
+                    self.cpu.set_flag(FLAG_CF, false);
+                } else {
+                    self.cpu.set_flag(FLAG_CF, true);
+                    self.cpu.ax = 0x05;
+                }
             }
             _ => {
-                // Unsupported function
+                // Log unhandled DOS function
+                self.log_unhandled(&alloc::format!("[INT 21h AH={:02X}h]", ah));
                 self.cpu.set_flag(FLAG_CF, true);
                 self.cpu.ax = 0x01; // Invalid function
             }
@@ -2497,27 +2952,22 @@ impl DosTask {
         Some(handle)
     }
 
-    // DOS Open File (INT 21h/3Dh)
+    // DOS Open File (INT 21h/3Dh) - uses VFS for any filesystem
     fn dos_open_file(&mut self, filename: &str, mode: u8) -> Option<u16> {
-        // Try to open from WFS
-        let current = disk::drive_manager().current_drive();
-        let drive = disk::drive_manager().get_drive(current)?;
-        let ahci = disk::AhciController::new_port(drive.disk_port)?;
-        let mut wfs = disk::Wfs::mount(ahci)?;
+        // Use VFS abstraction - works with WFS, FAT, or any filesystem
+        let current_name = disk::drive_manager().current_drive_name().to_string();
+        let mut vfs = disk::drive_manager().get_vfs(&current_name)?;
 
-        // Find the file
-        let entry = wfs.find_file(filename)?;
-
-        // Read file data
-        let mut data = vec![0u8; entry.size as usize];
-        wfs.read_file(&entry, &mut data)?;
+        // Read file data using VFS
+        let data = vfs.read_file(filename).ok()?;
+        let size = data.len() as u32;
 
         // Allocate handle
         let handle = self.alloc_handle()?;
         self.file_handles[handle as usize] = Some(FileHandle {
             filename: String::from(filename),
             position: 0,
-            size: entry.size as u32,
+            size,
             data,
             writable: (mode & 1) != 0 || (mode & 2) != 0,
         });
@@ -2630,6 +3080,11 @@ fn serial_write_hex8(n: u8) {
     outb(0x3F8, HEX[(n & 0xF) as usize]);
 }
 
+fn serial_write_hex16(n: u16) {
+    serial_write_hex8((n >> 8) as u8);
+    serial_write_hex8(n as u8);
+}
+
 static mut TASK_LIST: Option<Vec<DosTask>> = None;
 
 impl Runtime for Dos16Runtime {
@@ -2671,6 +3126,16 @@ pub fn poll_tasks() {
                     i += 1;
                 }
             }
+        }
+    }
+}
+
+pub fn has_running_tasks() -> bool {
+    unsafe {
+        if let Some(list) = TASK_LIST.as_ref() {
+            !list.is_empty()
+        } else {
+            false
         }
     }
 }

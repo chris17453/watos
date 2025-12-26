@@ -166,8 +166,16 @@ if [ -f "$PROJECT_ROOT/output/watos.img" ]; then
     QEMU_CMD+=(-device ide-hd,drive=wfsdisk,bus=ide.1)
 fi
 
+# Add DOS 6.22 disk as FAT drive if the folder exists
+DOS_DIR="$PROJECT_ROOT/dos-6.22"
+if [ -d "$DOS_DIR" ]; then
+    QEMU_CMD+=(-drive "file=fat:rw:$DOS_DIR,format=raw,if=none,id=dosdisk")
+    QEMU_CMD+=(-device ide-hd,drive=dosdisk,bus=ide.2)
+fi
+
 if [ "$INTERACTIVE" = true ]; then
     log "Starting QEMU in interactive mode..."
+    log "Serial log: $SERIAL_LOG"
     log "Close the QEMU window to exit (Ctrl+C in terminal)"
 
     # Build QEMU command with optional WFS data disk
@@ -183,7 +191,8 @@ if [ "$INTERACTIVE" = true ]; then
         -device e1000,netdev=net0
         -vga std
         -display gtk
-        -serial stdio
+        -chardev stdio,id=char0,mux=on,logfile="$SERIAL_LOG"
+        -serial chardev:char0
     )
 
     # Add WFS data disk if it exists
@@ -191,6 +200,14 @@ if [ "$INTERACTIVE" = true ]; then
         log "Adding WFS data disk: output/watos.img to ide.1"
         QEMU_ARGS+=(-drive "file=$PROJECT_ROOT/output/watos.img,format=raw,if=none,id=wfsdisk")
         QEMU_ARGS+=(-device ide-hd,drive=wfsdisk,bus=ide.1)
+    fi
+
+    # Add DOS 6.22 disk as FAT drive if the folder exists
+    DOS_DIR="$PROJECT_ROOT/dos-6.22"
+    if [ -d "$DOS_DIR" ]; then
+        log "Adding DOS 6.22 disk: dos-6.22/ as FAT drive on ide.2"
+        QEMU_ARGS+=(-drive "file=fat:rw:$DOS_DIR,format=raw,if=none,id=dosdisk")
+        QEMU_ARGS+=(-device ide-hd,drive=dosdisk,bus=ide.2)
     fi
 
     qemu-system-x86_64 "${QEMU_ARGS[@]}"

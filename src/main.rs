@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+use alloc::string::{String, ToString};
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 
@@ -12,6 +13,7 @@ mod interrupts;
 mod net;
 mod disk;
 mod runtime;
+pub mod console;
 
 // Boot info structure from bootloader at 0x80000
 #[repr(C)]
@@ -42,6 +44,9 @@ static mut CURSOR_X: u32 = 0;
 static mut CURSOR_Y: u32 = 0;
 static mut TEXT_COLS: u32 = 80;
 static mut TEXT_ROWS: u32 = 25;
+static mut CURSOR_VISIBLE: bool = true;
+static mut CURSOR_BLINK_COUNTER: u32 = 0;
+const CURSOR_BLINK_RATE: u32 = 9; // Blink every ~500ms at 18.2Hz
 
 // 8x16 VGA font - standard PC BIOS font for ASCII 32-126
 // Each character is 16 bytes (16 rows of 8 pixels)
@@ -325,6 +330,7 @@ fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
         0x0C => if shift { b'_' } else { b'-' },
         0x0D => if shift { b'+' } else { b'=' },
         0x0E => 0x08, // Backspace
+        0x0F => 0x09, // Tab
         0x10 => if shift { b'Q' } else { b'q' },
         0x11 => if shift { b'W' } else { b'w' },
         0x12 => if shift { b'E' } else { b'e' },
@@ -441,16 +447,89 @@ unsafe fn fb_scroll() {
             fb_put_pixel(x, y, 0, 0, 170); // Blue background
         }
     }
+}
+
+// Render a console's buffer to the framebuffer
+pub unsafe fn render_console(con: &console::Console) {
+    // VGA 16-color palette (CGA/EGA compatible)
+    const PALETTE: [(u8, u8, u8); 16] = [
+        (0, 0, 0),       // 0: Black
+        (0, 0, 170),     // 1: Blue
+        (0, 170, 0),     // 2: Green
+        (0, 170, 170),   // 3: Cyan
+        (170, 0, 0),     // 4: Red
+        (170, 0, 170),   // 5: Magenta
+        (170, 85, 0),    // 6: Brown
+        (170, 170, 170), // 7: Light Gray
+        (85, 85, 85),    // 8: Dark Gray
+        (85, 85, 255),   // 9: Light Blue
+        (85, 255, 85),   // 10: Light Green
+        (85, 255, 255),  // 11: Light Cyan
+        (255, 85, 85),   // 12: Light Red
+        (255, 85, 255),  // 13: Light Magenta
+        (255, 255, 85),  // 14: Yellow
+        (255, 255, 255), // 15: White
+    ];
+
+    for row in 0..console::CONSOLE_ROWS {
+        for col in 0..console::CONSOLE_COLS {
+            let cell = con.buffer[row * console::CONSOLE_COLS + col];
+            let (fg_r, fg_g, fg_b) = PALETTE[(cell.fg & 0x0F) as usize];
+            let (bg_r, bg_g, bg_b) = PALETTE[(cell.bg & 0x07) as usize];
+            let px = (col as u32) * CHAR_WIDTH;
+            let py = (row as u32) * CHAR_HEIGHT;
+            fb_draw_char(px, py, cell.ch, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+        }
+    }
+
+    // Draw cursor if visible
+    if con.cursor_visible {
+        let cx = con.cursor_x as u32 * CHAR_WIDTH;
+        let cy = con.cursor_y as u32 * CHAR_HEIGHT + CHAR_HEIGHT - 2;
+        for row in 0..2 {
+            for col in 0..CHAR_WIDTH {
+                fb_put_pixel(cx + col, cy + row, 255, 255, 255);
+            }
+        }
+    }
 
     CURSOR_Y = TEXT_ROWS - 1;
 }
 
+// Draw or erase cursor at current position
+unsafe fn fb_draw_cursor(show: bool) {
+    let px = CURSOR_X * CHAR_WIDTH;
+    let py = CURSOR_Y * CHAR_HEIGHT + CHAR_HEIGHT - 2; // Bottom 2 lines of cell
+    let (r, g, b) = if show { (255, 255, 255) } else { (0, 0, 170) }; // White or background
+    for row in 0..2 {
+        for col in 0..CHAR_WIDTH {
+            fb_put_pixel(px + col, py + row, r, g, b);
+        }
+    }
+}
+
+// Called by timer interrupt to blink cursor
+pub unsafe fn cursor_tick() {
+    CURSOR_BLINK_COUNTER += 1;
+    if CURSOR_BLINK_COUNTER >= CURSOR_BLINK_RATE {
+        CURSOR_BLINK_COUNTER = 0;
+        CURSOR_VISIBLE = !CURSOR_VISIBLE;
+        fb_draw_cursor(CURSOR_VISIBLE);
+    }
+}
+
 unsafe fn fb_putchar(c: u8) {
+    // Erase cursor before moving
+    fb_draw_cursor(false);
+
     match c {
         b'\n' => {
             CURSOR_X = 0;
             CURSOR_Y += 1;
-            if CURSOR_Y >= TEXT_ROWS { fb_scroll(); }
+            if CURSOR_Y >= TEXT_ROWS {
+                fb_scroll();
+                CURSOR_Y = TEXT_ROWS - 1; // Keep cursor on last row after scroll
+            }
         }
         b'\r' => { CURSOR_X = 0; }
         0x08 => {
@@ -469,10 +548,18 @@ unsafe fn fb_putchar(c: u8) {
             if CURSOR_X >= TEXT_COLS {
                 CURSOR_X = 0;
                 CURSOR_Y += 1;
-                if CURSOR_Y >= TEXT_ROWS { fb_scroll(); }
+                if CURSOR_Y >= TEXT_ROWS {
+                    fb_scroll();
+                    CURSOR_Y = TEXT_ROWS - 1; // Keep cursor on last row after scroll
+                }
             }
         }
     }
+
+    // Redraw cursor at new position
+    CURSOR_VISIBLE = true;
+    CURSOR_BLINK_COUNTER = 0;
+    fb_draw_cursor(true);
 }
 
 unsafe fn fb_print(s: &[u8]) {
@@ -482,6 +569,15 @@ unsafe fn fb_print(s: &[u8]) {
 pub unsafe fn console_print(s: &[u8]) {
     serial_write(s);
     fb_print(s);
+    // Also write to active console's buffer so state is preserved
+    console::manager().active().print(s);
+}
+
+// Print the command prompt with current drive name
+pub unsafe fn print_prompt() {
+    let name = disk::drive_manager().current_drive_name();
+    console_print(name.as_bytes());
+    console_print(b":\\> ");
 }
 
 // Helper to print a u8 as decimal
@@ -542,21 +638,88 @@ unsafe fn print_hex32(val: u32) {
     console_print(&buf);
 }
 
-// Helper to print u64 size right-aligned in 10 chars
-unsafe fn print_size_padded(val: u64) {
-    let mut buf = [b' '; 10];  // Pre-fill with spaces for right alignment
+// Helper to print u32 with commas (e.g., 1,234,567)
+unsafe fn print_u32_with_commas(val: u32) {
+    let mut buf = [0u8; 14];  // Max: "4,294,967,295"
     let mut n = val;
-    let mut pos = 9;
+    let mut pos = 13;
+    let mut digit_count = 0;
 
     loop {
+        if digit_count > 0 && digit_count % 3 == 0 {
+            buf[pos] = b',';
+            pos -= 1;
+        }
         buf[pos] = b'0' + (n % 10) as u8;
         n /= 10;
+        digit_count += 1;
+        if n == 0 {
+            break;
+        }
+        pos -= 1;
+    }
+    console_print(&buf[pos..14]);
+}
+
+// Helper to print u64 size right-aligned in 14 chars with commas
+unsafe fn print_size_padded(val: u64) {
+    // Format: "    1,234,567" (14 chars with commas, right-aligned)
+    let mut buf = [b' '; 14];
+    let mut n = val;
+    let mut pos = 13;
+    let mut digit_count = 0;
+
+    loop {
+        if digit_count > 0 && digit_count % 3 == 0 && pos > 0 {
+            buf[pos] = b',';
+            pos -= 1;
+        }
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        digit_count += 1;
         if n == 0 || pos == 0 {
             break;
         }
         pos -= 1;
     }
     console_print(&buf);
+}
+
+// Simple wildcard pattern matching (supports * and ?)
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.to_ascii_uppercase();
+    let text = text.to_ascii_uppercase();
+    wildcard_match_impl(pattern.as_bytes(), text.as_bytes())
+}
+
+fn wildcard_match_impl(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    let mut star_p = usize::MAX;
+    let mut star_t = 0;
+
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star_p = p;
+            star_t = t;
+            p += 1;
+        } else if star_p != usize::MAX {
+            p = star_p + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
 }
 
 #[no_mangle]
@@ -590,12 +753,15 @@ pub extern "C" fn kernel_main() -> ! {
         serial_write(b"Screen cleared\r\n");
     }
 
-    // Initialize heap
+    // Initialize heap (4 MiB for DOS task memory + other allocations)
     unsafe {
         const HEAP_START: usize = 0x300000;
-        const HEAP_SIZE: usize = 64 * 1024;
+        const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
         ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE);
     }
+
+    // Initialize console system (multi-session support)
+    console::init();
 
     // Initialize interrupts (timer + keyboard)
     unsafe {
@@ -609,7 +775,7 @@ pub extern "C" fn kernel_main() -> ! {
     // Display boot banner
     unsafe {
         console_print(b"=====================================\n");
-        console_print(b"         DOS64 Kernel v0.1\n");
+        console_print(b"         DOS64 Kernel v0.2\n");
         console_print(b"   64-bit DOS-compatible OS in Rust\n");
         console_print(b"=====================================\n");
         console_print(b"\n");
@@ -674,26 +840,55 @@ pub extern "C" fn kernel_main() -> ! {
         console_print(b"\nType 'help' for commands.\n");
         console_print(b"\n");
         runtime::register_default_runtimes();
-        let drive = disk::drive_manager().current_drive();
-        console_print(&[drive, b':', b'\\', b'>', b' ']);
+        print_prompt();
     }
 
     // Main command loop
     let mut command_buffer = [0u8; 64];
     let mut buffer_pos: usize = 0;
     let mut shift_pressed = false;
+    let mut ctrl_pressed = false;
+    let mut last_tick: u64 = 0;
+
+    // Enable timer for cursor blinking
+    interrupts::enable_timer();
+
+    // Draw initial cursor
+    unsafe { fb_draw_cursor(true); }
 
     loop {
         // Wait for interrupt first (power saving)
         interrupts::halt();
         runtime::poll_tasks();
 
+        // Blink cursor on timer tick
+        let current_tick = interrupts::get_ticks();
+        if current_tick != last_tick {
+            last_tick = current_tick;
+            unsafe { cursor_tick(); }
+        }
+
         // After waking, check for input
         let ch = unsafe {
             if let Some(scancode) = interrupts::get_scancode() {
-                // Convert interrupt scancode to char
+                // Track modifier keys
                 if scancode == 0x2A || scancode == 0x36 { shift_pressed = true; None }
                 else if scancode == 0xAA || scancode == 0xB6 { shift_pressed = false; None }
+                else if scancode == 0x1D { ctrl_pressed = true; None } // Left Ctrl press
+                else if scancode == 0x9D { ctrl_pressed = false; None } // Left Ctrl release
+                else if scancode == 0x0F && ctrl_pressed {
+                    // Ctrl+Tab - switch console
+                    let new_id = if shift_pressed {
+                        console::manager().prev()
+                    } else {
+                        console::manager().next()
+                    };
+                    // Render the newly active console
+                    if let Some(con) = console::manager().get(new_id) {
+                        render_console(con);
+                    }
+                    None
+                }
                 else { scancode_to_ascii(scancode, shift_pressed) }
             } else if let Some(c) = serial_read_char() {
                 Some(c)
@@ -712,31 +907,41 @@ pub extern "C" fn kernel_main() -> ! {
                     match cmd.trim() {
                         "help" => unsafe {
                             console_print(b"Commands:\n");
-                            console_print(b"  help       - Show this help\n");
-                            console_print(b"  ver        - Show version\n");
-                            console_print(b"  vol        - Show mounted volumes\n");
-                            console_print(b"  C: D: etc  - Change drive\n");
-                            console_print(b"  dir        - List files\n");
-                            console_print(b"  type <f>   - Display file contents\n");
-                            console_print(b"  chkdsk     - Check filesystem\n");
-                            console_print(b"  format     - Format current drive\n");
-                            console_print(b"  mem        - Memory info\n");
-                            console_print(b"  net        - Network info\n");
-                            console_print(b"  ifconfig   - Show IP config\n");
-                            console_print(b"  ping <ip>  - Ping a host\n");
-                            console_print(b"  cls        - Clear screen\n");
-                            console_print(b"  exit       - Shutdown\n");
+                            console_print(b"  help        - Show this help\n");
+                            console_print(b"  ver         - Show version\n");
+                            console_print(b"  vol         - Show mounted volumes\n");
+                            console_print(b"  C: D: etc   - Change drive\n");
+                            console_print(b"  dir         - List files\n");
+                            console_print(b"  type <file> - Display file contents\n");
+                            console_print(b"  run <file>  - Run a program (.COM/.EXE)\n");
+                            console_print(b"  chkdsk      - Check filesystem\n");
+                            console_print(b"  format      - Format current drive\n");
+                            console_print(b"  mem         - Memory info\n");
+                            console_print(b"  disk        - Disk info\n");
+                            console_print(b"  net         - Network info\n");
+                            console_print(b"  ifconfig    - Show IP config\n");
+                            console_print(b"  netdiag     - Network diagnostics\n");
+                            console_print(b"  ping <ip>   - Ping a host\n");
+                            console_print(b"  cls         - Clear screen\n");
+                            console_print(b"  exit        - Shutdown\n");
                         },
                         "ver" => unsafe {
-                            console_print(b"DOS64 Version 0.1\n");
-                            console_print(b"WFS Filesystem v1.0\n");
+                            console_print(b"DOS64 Version 0.2\n");
+                            console_print(b"VFS Abstraction Layer\n");
+                            console_print(b"WFS Filesystem v2.0\n");
                         },
                         "vol" => unsafe {
                             console_print(b"Mounted Volumes:\n");
-                            console_print(b"Drive  Type    Size     Status\n");
-                            console_print(b"-----  ------  -------  ------\n");
+                            console_print(b"Drive        Type    Size     Status\n");
+                            console_print(b"-----------  ------  -------  ------\n");
                             for drive in disk::drive_manager().list_drives() {
-                                console_print(&[drive.letter, b':', b' ', b' ', b' ', b' ', b' ']);
+                                // Print drive name (up to 10 chars + colon)
+                                console_print(drive.name.as_bytes());
+                                console_print(b":");
+                                // Pad to 13 chars
+                                for _ in drive.name.len()..11 {
+                                    console_print(b" ");
+                                }
                                 let fs_str = drive.fs_type_str();
                                 console_print(fs_str.as_bytes());
                                 for _ in fs_str.len()..8 {
@@ -748,33 +953,38 @@ pub extern "C" fn kernel_main() -> ! {
                         },
                         "chkdsk" => unsafe {
                             console_print(b"Checking filesystem...\n");
-                            if let Some(ahci) = disk::AhciController::new() {
-                                if let Some(mut wfs) = disk::Wfs::mount(ahci) {
-                                    let result = wfs.check_filesystem(false);
-                                    console_print(b"Superblocks checked: ");
-                                    print_u8(result.superblocks_checked as u8);
-                                    console_print(b"\n");
-                                    console_print(b"Files checked:       ");
-                                    print_u16(result.files_checked as u16);
-                                    console_print(b"\n");
-                                    console_print(b"Blocks checked:      ");
-                                    print_u16(result.blocks_checked as u16);
-                                    console_print(b"\n");
-                                    if result.errors_found > 0 {
-                                        console_print(b"ERRORS FOUND:        ");
-                                        print_u16(result.errors_found as u16);
+                            let current = disk::drive_manager().current_drive();
+                            if let Some(drive) = disk::drive_manager().get_drive(current) {
+                                if let Some(ahci) = disk::AhciController::new_port(drive.disk_port) {
+                                    if let Some(mut wfs) = disk::Wfs::mount(ahci) {
+                                        let result = wfs.check_filesystem(false);
+                                        console_print(b"Superblocks checked: ");
+                                        print_u8(result.superblocks_checked as u8);
                                         console_print(b"\n");
-                                        console_print(b"Bad blocks:          ");
-                                        print_u16(result.bad_blocks as u16);
+                                        console_print(b"Files checked:       ");
+                                        print_u16(result.files_checked as u16);
                                         console_print(b"\n");
+                                        console_print(b"Blocks checked:      ");
+                                        print_u16(result.blocks_checked as u16);
+                                        console_print(b"\n");
+                                        if result.errors_found > 0 {
+                                            console_print(b"ERRORS FOUND:        ");
+                                            print_u16(result.errors_found as u16);
+                                            console_print(b"\n");
+                                            console_print(b"Bad blocks:          ");
+                                            print_u16(result.bad_blocks as u16);
+                                            console_print(b"\n");
+                                        } else {
+                                            console_print(b"No errors found.\n");
+                                        }
                                     } else {
-                                        console_print(b"No errors found.\n");
+                                        console_print(b"No WFS filesystem on current drive\n");
                                     }
                                 } else {
-                                    console_print(b"No WFS filesystem on current drive\n");
+                                    console_print(b"No disk controller found\n");
                                 }
                             } else {
-                                console_print(b"No disk controller found\n");
+                                console_print(b"Drive not found\n");
                             }
                         },
                         "format" => unsafe {
@@ -786,88 +996,106 @@ pub extern "C" fn kernel_main() -> ! {
                             console_print(b"\nWARNING: All data will be lost!\n");
                             console_print(b"Use 'format X:' to format drive X\n");
                         },
-                        "dir" => unsafe {
-                            let current = disk::drive_manager().current_drive();
-                            if let Some(drive) = disk::drive_manager().get_drive(current) {
+                        _ if cmd.trim() == "dir" || cmd.trim().starts_with("dir ") => unsafe {
+                            // Parse optional filter pattern (e.g., "dir *.exe")
+                            let filter = if cmd.trim().starts_with("dir ") {
+                                cmd.trim().strip_prefix("dir ").unwrap_or("").trim()
+                            } else {
+                                "*"  // Default: match all files
+                            };
+
+                            let current_name = disk::drive_manager().current_drive_name().to_string();
+                            if let Some(drive) = disk::drive_manager().get_drive_by_name(&current_name) {
+                                let partition = drive.partition;
+                                let port = drive.disk_port;
+
                                 console_print(b" Volume in drive ");
-                                console_print(&[current]);
+                                console_print(current_name.as_bytes());
                                 console_print(b" is ");
                                 console_print(drive.fs_type_str().as_bytes());
                                 console_print(b" (port ");
-                                print_u8(drive.disk_port);
+                                print_u8(port);
+                                if partition > 0 {
+                                    console_print(b" part ");
+                                    print_u8(partition);
+                                }
                                 console_print(b")\n Directory of ");
-                                console_print(&[current, b':', b'\\', b'\n', b'\n']);
+                                console_print(current_name.as_bytes());
+                                console_print(b":\\\n\n");
 
-                                // Try to read from WFS disk
-                                // Need a fresh controller since the previous one was consumed
-                                if let Some(ahci) = disk::AhciController::new_port(drive.disk_port) {
-                                    match disk::Wfs::try_mount(ahci) {
-                                        disk::MountResult::Ok(mut wfs) => {
+                                // Use VFS abstraction - works with any filesystem!
+                                if let Some(mut vfs) = disk::drive_manager().get_vfs(&current_name) {
+                                    match vfs.read_dir("/") {
+                                        Ok(entries) => {
                                             let mut count = 0u32;
                                             let mut total_size = 0u64;
-                                            for entry in wfs.list_files() {
-                                                // Show permissions/flags: -rwxshr
-                                                // r=readonly, x=exec, s=system, h=hidden, d=directory
-                                                let flags = entry.flags;
+
+                                            for entry in &entries {
+                                                // Apply filter
+                                                if !wildcard_match(filter, &entry.name) {
+                                                    continue;
+                                                }
+
+                                                // Show attributes: d=dir, r=readonly, x=exec, s=system, h=hidden
                                                 let perm = [
-                                                    if flags & 0x0010 != 0 { b'd' } else { b'-' },  // DIR
-                                                    if flags & 0x0002 != 0 { b'r' } else { b'-' },  // READONLY
-                                                    if flags & 0x0001 != 0 { b'x' } else { b'-' },  // EXEC
-                                                    if flags & 0x0004 != 0 { b's' } else { b'-' },  // SYSTEM
-                                                    if flags & 0x0008 != 0 { b'h' } else { b'-' },  // HIDDEN
+                                                    if entry.is_dir() { b'd' } else { b'-' },
+                                                    if entry.attr.readonly { b'r' } else { b'-' },
+                                                    if entry.attr.executable { b'x' } else { b'-' },
+                                                    if entry.attr.system { b's' } else { b'-' },
+                                                    if entry.attr.hidden { b'h' } else { b'-' },
                                                 ];
                                                 console_print(&perm);
                                                 console_print(b" ");
 
-                                                // Print file size right-aligned (10 chars)
-                                                let size = entry.size;
-                                                print_size_padded(size);
+                                                // Size (directories show <DIR>)
+                                                if entry.is_dir() {
+                                                    console_print(b"         <DIR>  ");
+                                                } else {
+                                                    print_size_padded(entry.size);
+                                                    console_print(b"  ");
+                                                }
+
+                                                // Date from VFS entry
+                                                if entry.mdate != 0 {
+                                                    print_u16(entry.year());
+                                                    console_print(b"-");
+                                                    if entry.month() < 10 { console_print(b"0"); }
+                                                    print_u8(entry.month());
+                                                    console_print(b"-");
+                                                    if entry.day() < 10 { console_print(b"0"); }
+                                                    print_u8(entry.day());
+                                                } else {
+                                                    console_print(b"          ");  // No date
+                                                }
                                                 console_print(b"  ");
 
-                                                // Date (placeholder)
-                                                console_print(b"2025-12-25  ");
-
-                                                // Filename (up to 40 chars to fit nicely)
-                                                let name = entry.name_str();
-                                                for c in name.bytes().take(40) {
-                                                    console_print(&[c]);
-                                                }
+                                                // Filename
+                                                console_print(entry.name.as_bytes());
                                                 console_print(b"\n");
 
                                                 count += 1;
-                                                total_size += size;
+                                                if !entry.is_dir() {
+                                                    total_size += entry.size;
+                                                }
                                             }
-                                            console_print(b"\n");
-                                            print_u16(count as u16);
+                                            console_print(b"\n        ");
+                                            print_u32_with_commas(count);
                                             console_print(b" file(s)  ");
                                             print_size_padded(total_size);
-                                            console_print(b" bytes total\n");
+                                            console_print(b" bytes\n");
                                         }
-                                        disk::MountResult::ReadFailed => {
-                                            console_print(b"Failed to read disk\n");
-                                        }
-                                        disk::MountResult::BadMagic(magic) => {
-                                            console_print(b"Not a WFS disk (magic: 0x");
-                                            print_hex32(magic);
-                                            console_print(b")\n");
-                                        }
-                                        disk::MountResult::CrcMismatch => {
-                                            console_print(b"WFS CRC error: sz=");
-                                            print_u16(disk::DEBUG_SB_SIZE as u16);
-                                            console_print(b" calc=0x");
-                                            print_hex32(disk::DEBUG_CALC_CRC);
-                                            console_print(b" stored=0x");
-                                            print_hex32(disk::DEBUG_STORED_CRC);
-                                            console_print(b"\n");
-                                        }
-                                        disk::MountResult::BadVersion(ver) => {
-                                            console_print(b"Unsupported WFS version: ");
-                                            print_u16(ver);
-                                            console_print(b"\n");
+                                        Err(e) => {
+                                            console_print(b"Error reading directory: ");
+                                            match e {
+                                                disk::FsError::NotFound => console_print(b"not found\n"),
+                                                disk::FsError::IoError => console_print(b"I/O error\n"),
+                                                disk::FsError::Corrupted => console_print(b"filesystem corrupted\n"),
+                                                _ => console_print(b"unknown error\n"),
+                                            }
                                         }
                                     }
                                 } else {
-                                    console_print(b"Disk not accessible\n");
+                                    console_print(b"Could not mount filesystem\n");
                                 }
                             } else {
                                 console_print(b"No drives available\n");
@@ -1050,6 +1278,8 @@ pub extern "C" fn kernel_main() -> ! {
                             fb_clear(0, 0, 170);
                             CURSOR_X = 0;
                             CURSOR_Y = 0;
+                            // Also clear the active console's buffer
+                            console::manager().active().clear();
                         },
                         "exit" => unsafe {
                             console_print(b"System shutting down...\n");
@@ -1061,41 +1291,33 @@ pub extern "C" fn kernel_main() -> ! {
                             if filename.is_empty() {
                                 console_print(b"Usage: type <filename>\n");
                             } else {
-                                // Get current drive from drive manager (same as DIR command)
-                                let current = disk::drive_manager().current_drive();
-                                if let Some(drive) = disk::drive_manager().get_drive(current) {
-                                    // Use the correct port for this drive
-                                    if let Some(ahci) = disk::AhciController::new_port(drive.disk_port) {
-                                        if let Some(mut wfs) = disk::Wfs::mount(ahci) {
-                                            if let Some(entry) = wfs.find_file(filename) {
-                                                // Allocate buffer for file
-                                                let mut buf = alloc::vec![0u8; entry.size as usize];
-                                                if let Some(size) = wfs.read_file(&entry, &mut buf) {
-                                                    // Print file contents
-                                                    for &b in &buf[..size] {
-                                                        if b == b'\n' {
-                                                            console_print(b"\n");
-                                                        } else if b >= 0x20 && b < 0x7F {
-                                                            console_print(&[b]);
-                                                        }
-                                                    }
+                                let current_name = disk::drive_manager().current_drive_name().to_string();
+                                // Use VFS abstraction - works with any filesystem!
+                                if let Some(mut vfs) = disk::drive_manager().get_vfs(&current_name) {
+                                    match vfs.read_file(filename) {
+                                        Ok(data) => {
+                                            for &b in &data {
+                                                if b == b'\n' {
                                                     console_print(b"\n");
-                                                } else {
-                                                    console_print(b"Error reading file\n");
+                                                } else if b == b'\r' {
+                                                    // Skip CR in CR/LF
+                                                } else if b >= 0x20 && b < 0x7F {
+                                                    console_print(&[b]);
                                                 }
-                                            } else {
-                                                console_print(b"File not found: ");
-                                                console_print(filename.as_bytes());
-                                                console_print(b"\n");
                                             }
-                                        } else {
-                                            console_print(b"No WFS filesystem found\n");
+                                            console_print(b"\n");
                                         }
-                                    } else {
-                                        console_print(b"No disk controller found\n");
+                                        Err(disk::FsError::NotFound) => {
+                                            console_print(b"File not found: ");
+                                            console_print(filename.as_bytes());
+                                            console_print(b"\n");
+                                        }
+                                        Err(_) => {
+                                            console_print(b"Error reading file\n");
+                                        }
                                     }
                                 } else {
-                                    console_print(b"Drive not found\n");
+                                    console_print(b"Could not mount filesystem\n");
                                 }
                             }
                         },
@@ -1133,10 +1355,10 @@ pub extern "C" fn kernel_main() -> ! {
                                 console_print(b"Usage: format X:\n");
                             }
                         },
-                        // Drive letter switching (C:, D:, etc.)
-                        _ if cmd.trim().len() == 2 && cmd.trim().ends_with(':') => unsafe {
-                            let letter = cmd.trim().as_bytes()[0].to_ascii_uppercase();
-                            if disk::drive_manager().set_current_drive(letter) {
+                        // Drive switching (C:, D:, cocknballs:, etc.)
+                        _ if cmd.trim().ends_with(':') && cmd.trim().len() >= 2 => unsafe {
+                            let name = &cmd.trim()[..cmd.trim().len()-1]; // Remove trailing ':'
+                            if disk::drive_manager().set_current_drive_name(name) {
                                 // Drive changed successfully
                             } else {
                                 console_print(b"Invalid drive specification\n");
@@ -1182,54 +1404,160 @@ pub extern "C" fn kernel_main() -> ! {
                             if filename.is_empty() {
                                 console_print(b"Usage: run <filename>\n");
                             } else {
-                                // Get current drive from drive manager (same as DIR command)
-                                let current = disk::drive_manager().current_drive();
-                                if let Some(drive) = disk::drive_manager().get_drive(current) {
-                                    // Use the correct port for this drive
-                                    if let Some(ahci) = disk::AhciController::new_port(drive.disk_port) {
-                                        if let Some(mut wfs) = disk::Wfs::mount(ahci) {
-                                            if let Some(entry) = wfs.find_file(filename) {
-                                                let mut buf = alloc::vec![0u8; entry.size as usize];
-                                                if let Some(size) = wfs.read_file(&entry, &mut buf) {
-                                                    // Detect format and dispatch to runtime
-                                                    match runtime::detect_and_run(filename, &buf[..size]) {
-                                                        runtime::RunResult::Scheduled(id) => {
-                                                            console_print(b"Task scheduled: ");
-                                                            print_u16(id as u16);
-                                                            console_print(b"\n");
+                                console_print(b"Loading: ");
+                                console_print(filename.as_bytes());
+                                console_print(b"\n");
+
+                                let current_name = disk::drive_manager().current_drive_name().to_string();
+                                // Use VFS abstraction - works with any filesystem!
+                                if let Some(mut vfs) = disk::drive_manager().get_vfs(&current_name) {
+                                    match vfs.read_file(filename) {
+                                        Ok(data) => {
+                                            console_print(b"File read, bytes: ");
+                                            print_u16(data.len() as u16);
+                                            console_print(b"\n");
+                                            // Detect format and dispatch to runtime
+                                            match runtime::detect_and_run(filename, &data) {
+                                                runtime::RunResult::Scheduled(_id) => {
+                                                    // Render the DOS task's console
+                                                    let active_id = console::manager().active_id();
+                                                    if let Some(con) = console::manager().get(active_id) {
+                                                        render_console(con);
+                                                    }
+                                                    // Run the task immediately until it terminates
+                                                    loop {
+                                                        runtime::poll_tasks();
+                                                        // Render the active console to show output
+                                                        let active_id = console::manager().active_id();
+                                                        if let Some(con) = console::manager().get(active_id) {
+                                                            render_console(con);
                                                         }
-                                                        runtime::RunResult::Failed => {
-                                                            console_print(b"Failed to run file\n");
+                                                        // Check if task is still running
+                                                        if !runtime::dos16::has_running_tasks() {
+                                                            break;
                                                         }
                                                     }
-                                                } else {
-                                                    console_print(b"Error reading file\n");
+                                                    // Task finished - console switched back to parent
+                                                    // Render the parent console to restore screen state
+                                                    let active_id = console::manager().active_id();
+                                                    if let Some(con) = console::manager().get(active_id) {
+                                                        render_console(con);
+                                                        // Restore cursor position from console
+                                                        CURSOR_X = con.cursor_x as u32;
+                                                        CURSOR_Y = con.cursor_y as u32;
+                                                    }
                                                 }
-                                            } else {
-                                                console_print(b"File not found: ");
-                                                console_print(filename.as_bytes());
-                                                console_print(b"\n");
+                                                runtime::RunResult::Failed => {
+                                                    console_print(b"Failed to run file\n");
+                                                }
                                             }
-                                        } else {
-                                            console_print(b"No WFS filesystem found\n");
                                         }
-                                    } else {
-                                        console_print(b"No disk controller found\n");
+                                        Err(disk::FsError::NotFound) => {
+                                            console_print(b"File not found: ");
+                                            console_print(filename.as_bytes());
+                                            console_print(b"\n");
+                                        }
+                                        Err(_) => {
+                                            console_print(b"Error reading file\n");
+                                        }
                                     }
                                 } else {
-                                    console_print(b"Drive not found\n");
+                                    console_print(b"Could not mount filesystem\n");
                                 }
                             }
                         },
                         _ => unsafe {
-                            console_print(b"Bad command or file name\n");
+                            // Check if it's an executable file (.COM or .EXE)
+                            let cmd_upper = cmd.trim().to_ascii_uppercase();
+                            let is_executable = cmd_upper.ends_with(".COM") || cmd_upper.ends_with(".EXE");
+
+                            if is_executable || !cmd.trim().contains('.') {
+                                let filename = cmd.trim();
+                                let current_name = disk::drive_manager().current_drive_name().to_string();
+
+                                // Use VFS abstraction - works with any filesystem!
+                                if let Some(mut vfs) = disk::drive_manager().get_vfs(&current_name) {
+                                    // Try exact name, then .COM, then .EXE
+                                    let mut actual_name = alloc::string::String::from(filename);
+                                    let mut found = vfs.exists(filename);
+
+                                    if !found && !is_executable {
+                                        // Try with .COM
+                                        let mut com_name = alloc::string::String::from(filename);
+                                        com_name.push_str(".COM");
+                                        if vfs.exists(&com_name) {
+                                            actual_name = com_name;
+                                            found = true;
+                                        }
+                                    }
+                                    if !found && !is_executable {
+                                        // Try with .EXE
+                                        let mut exe_name = alloc::string::String::from(filename);
+                                        exe_name.push_str(".EXE");
+                                        if vfs.exists(&exe_name) {
+                                            actual_name = exe_name;
+                                            found = true;
+                                        }
+                                    }
+
+                                    if found {
+                                        let name_upper = actual_name.to_ascii_uppercase();
+                                        if name_upper.ends_with(".COM") || name_upper.ends_with(".EXE") {
+                                            match vfs.read_file(&actual_name) {
+                                                Ok(data) => {
+                                                    match runtime::detect_and_run(&actual_name, &data) {
+                                                        runtime::RunResult::Scheduled(_id) => {
+                                                            // Render the DOS task's console
+                                                            let active_id = console::manager().active_id();
+                                                            if let Some(con) = console::manager().get(active_id) {
+                                                                render_console(con);
+                                                            }
+                                                            // Run until complete
+                                                            loop {
+                                                                runtime::poll_tasks();
+                                                                let active_id = console::manager().active_id();
+                                                                if let Some(con) = console::manager().get(active_id) {
+                                                                    render_console(con);
+                                                                }
+                                                                if !runtime::dos16::has_running_tasks() {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            // Restore parent console
+                                                            let active_id = console::manager().active_id();
+                                                            if let Some(con) = console::manager().get(active_id) {
+                                                                render_console(con);
+                                                                CURSOR_X = con.cursor_x as u32;
+                                                                CURSOR_Y = con.cursor_y as u32;
+                                                            }
+                                                        }
+                                                        runtime::RunResult::Failed => {
+                                                            console_print(b"Failed to run program\n");
+                                                        }
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    console_print(b"Error reading file\n");
+                                                }
+                                            }
+                                        } else {
+                                            console_print(b"Bad command or file name\n");
+                                        }
+                                    } else {
+                                        console_print(b"Bad command or file name\n");
+                                    }
+                                } else {
+                                    console_print(b"Bad command or file name\n");
+                                }
+                            } else {
+                                console_print(b"Bad command or file name\n");
+                            }
                         },
                     }
 
                     buffer_pos = 0;
                     unsafe {
-                        let drive = disk::drive_manager().current_drive();
-                        console_print(&[drive, b':', b'\\', b'>', b' ']);
+                        print_prompt();
                     }
                 }
                 0x7F | 0x08 => {
@@ -1238,6 +1566,36 @@ pub extern "C" fn kernel_main() -> ! {
                         unsafe {
                             serial_write(b"\x08 \x08");
                             fb_putchar(0x08);
+                        }
+                    }
+                }
+                0x09 => unsafe {
+                    // Tab completion - uses VFS for any filesystem
+                    let partial = core::str::from_utf8(&command_buffer[..buffer_pos]).unwrap_or("");
+                    let partial_upper = partial.to_ascii_uppercase();
+
+                    let current_name = disk::drive_manager().current_drive_name().to_string();
+                    if let Some(mut vfs) = disk::drive_manager().get_vfs(&current_name) {
+                        if let Ok(entries) = vfs.read_dir("/") {
+                            // Find matching files
+                            for entry in &entries {
+                                let name_upper = entry.name.to_ascii_uppercase();
+                                if name_upper.starts_with(&partial_upper) {
+                                    // Clear current input on screen
+                                    for _ in 0..buffer_pos {
+                                        serial_write(b"\x08 \x08");
+                                        fb_putchar(0x08);
+                                    }
+                                    // Copy new name to buffer
+                                    let name_bytes = entry.name.as_bytes();
+                                    let copy_len = core::cmp::min(name_bytes.len(), 63);
+                                    command_buffer[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                                    buffer_pos = copy_len;
+                                    // Print new name
+                                    console_print(&command_buffer[..buffer_pos]);
+                                    break; // Take first match
+                                }
+                            }
                         }
                     }
                 }
@@ -1253,7 +1611,27 @@ pub extern "C" fn kernel_main() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    unsafe { serial_write(b"KERNEL PANIC!\r\n"); }
+fn panic(info: &PanicInfo) -> ! {
+    unsafe {
+        serial_write(b"KERNEL PANIC!\r\n");
+        if let Some(location) = info.location() {
+            serial_write(b"  at ");
+            serial_write(location.file().as_bytes());
+            serial_write(b":");
+            // Print line number
+            let mut line = location.line();
+            let mut buf = [0u8; 10];
+            let mut i = 9;
+            loop {
+                buf[i] = b'0' + (line % 10) as u8;
+                line /= 10;
+                if line == 0 { break; }
+                if i == 0 { break; }
+                i -= 1;
+            }
+            serial_write(&buf[i..]);
+            serial_write(b"\r\n");
+        }
+    }
     loop { unsafe { core::arch::asm!("hlt"); } }
 }

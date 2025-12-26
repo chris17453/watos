@@ -1,0 +1,11 @@
+[package]
+name = "dos16-core"
+version = "0.1.0"
+edition = "2021"
+description = "DOS 16-bit x86 CPU emulator core - testable in isolation"
+
+[features]
+default = []
+std = []
+
+[dependencies]

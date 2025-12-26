@@ -97,6 +97,8 @@ pub struct AhciController {
     cmd_list: u64,
     cmd_table: u64,
     fis_base: u64,
+    // LBA offset for partition support (0 for raw disk)
+    lba_offset: u64,
 }
 
 impl AhciController {
@@ -153,9 +155,17 @@ impl AhciController {
             cmd_list,
             cmd_table,
             fis_base,
+            lba_offset: 0,
         };
 
         ctrl.init_port();
+        Some(ctrl)
+    }
+
+    /// Initialize AHCI controller for a specific port with LBA offset (for partitions)
+    pub fn new_port_at(target_port: u8, lba_offset: u64) -> Option<Self> {
+        let mut ctrl = Self::new_port(target_port)?;
+        ctrl.lba_offset = lba_offset;
         Some(ctrl)
     }
 
@@ -226,7 +236,7 @@ impl AhciController {
     }
 
     /// Read sectors from disk
-    /// lba: starting sector (512 bytes each)
+    /// lba: starting sector (512 bytes each), relative to partition start
     /// count: number of sectors to read
     /// buffer: destination buffer (must be count * 512 bytes)
     pub fn read_sectors(&mut self, lba: u64, count: u16, buffer: &mut [u8]) -> bool {
@@ -234,7 +244,8 @@ impl AhciController {
             return false;
         }
 
-        self.issue_command(ATA_CMD_READ_DMA_EXT, lba, count, buffer.as_ptr() as u64, false)
+        let absolute_lba = lba + self.lba_offset;
+        self.issue_command(ATA_CMD_READ_DMA_EXT, absolute_lba, count, buffer.as_ptr() as u64, false)
     }
 
     /// Write sectors to disk
@@ -243,7 +254,8 @@ impl AhciController {
             return false;
         }
 
-        self.issue_command(ATA_CMD_WRITE_DMA_EXT, lba, count, buffer.as_ptr() as u64, true)
+        let absolute_lba = lba + self.lba_offset;
+        self.issue_command(ATA_CMD_WRITE_DMA_EXT, absolute_lba, count, buffer.as_ptr() as u64, true)
     }
 
     fn issue_command(&mut self, cmd: u8, lba: u64, count: u16, buffer_addr: u64, write: bool) -> bool {

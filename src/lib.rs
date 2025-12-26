@@ -11,6 +11,7 @@ pub mod interrupts;
 pub mod net;
 pub mod disk;
 pub mod runtime;
+pub mod console;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
