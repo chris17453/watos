@@ -777,6 +777,15 @@ fn wildcard_match_impl(pattern: &[u8], text: &[u8]) -> bool {
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    // Immediate debug: Write to VGA text mode without any setup
+    unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        *vga_buffer = 0x4f4b; // 'K' white on red background
+        *vga_buffer.add(1) = 0x4f45; // 'E' 
+        *vga_buffer.add(2) = 0x4f52; // 'R'
+        *vga_buffer.add(3) = 0x4f4e; // 'N'
+    }
+    
     unsafe {
         serial_init();
         serial_write(b"Kernel starting...\r\n");
@@ -815,6 +824,8 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Initialize GDT and TSS for Ring 3 user mode support
     unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        *vga_buffer.add(6) = 0x4f47; // 'G' - GDT start
         serial_write(b"Initializing GDT and TSS for Ring 3...\r\n");
         
         // Allocate kernel stack for interrupt handling (separate from kernel's main stack)
@@ -822,12 +833,15 @@ pub extern "C" fn kernel_main() -> ! {
         const KERNEL_INTERRUPT_STACK_BASE: usize = 0x280000; // Before heap
         let kernel_stack_top = KERNEL_INTERRUPT_STACK_BASE + KERNEL_INTERRUPT_STACK_SIZE;
         
+        *vga_buffer.add(7) = 0x4f54; // 'T' - TSS start
         // Initialize TSS with kernel stack
         tss::init_tss(kernel_stack_top as u64);
         
+        *vga_buffer.add(8) = 0x4f44; // 'D' - GDT init start
         // Get TSS descriptor and initialize GDT
         let tss_desc = tss::get_tss_descriptor();
         gdt::init(tss_desc);
+        *vga_buffer.add(9) = 0x4f2b; // '+' - GDT init done
         
         serial_write(b"GDT and TSS initialized, CS=0x");
         let cs = gdt::get_cs();
@@ -844,9 +858,15 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Initialize MMU subsystem  
     unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        *vga_buffer.add(4) = 0x4f4d; // 'M' - MMU start
         serial_write(b"Initializing MMU...\r\n");
     }
     mmu::init();
+    unsafe {
+        let vga_buffer = 0xb8000 as *mut u16;
+        *vga_buffer.add(5) = 0x4f4d; // 'M' - MMU done
+    }
 
     // Initialize process management
     unsafe {
@@ -960,6 +980,28 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Draw initial cursor
     unsafe { fb_draw_cursor(true); }
+
+    // Test syscall mechanism with a simple call
+    unsafe {
+        serial_write(b"[DEBUG] Testing syscall mechanism...\r\n");
+        // Simple syscall test - call SYS_TIME (should be safe)
+        let result: u64;
+        core::arch::asm!(
+            "mov rax, 11",  // SYS_TIME = 11 
+            "int 0x80",
+            "mov {}, rax",
+            out(reg) result,
+            options(nostack)
+        );
+        serial_write(b"[DEBUG] Syscall test completed, result=");
+        // Print result as hex
+        let hex = b"0123456789ABCDEF";
+        for i in (0..16).rev() {
+            let nibble = ((result >> (i * 4)) & 0xF) as usize;
+            serial_write(&[hex[nibble]]);
+        }
+        serial_write(b"\r\n");
+    }
 
     loop {
         // Wait for interrupt first (power saving)

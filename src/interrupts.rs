@@ -72,7 +72,7 @@ impl IdtEntry {
         self.offset_high = (handler >> 32) as u32;
         self.selector = code_selector; // Kernel code segment
         self.ist = 0;
-        self.type_attr = 0xEE; // Present, Ring 3 callable (DPL=3), Interrupt Gate
+        self.type_attr = 0xEF; // Present, Ring 3 callable (DPL=3), Trap Gate
         self.reserved = 0;
     }
 }
@@ -142,8 +142,11 @@ unsafe fn _pic_eoi(irq: u8) {
 #[unsafe(naked)]
 unsafe extern "C" fn timer_handler_asm() {
     core::arch::naked_asm!(
+        // Save registers and maintain stack alignment
         "push rax",
-        "push rbx",
+        "push rbx", 
+        "push rcx",
+        "push rdx",
 
         // Increment tick counter using absolute address
         "lea rbx, [rip + {ticks}]",
@@ -155,6 +158,9 @@ unsafe extern "C" fn timer_handler_asm() {
         "mov al, 0x20",
         "out 0x20, al",
 
+        // Restore registers in reverse order
+        "pop rdx",
+        "pop rcx",
         "pop rbx",
         "pop rax",
         "iretq",
@@ -175,17 +181,17 @@ unsafe extern "C" fn keyboard_handler_asm() {
         "in al, 0x60",
         "mov dl, al",  // Save scancode in dl
 
-        // Get write_pos into eax
+        // Get write_pos into rax (using full 64-bit)
         "lea rbx, [rip + {write_pos}]",
-        "mov eax, [rbx]",
+        "mov rax, [rbx]",
 
-        // Calculate next_write = (write_pos + 1) & 31 into ecx
-        "lea ecx, [eax + 1]",
-        "and ecx, 31",
+        // Calculate next_write = (write_pos + 1) & 31 into rcx
+        "lea rcx, [rax + 1]",
+        "and rcx, 31",
 
         // Check if buffer full (next_write == read_pos)
         "lea rbx, [rip + {read_pos}]",
-        "cmp ecx, [rbx]",
+        "cmp rcx, [rbx]",
         "je 2f",
 
         // Store scancode at KEY_BUFFER[write_pos]
@@ -194,7 +200,7 @@ unsafe extern "C" fn keyboard_handler_asm() {
 
         // Update write_pos = next_write
         "lea rbx, [rip + {write_pos}]",
-        "mov [rbx], ecx",
+        "mov [rbx], rcx",
 
         "2:",
         // Send EOI to PIC1
@@ -307,17 +313,19 @@ pub fn sleep_ms(ms: u32) {
 pub use watos_syscall::numbers as syscall;
 
 /// Syscall context passed from assembly handler
+/// Order matches the stack layout from syscall_handler_asm
 #[repr(C)]
 pub struct SyscallContext {
-    pub r11: u64,
-    pub r10: u64,  // arg4
-    pub r9: u64,   // arg6
-    pub r8: u64,   // arg5
-    pub rdi: u64,  // arg1
-    pub rsi: u64,  // arg2
-    pub rdx: u64,  // arg3
+    pub rax: u64,  // syscall number / return value (pushed first, at top)
     pub rcx: u64,
-    pub rax: u64,  // syscall number / return value
+    pub rdx: u64,  // arg3
+    pub rsi: u64,  // arg2
+    pub rdi: u64,  // arg1
+    pub r8: u64,   // arg5
+    pub r9: u64,   // arg6
+    pub r10: u64,  // arg4
+    pub r11: u64,
+    pub rbp: u64,  // alignment padding (pushed last, at bottom)
 }
 
 /// Debug helper for syscalls
@@ -345,6 +353,11 @@ unsafe fn debug_hex_byte(val: u8) {
 /// Returns result in rax
 #[no_mangle]
 pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
+    // Debug: immediate output to serial at handler start
+    unsafe {
+        debug_syscall(b"[ENTER] ");
+    }
+    
     let syscall_num = ctx.rax as u32;
     
     // Debug: log syscall entry
@@ -737,9 +750,18 @@ pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_handler_asm() {
     core::arch::naked_asm!(
-        // Save registers
+        // Debug: write 'S' to serial port immediately 
         "push rax",
-        "push rcx",
+        "push rdx",
+        "mov al, 83", // 'S'
+        "mov dx, 0x3F8",
+        "out dx, al",
+        "pop rdx",
+        "pop rax",
+
+        // Save registers and align stack
+        "push rax",
+        "push rcx", 
         "push rdx",
         "push rsi",
         "push rdi",
@@ -747,18 +769,39 @@ pub unsafe extern "C" fn syscall_handler_asm() {
         "push r9",
         "push r10",
         "push r11",
+        "push rbp",    // Extra push for 16-byte alignment (9+1=10, 10*8=80 bytes, 80%16=0)
 
-        // Call Rust handler with pointer to context
+        // Debug: write 'C' to serial before calling handler
+        "push rax",
+        "push rdx",
+        "mov al, 67", // 'C' 
+        "mov dx, 0x3F8",
+        "out dx, al",
+        "pop rdx",
+        "pop rax",
+
+        // Set up stack frame and call Rust handler
+        "mov rbp, rsp",
         "mov rdi, rsp",
         "call {handler}",
 
+        // Debug: write 'R' to serial after handler returns
+        "push rax",
+        "push rdx",
+        "mov al, 82", // 'R'
+        "mov dx, 0x3F8",
+        "out dx, al", 
+        "pop rdx",
+        "pop rax",
+
         // Restore registers
-        "pop r11",
+        "pop rbp",
+        "pop r11", 
         "pop r10",
         "pop r9",
         "pop r8",
         "pop rdi",
-        "pop rsi",
+        "pop rsi", 
         "pop rdx",
         "pop rcx",
         "pop rax",
