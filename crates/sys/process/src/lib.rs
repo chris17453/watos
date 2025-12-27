@@ -198,9 +198,13 @@ static mut NEXT_PID: u32 = 1;
 static mut CURRENT_PROCESS: Option<u32> = None;
 static mut KERNEL_PML4: u64 = 0;
 
-// Process memory starts at 16MB, outside kernel's 8MB identity-mapped region
+// Process memory layout (per process):
+//   base + 0x000000: Code/data (up to 1MB)
+//   base + 0x100000: Heap (1MB)
+//   base + 0x1F0000: Stack (64KB, grows down from base + 0x200000)
+// Total: 2MB per process, with 1.5MB gap before next process's code
 const PROCESS_MEM_BASE: u64 = 0x1000000;
-const PROCESS_MEM_SIZE: u64 = 0x100000;  // 1MB per process
+const PROCESS_MEM_SIZE: u64 = 0x400000;  // 4MB spacing between processes
 const PROCESS_STACK_SIZE: u64 = 0x10000; // 64KB stack
 
 static mut KERNEL_RSP: u64 = 0;
@@ -414,16 +418,34 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
     let stack_pages = PROCESS_STACK_SIZE / PAGE_SIZE as u64;
     for i in 0..stack_pages {
         let virt_addr = stack_top - (i as u64 + 1) * PAGE_SIZE as u64;
-        let phys_addr = stack_top - (i as u64 + 1) * PAGE_SIZE as u64;
+        // Allocate fresh physical page for stack
+        let phys_addr = watos_mem::phys::alloc_page()
+            .ok_or("Out of physical memory for stack")? as u64;
+        if i == 0 {
+            unsafe {
+                debug_serial(b"  stack virt=0x");
+                debug_hex(virt_addr);
+                debug_serial(b" phys=0x");
+                debug_hex(phys_addr);
+                debug_serial(b"\r\n");
+            }
+        }
+        // Zero the stack page
+        unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
         page_table.map_user_page(virt_addr, phys_addr,
             page_flags::PRESENT | page_flags::WRITABLE)?;
     }
 
     unsafe { debug_serial(b"exec: mapping heap...\r\n"); }
-    let heap_pages = (PROCESS_MEM_SIZE - PROCESS_STACK_SIZE - 0x80000) / PAGE_SIZE as u64;
+    // Allocate a reasonable initial heap (256KB)
+    let heap_pages = 64u64; // 64 pages * 4KB = 256KB initial heap
     for i in 0..heap_pages {
-        let virt_addr = heap_base + i as u64 * PAGE_SIZE as u64;
-        let phys_addr = heap_base + i as u64 * PAGE_SIZE as u64;
+        let virt_addr = heap_base + i * PAGE_SIZE as u64;
+        // Allocate fresh physical page for heap
+        let phys_addr = watos_mem::phys::alloc_page()
+            .ok_or("Out of physical memory for heap")? as u64;
+        // Zero the heap page
+        unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
         page_table.map_user_page(virt_addr, phys_addr,
             page_flags::PRESENT | page_flags::WRITABLE)?;
     }
@@ -469,7 +491,7 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
         entry_point: entry,
         stack_top,
         heap_base,
-        heap_size: heap_pages as usize * PAGE_SIZE,
+        heap_size: (heap_pages as usize) * PAGE_SIZE,
         page_table,
         handle_table: HandleTable::new(),
     };
@@ -512,6 +534,19 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
     }
 
     unsafe {
+        // Save the current kernel stack so we can return on process exit
+        let mut saved_rsp: u64 = 0;
+        let mut saved_rbp: u64 = 0;
+        core::arch::asm!(
+            "mov {}, rsp",
+            "mov {}, rbp",
+            out(reg) saved_rsp,
+            out(reg) saved_rbp,
+            options(nostack, preserves_flags)
+        );
+        KERNEL_RSP = saved_rsp;
+        KERNEL_RBP = saved_rbp;
+
         const KERNEL_STACK_SIZE: usize = 0x10000;
         let kernel_stack_base = 0x280000 + (pid as usize * KERNEL_STACK_SIZE);
         let kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
@@ -552,6 +587,34 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
                 debug_serial(b" (huge=");
                 if pd_0 & 0x80 != 0 { debug_serial(b"Y"); } else { debug_serial(b"N"); }
                 debug_serial(b")\r\n");
+
+                // Also dump PD[8] (for code at 0x1000000) and PD[9] (for stack at 0x13FF000)
+                let pd_8 = *pd_ptr.add(8);
+                debug_serial(b"  PD[8]=0x");
+                debug_hex(pd_8);
+                if pd_8 & 1 != 0 {
+                    // Follow to PT
+                    let pt_addr = pd_8 & 0x000F_FFFF_FFFF_F000;
+                    let pt_ptr = pt_addr as *const u64;
+                    let pt_0 = *pt_ptr;
+                    debug_serial(b" -> PT[0]=0x");
+                    debug_hex(pt_0);
+                }
+                debug_serial(b"\r\n");
+
+                let pd_9 = *pd_ptr.add(9);
+                debug_serial(b"  PD[9]=0x");
+                debug_hex(pd_9);
+                if pd_9 & 1 != 0 {
+                    // Follow to PT for stack page
+                    let pt_addr = pd_9 & 0x000F_FFFF_FFFF_F000;
+                    let pt_ptr = pt_addr as *const u64;
+                    // Stack at 0x13FF000 -> PT index 511
+                    let pt_511 = *pt_ptr.add(511);
+                    debug_serial(b" -> PT[511]=0x");
+                    debug_hex(pt_511);
+                }
+                debug_serial(b"\r\n");
             }
         }
 
@@ -687,8 +750,23 @@ pub extern "C" fn process_exit_to_kernel(code: i32) -> ! {
                     }
                 }
             }
+            // Drop the process slot now that it has exited to release resources
+            for slot in PROCESSES.iter_mut() {
+                if let Some(ref p) = slot {
+                    if p.id == pid {
+                        *slot = None;
+                        break;
+                    }
+                }
+            }
             CURRENT_PROCESS = None;
         }
+
+        // Always restore kernel paging before returning to the kernel stack
+        restore_kernel_paging();
+
+        // Clear the saved parent context to avoid stale resumes
+        PARENT_CONTEXT.valid = false;
 
         if KERNEL_RSP != 0 {
             core::arch::asm!(
