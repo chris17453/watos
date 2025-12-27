@@ -253,9 +253,25 @@ pub extern "C" fn process_exit_to_kernel(code: i32) -> ! {
             );
         }
 
-        // Fallback: just halt
-        loop {
-            core::arch::asm!("hlt");
+        // Fallback: log error and return to scheduler
+        unsafe {
+            debug_serial(b"ERROR: process_exit_to_kernel failed to restore kernel state\r\n");
+            debug_serial(b"Process ID: ");
+            if let Some(pid) = CURRENT_PROCESS {
+                debug_hex(pid as u64);
+            } else {
+                debug_serial(b"<none>");
+            }
+            debug_serial(b"\r\n");
+            
+            // Clear the current process to prevent recursion
+            CURRENT_PROCESS = None;
+            
+            // Attempt to continue kernel operation instead of halting
+            debug_serial(b"Attempting to continue kernel operation...\r\n");
+            loop {
+                core::arch::asm!("hlt", options(nostack, nomem));
+            }
         }
     }
 }

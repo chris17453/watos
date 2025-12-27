@@ -156,8 +156,87 @@ impl DriveManager {
                             }
                         }
                         PartitionTableType::Gpt => {
-                            // GPT partition table - TODO: parse GPT entries
-                            // For now, skip GPT disks
+                            // GPT partition table - parse GPT entries
+                            // GPT Header is in LBA 1
+                            let mut gpt_header = [0u8; 512];
+                            if !ahci.read_sectors(1, 1, &mut gpt_header) {
+                                continue;
+                            }
+                            
+                            // Verify GPT signature "EFI PART"
+                            if &gpt_header[0..8] != b"EFI PART" {
+                                continue;
+                            }
+                            
+                            // Parse GPT header
+                            let partition_entry_lba = u64::from_le_bytes([
+                                gpt_header[72], gpt_header[73], gpt_header[74], gpt_header[75],
+                                gpt_header[76], gpt_header[77], gpt_header[78], gpt_header[79],
+                            ]);
+                            let num_partition_entries = u32::from_le_bytes([
+                                gpt_header[80], gpt_header[81], gpt_header[82], gpt_header[83],
+                            ]);
+                            let partition_entry_size = u32::from_le_bytes([
+                                gpt_header[84], gpt_header[85], gpt_header[86], gpt_header[87],
+                            ]);
+                            
+                            // Read partition entries (typically 128 bytes each, in LBA 2+)
+                            let entries_per_sector = 512 / partition_entry_size;
+                            let sectors_needed = (num_partition_entries + entries_per_sector - 1) / entries_per_sector;
+                            
+                            for sector_idx in 0..sectors_needed {
+                                let mut sector = [0u8; 512];
+                                if !ahci.read_sectors(partition_entry_lba + sector_idx as u64, 1, &mut sector) {
+                                    break;
+                                }
+                                
+                                for entry_idx in 0..entries_per_sector {
+                                    if sector_idx * entries_per_sector + entry_idx >= num_partition_entries {
+                                        break;
+                                    }
+                                    
+                                    let offset = (entry_idx * partition_entry_size) as usize;
+                                    if offset + 128 > 512 {
+                                        break;
+                                    }
+                                    
+                                    // Check if partition type GUID is non-zero (entry is used)
+                                    let mut is_empty = true;
+                                    for i in 0..16 {
+                                        if sector[offset + i] != 0 {
+                                            is_empty = false;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if is_empty {
+                                        continue;
+                                    }
+                                    
+                                    // Parse partition entry
+                                    let start_lba = u64::from_le_bytes([
+                                        sector[offset + 32], sector[offset + 33], sector[offset + 34], sector[offset + 35],
+                                        sector[offset + 36], sector[offset + 37], sector[offset + 38], sector[offset + 39],
+                                    ]);
+                                    let end_lba = u64::from_le_bytes([
+                                        sector[offset + 40], sector[offset + 41], sector[offset + 42], sector[offset + 43],
+                                        sector[offset + 44], sector[offset + 45], sector[offset + 46], sector[offset + 47],
+                                    ]);
+                                    let size_sectors = end_lba - start_lba + 1;
+                                    
+                                    // Detect filesystem on partition
+                                    let fs_type = self.detect_filesystem_at(&mut ahci, start_lba);
+                                    
+                                    if next_letter <= b'Z' && fs_type != FsType::None && fs_type != FsType::Unknown {
+                                        let name = String::from_utf8(alloc::vec![next_letter]).unwrap_or_default();
+                                        let partition_idx = (sector_idx * entries_per_sector + entry_idx) as u8;
+                                        if self.mount_partition(&name, port, partition_idx, fs_type, size_sectors, start_lba) {
+                                            next_letter += 1;
+                                            mounted_count += 1;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

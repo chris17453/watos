@@ -3345,35 +3345,90 @@ impl DosTask {
                 self.cpu.ax = 0; // No child, return 0
             }
             0x4E => {
-                // Find first file (FCB) - DS:DX = FCB pattern, CX = attributes
-                // For simple implementation, just return a fake file entry
-                let fcb_seg = self.cpu.ds;
-                let fcb_off = self.cpu.dx;
+                // Find first file - DS:DX = ASCIIZ filename pattern, CX = attributes
+                let filename_ptr = ((self.cpu.ds as usize) << 4) + (self.cpu.dx as usize);
                 
-                // Read filename pattern from FCB
-                // For now, just store a simple pattern and pretend we found something
-                self.find_file_pattern = Some(String::from("*.*"));
+                // Read filename pattern from memory
+                let mut pattern = String::new();
+                for i in 0..128 {
+                    if filename_ptr + i >= self.memory.len() {
+                        break;
+                    }
+                    let c = self.memory[filename_ptr + i];
+                    if c == 0 {
+                        break;
+                    }
+                    pattern.push(c as char);
+                }
+                
+                serial_write_bytes(b"Find first file: ");
+                serial_write_bytes(pattern.as_bytes());
+                serial_write_bytes(b"\r\n");
+                
+                // For now, return files from a hardcoded list
+                // TODO: Integrate with actual VFS when directory listing API is available
+                let dummy_files = vec![
+                    ("COMMAND.COM", 25308u32, false),
+                    ("CONFIG.SYS", 128u32, false),
+                    ("AUTOEXEC.BAT", 256u32, false),
+                ];
+                
+                // Store search state
+                self.find_file_pattern = Some(pattern.clone());
                 self.find_file_index = 0;
                 
-                // Write a fake DTA entry at PSP:0x80 (default DTA)
-                // Format: drive, filename (8), ext (3), attrs, etc.
-                let dta_addr = ((self.psp_seg as usize) << 4) + 0x80;
-                if dta_addr + 43 <= self.memory.len() {
-                    self.memory[dta_addr] = 0; // Drive
-                    // Fake filename: "TEST    TXT"
-                    for (i, &c) in b"TEST    TXT".iter().enumerate() {
-                        self.memory[dta_addr + 1 + i] = c;
+                // Find first matching file
+                let mut found = false;
+                for (idx, (name, size, is_dir)) in dummy_files.iter().enumerate() {
+                    if self.matches_pattern(name, &pattern) {
+                        self.write_dta_entry(name, *size, *is_dir);
+                        self.find_file_index = idx + 1;
+                        found = true;
+                        break;
                     }
                 }
                 
-                self.cpu.set_flag(FLAG_CF, false);
-                self.cpu.ax = 0;
+                if found {
+                    self.cpu.set_flag(FLAG_CF, false);
+                    self.cpu.ax = 0;
+                } else {
+                    self.cpu.set_flag(FLAG_CF, true);
+                    self.cpu.ax = 0x12; // No more files
+                }
             }
             0x4F => {
-                // Find next file (FCB) - continue from previous search
-                // Just return "no more files" for now
-                self.cpu.set_flag(FLAG_CF, true);
-                self.cpu.ax = 0x12; // No more files
+                // Find next file - continue from previous search
+                if let Some(ref pattern) = self.find_file_pattern.clone() {
+                    let dummy_files = vec![
+                        ("COMMAND.COM", 25308u32, false),
+                        ("CONFIG.SYS", 128u32, false),
+                        ("AUTOEXEC.BAT", 256u32, false),
+                    ];
+                    
+                    // Continue from where we left off
+                    let mut found = false;
+                    for idx in self.find_file_index..dummy_files.len() {
+                        let (name, size, is_dir) = dummy_files[idx];
+                        if self.matches_pattern(name, pattern) {
+                            self.write_dta_entry(name, size, is_dir);
+                            self.find_file_index = idx + 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    if found {
+                        self.cpu.set_flag(FLAG_CF, false);
+                        self.cpu.ax = 0;
+                    } else {
+                        self.cpu.set_flag(FLAG_CF, true);
+                        self.cpu.ax = 0x12; // No more files
+                    }
+                } else {
+                    // No search in progress
+                    self.cpu.set_flag(FLAG_CF, true);
+                    self.cpu.ax = 0x12;
+                }
             }
             0x50 => {
                 // Set PSP - ignore
@@ -3594,6 +3649,86 @@ impl DosTask {
 
         fh.position = new_pos;
         Some(new_pos)
+    }
+    
+    // Helper: Match filename against DOS wildcard pattern
+    fn matches_pattern(&self, filename: &str, pattern: &str) -> bool {
+        // Simple wildcard matching: * matches everything, ? matches one char
+        let fname_upper = filename.to_uppercase();
+        let pattern_upper = pattern.to_uppercase();
+        
+        // Special case: *.* matches everything
+        if pattern_upper == "*.*" {
+            return true;
+        }
+        
+        // Simple matching without full regex
+        let mut f_chars = fname_upper.chars();
+        let mut p_chars = pattern_upper.chars();
+        
+        loop {
+            match (p_chars.next(), f_chars.next()) {
+                (Some('*'), _) => return true, // * matches rest
+                (Some('?'), Some(_)) => continue, // ? matches one char
+                (Some(p), Some(f)) if p == f => continue,
+                (None, None) => return true, // Both ended = match
+                _ => return false, // Mismatch
+            }
+        }
+    }
+    
+    // Helper: Write DTA entry for found file
+    fn write_dta_entry(&mut self, filename: &str, size: u32, is_dir: bool) {
+        let dta_addr = ((self.psp_seg as usize) << 4) + 0x80;
+        if dta_addr + 43 > self.memory.len() {
+            return;
+        }
+        
+        // DOS DTA format for find file:
+        // 00h: drive (0=default)
+        // 01h: filename (8 bytes, space-padded)
+        // 09h: extension (3 bytes, space-padded)
+        // 0Ch: attributes
+        // 0Dh: reserved
+        // 15h: time
+        // 17h: date
+        // 19h: file size (4 bytes)
+        
+        self.memory[dta_addr] = 0; // Default drive
+        
+        // Split filename into name and extension
+        let (name, ext) = if let Some(dot_pos) = filename.rfind('.') {
+            (&filename[..dot_pos], &filename[dot_pos+1..])
+        } else {
+            (filename, "")
+        };
+        
+        // Write name (8 bytes, space-padded)
+        for i in 0..8 {
+            self.memory[dta_addr + 1 + i] = if i < name.len() {
+                name.as_bytes()[i].to_ascii_uppercase()
+            } else {
+                b' '
+            };
+        }
+        
+        // Write extension (3 bytes, space-padded)
+        for i in 0..3 {
+            self.memory[dta_addr + 9 + i] = if i < ext.len() {
+                ext.as_bytes()[i].to_ascii_uppercase()
+            } else {
+                b' '
+            };
+        }
+        
+        // Attributes: 0x10 = directory
+        self.memory[dta_addr + 0x0C] = if is_dir { 0x10 } else { 0x00 };
+        
+        // File size (little-endian)
+        self.memory[dta_addr + 0x19] = (size & 0xFF) as u8;
+        self.memory[dta_addr + 0x1A] = ((size >> 8) & 0xFF) as u8;
+        self.memory[dta_addr + 0x1B] = ((size >> 16) & 0xFF) as u8;
+        self.memory[dta_addr + 0x1C] = ((size >> 24) & 0xFF) as u8;
     }
 }
 

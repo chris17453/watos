@@ -1973,8 +1973,17 @@ pub extern "C" fn watos_exit(code: i32) -> ! {
     if process::current_pid().is_some() {
         process::process_exit_to_kernel(code);
     }
-    // Fallback: just halt
-    loop { unsafe { core::arch::asm!("hlt"); } }
+    // Fallback: log error and return to shell/scheduler
+    unsafe {
+        serial_write(b"WARNING: process_exit_to_kernel failed, returning to kernel loop\r\n");
+        // Clear interrupts and return to a safe state
+        core::arch::asm!("cli", options(nostack, nomem));
+        // Could return to kernel_main loop instead of halting
+        // For now, yield CPU and wait for scheduler
+        loop { 
+            core::arch::asm!("hlt", options(nostack, nomem)); 
+        }
+    }
 }
 
 #[panic_handler]
