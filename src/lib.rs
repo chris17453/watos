@@ -13,6 +13,8 @@ pub mod console;
 pub mod mmu;
 pub mod io;
 pub mod globals;
+pub mod tss;
+pub mod gdt;
 
 
 #[panic_handler]

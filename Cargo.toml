@@ -19,7 +19,7 @@ members = [
     "crates/watos-syscall",
     "crates/echo"
 ]
-exclude = ["junk"]
+exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
 
 [workspace.dependencies]
 uefi = "0.25"

@@ -17,6 +17,8 @@ mod runtime;
 mod process;
 mod mmu;
 mod io;
+mod tss;
+mod gdt;
 pub mod console;
 
 // Boot info structure from bootloader at 0x80000
@@ -809,6 +811,32 @@ pub extern "C" fn kernel_main() -> ! {
         const HEAP_START: usize = 0x300000;
         const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+    }
+
+    // Initialize GDT and TSS for Ring 3 user mode support
+    unsafe {
+        serial_write(b"Initializing GDT and TSS for Ring 3...\r\n");
+        
+        // Allocate kernel stack for interrupt handling (separate from kernel's main stack)
+        const KERNEL_INTERRUPT_STACK_SIZE: usize = 0x10000; // 64KB
+        const KERNEL_INTERRUPT_STACK_BASE: usize = 0x280000; // Before heap
+        let kernel_stack_top = KERNEL_INTERRUPT_STACK_BASE + KERNEL_INTERRUPT_STACK_SIZE;
+        
+        // Initialize TSS with kernel stack
+        tss::init_tss(kernel_stack_top as u64);
+        
+        // Get TSS descriptor and initialize GDT
+        let tss_desc = tss::get_tss_descriptor();
+        gdt::init(tss_desc);
+        
+        serial_write(b"GDT and TSS initialized, CS=0x");
+        let cs = gdt::get_cs();
+        let hex = b"0123456789ABCDEF";
+        serial_write(&[hex[(cs >> 12) as usize & 0xF]]);
+        serial_write(&[hex[(cs >> 8) as usize & 0xF]]);
+        serial_write(&[hex[(cs >> 4) as usize & 0xF]]);
+        serial_write(&[hex[cs as usize & 0xF]]);
+        serial_write(b"\r\n");
     }
 
     // Initialize console system (multi-session support)

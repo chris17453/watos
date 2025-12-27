@@ -182,9 +182,15 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
     Ok(pid)
 }
 
-/// Run a process by jumping to its entry point  
+/// Run a process in Ring 3 user mode with proper privilege transitions
+/// 
+/// This implements full CPU privilege separation:
+/// - Process code runs in Ring 3 (user mode)
+/// - Syscalls via INT 0x80 transition to Ring 0 (kernel mode)
+/// - TSS provides kernel stack for interrupt handling
+/// - Separate page tables isolate user and kernel memory
 fn run_process(pid: u32) -> Result<(), &'static str> {
-    let (entry, _stack_top, pml4_addr) = unsafe {
+    let (entry, stack_top, pml4_addr) = unsafe {
         let proc = PROCESSES.iter()
             .find_map(|p| p.as_ref().filter(|p| p.id == pid))
             .ok_or("Process not found")?;
@@ -193,37 +199,50 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
         (proc.entry_point, proc.stack_top, proc.page_table.pml4_phys_addr())
     };
 
-    // Debug: print entry point and page table
+    // Debug: print process info
     unsafe {
-        debug_serial(b"Process entry: 0x");
+        debug_serial(b"[PROCESS] Starting PID=");
+        debug_hex(pid as u64);
+        debug_serial(b" in Ring 3 user mode\r\n");
+        debug_serial(b"[PROCESS] Entry=0x");
         debug_hex(entry);
-        debug_serial(b" PML4: 0x");
+        debug_serial(b" Stack=0x");
+        debug_hex(stack_top);
+        debug_serial(b" PML4=0x");
         debug_hex(pml4_addr);
         debug_serial(b"\r\n");
     }
 
-    // Switch to process page table
+    // Update TSS with kernel stack for this process
+    // When INT 0x80 occurs, CPU will switch to this stack
     unsafe {
-        debug_serial(b"Switching to process page table...\r\n");
-        crate::mmu::enable_paging(pml4_addr);
+        const KERNEL_STACK_SIZE: usize = 0x10000; // 64KB per process
+        let kernel_stack_base = 0x280000 + (pid as usize * KERNEL_STACK_SIZE);
+        let kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
+        
+        debug_serial(b"[PROCESS] Kernel stack for interrupts: 0x");
+        debug_hex(kernel_stack_top as u64);
+        debug_serial(b"\r\n");
+        
+        crate::tss::update_kernel_stack(kernel_stack_top as u64);
     }
 
-    // Execute the process
+    // Switch to process page table
     unsafe {
-        // Save kernel context for watos_exit to return to
-        core::arch::asm!(
-            "mov {rsp}, rsp",
-            "mov {rbp}, rbp",
-            rsp = out(reg) KERNEL_RSP,
-            rbp = out(reg) KERNEL_RBP,
-            options(nostack, preserves_flags)
-        );
+        debug_serial(b"[PROCESS] Switching to user page table...\r\n");
+        crate::mmu::enable_paging(pml4_addr);
+        
+        let new_cr3 = crate::mmu::get_current_cr3();
+        debug_serial(b"[PROCESS] Page table switched, CR3=0x");
+        debug_hex(new_cr3);
+        debug_serial(b"\r\n");
+    }
 
-        debug_serial(b"Calling entry point...\r\n");
-
-        // Dump first 16 bytes at entry point to verify code is there
-        debug_serial(b"Code at entry: ");
+    // Verify entry point is accessible
+    unsafe {
+        debug_serial(b"[PROCESS] Verifying user code is accessible...\r\n");
         let code_ptr = entry as *const u8;
+        debug_serial(b"[PROCESS] First 16 bytes: ");
         for i in 0..16 {
             let byte = *code_ptr.add(i);
             let hex = b"0123456789ABCDEF";
@@ -231,34 +250,66 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
             core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") hex[(byte & 0xF) as usize], options(nostack));
             core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") b' ', options(nostack));
         }
-        debug_serial(b"\r\n");
-
-        // Call the entry point directly on current stack
-        // _start function is declared as -> ! so it should call watos_exit
-        let entry_fn: extern "C" fn() = core::mem::transmute(entry);
-        entry_fn();
-
-        debug_serial(b"Process returned normally\r\n");
-
-        // Clear kernel context
-        KERNEL_RSP = 0;
-        KERNEL_RBP = 0;
+        debug_serial(b"OK\r\n");
     }
 
-    // Mark process as terminated
+    // Transition to Ring 3 and execute user code
     unsafe {
-        CURRENT_PROCESS = None;
-        for slot in PROCESSES.iter_mut() {
-            if let Some(ref mut p) = slot {
-                if p.id == pid {
-                    p.state = ProcessState::Terminated(0);
-                    break;
-                }
-            }
-        }
+        debug_serial(b"[PROCESS] Transitioning to Ring 3...\r\n");
+        
+        let user_stack = stack_top - 8;  // Aligned stack
+        let user_cs = crate::gdt::selectors::USER_CODE as u64;
+        let user_ds = crate::gdt::selectors::USER_DATA as u64;
+        let rflags: u64 = 0x202;  // IF (interrupts enabled) + reserved bit 1
+        
+        // Set up user mode segments
+        core::arch::asm!(
+            "mov ds, {0:x}",
+            "mov es, {0:x}",
+            "mov fs, {0:x}",
+            "mov gs, {0:x}",
+            in(reg) user_ds,
+        );
+        
+        // Jump to Ring 3 using IRETQ
+        // This is the standard way to enter user mode
+        // Stack frame for IRETQ: SS, RSP, RFLAGS, CS, RIP
+        core::arch::asm!(
+            // Build IRETQ stack frame
+            "push {user_ss}",          // SS (user data selector)
+            "push {user_rsp}",         // RSP (user stack pointer)
+            "push {rflags}",           // RFLAGS (interrupt flag set)
+            "push {user_cs}",          // CS (user code selector)
+            "push {entry}",            // RIP (entry point)
+            
+            // Clear registers for security
+            "xor rax, rax",
+            "xor rbx, rbx",
+            "xor rcx, rcx",
+            "xor rdx, rdx",
+            "xor rsi, rsi",
+            "xor rdi, rdi",
+            "xor rbp, rbp",
+            "xor r8, r8",
+            "xor r9, r9",
+            "xor r10, r10",
+            "xor r11, r11",
+            "xor r12, r12",
+            "xor r13, r13",
+            "xor r14, r14",
+            "xor r15, r15",
+            
+            // Jump to Ring 3
+            "iretq",
+            
+            user_ss = in(reg) user_ds,
+            user_rsp = in(reg) user_stack,
+            rflags = in(reg) rflags,
+            user_cs = in(reg) user_cs,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
     }
-
-    Ok(())
 }
 
 /// Return to kernel from a running process (called by watos_exit)
