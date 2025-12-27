@@ -1,0 +1,10 @@
+[package]
+name = "exe-tester"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+# This is a standalone package, not part of WATOS workspace
+
+[dependencies]
+# No external dependencies - keep it simple

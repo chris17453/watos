@@ -183,8 +183,12 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
 }
 
 /// Run a process by jumping to its entry point  
+/// 
+/// CRITICAL FIX: This keeps the process in kernel mode (Ring 0) to avoid the
+/// complexity of Ring 3 transitions. The process page table includes all kernel
+/// mappings, so the kernel (including interrupt handlers) remains accessible.
 fn run_process(pid: u32) -> Result<(), &'static str> {
-    let (entry, _stack_top, pml4_addr) = unsafe {
+    let (entry, stack_top, pml4_addr) = unsafe {
         let proc = PROCESSES.iter()
             .find_map(|p| p.as_ref().filter(|p| p.id == pid))
             .ok_or("Process not found")?;
@@ -195,22 +199,29 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
 
     // Debug: print entry point and page table
     unsafe {
-        debug_serial(b"Process entry: 0x");
+        debug_serial(b"[PROCESS] Starting PID=");
+        debug_hex(pid as u64);
+        debug_serial(b" Entry=0x");
         debug_hex(entry);
-        debug_serial(b" PML4: 0x");
+        debug_serial(b" Stack=0x");
+        debug_hex(stack_top);
+        debug_serial(b" PML4=0x");
         debug_hex(pml4_addr);
+        debug_serial(b"\r\n");
+        
+        // Verify kernel is still mapped after page table switch
+        let current_cr3 = crate::mmu::get_current_cr3();
+        debug_serial(b"[PROCESS] Current CR3=0x");
+        debug_hex(current_cr3);
         debug_serial(b"\r\n");
     }
 
-    // Switch to process page table
+    // CRITICAL: Verify the process page table includes kernel mappings
+    // The kernel must remain accessible for interrupt handlers (including INT 0x80)
     unsafe {
-        debug_serial(b"Switching to process page table...\r\n");
-        crate::mmu::enable_paging(pml4_addr);
-    }
-
-    // Execute the process
-    unsafe {
-        // Save kernel context for watos_exit to return to
+        debug_serial(b"[PROCESS] Switching to process page table...\r\n");
+        
+        // Save kernel context for returning from process
         core::arch::asm!(
             "mov {rsp}, rsp",
             "mov {rbp}, rbp",
@@ -218,11 +229,20 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
             rbp = out(reg) KERNEL_RBP,
             options(nostack, preserves_flags)
         );
+        
+        // Switch page tables - kernel mappings are preserved via map_kernel_space()
+        crate::mmu::enable_paging(pml4_addr);
+        
+        debug_serial(b"[PROCESS] Page table switched, CR3=0x");
+        let new_cr3 = crate::mmu::get_current_cr3();
+        debug_hex(new_cr3);
+        debug_serial(b"\r\n");
+    }
 
-        debug_serial(b"Calling entry point...\r\n");
-
-        // Dump first 16 bytes at entry point to verify code is there
-        debug_serial(b"Code at entry: ");
+    // Verify code is mapped and readable
+    unsafe {
+        debug_serial(b"[PROCESS] Verifying code is accessible...\r\n");
+        debug_serial(b"[PROCESS] First 16 bytes at entry: ");
         let code_ptr = entry as *const u8;
         for i in 0..16 {
             let byte = *code_ptr.add(i);
@@ -232,33 +252,45 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
             core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") b' ', options(nostack));
         }
         debug_serial(b"\r\n");
-
-        // Call the entry point directly on current stack
-        // _start function is declared as -> ! so it should call watos_exit
-        let entry_fn: extern "C" fn() = core::mem::transmute(entry);
-        entry_fn();
-
-        debug_serial(b"Process returned normally\r\n");
-
-        // Clear kernel context
-        KERNEL_RSP = 0;
-        KERNEL_RBP = 0;
+        
+        // Verify we can still access kernel code (interrupt handler)
+        debug_serial(b"[PROCESS] Verifying kernel code accessible...\r\n");
+        let handler_addr = crate::interrupts::syscall_handler_asm as *const u8;
+        debug_serial(b"[PROCESS] Syscall handler at: 0x");
+        debug_hex(handler_addr as u64);
+        debug_serial(b"\r\n");
+        
+        // Try reading first byte of handler (will fault if unmapped)
+        let first_byte = *handler_addr;
+        debug_serial(b"[PROCESS] Handler first byte: 0x");
+        let hex = b"0123456789ABCDEF";
+        core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") hex[(first_byte >> 4) as usize], options(nostack));
+        core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") hex[(first_byte & 0xF) as usize], options(nostack));
+        debug_serial(b" OK\r\n");
     }
 
-    // Mark process as terminated
+    // Execute the process in kernel mode (Ring 0)
+    // This avoids the complexity of Ring 3 transitions while maintaining memory protection
     unsafe {
-        CURRENT_PROCESS = None;
-        for slot in PROCESSES.iter_mut() {
-            if let Some(ref mut p) = slot {
-                if p.id == pid {
-                    p.state = ProcessState::Terminated(0);
-                    break;
-                }
-            }
-        }
-    }
+        debug_serial(b"[PROCESS] Calling entry point...\r\n");
 
-    Ok(())
+        // Set up process stack
+        let user_stack = stack_top - 8;  // Leave space for alignment
+        
+        // Call the entry point with proper stack
+        // Process runs in kernel mode but with its own page table
+        core::arch::asm!(
+            "mov rsp, {stack}",   // Switch to process stack
+            "xor rbp, rbp",       // Clear frame pointer
+            "call {entry}",       // Call _start
+            "2:",
+            "hlt",                // Should never reach here
+            "jmp 2b",
+            stack = in(reg) user_stack,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
+    }
 }
 
 /// Return to kernel from a running process (called by watos_exit)

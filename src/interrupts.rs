@@ -310,11 +310,45 @@ pub struct SyscallContext {
     pub rax: u64,  // syscall number / return value
 }
 
+/// Debug helper for syscalls
+unsafe fn debug_syscall(msg: &[u8]) {
+    const SERIAL_PORT: u16 = 0x3F8;
+    for &byte in msg {
+        // Simple busy-wait for serial
+        for _ in 0..100 {
+            core::arch::asm!("nop", options(nostack));
+        }
+        core::arch::asm!("out dx, al", in("dx") SERIAL_PORT, in("al") byte, options(nostack));
+    }
+}
+
+unsafe fn debug_hex_byte(val: u8) {
+    const SERIAL_PORT: u16 = 0x3F8;
+    let hex = b"0123456789ABCDEF";
+    for _ in 0..100 { core::arch::asm!("nop", options(nostack)); }
+    core::arch::asm!("out dx, al", in("dx") SERIAL_PORT, in("al") hex[(val >> 4) as usize], options(nostack));
+    for _ in 0..100 { core::arch::asm!("nop", options(nostack)); }
+    core::arch::asm!("out dx, al", in("dx") SERIAL_PORT, in("al") hex[(val & 0xF) as usize], options(nostack));
+}
+
 /// Syscall handler - dispatches based on syscall number
 /// Returns result in rax
 #[no_mangle]
 pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
     let syscall_num = ctx.rax as u32;
+    
+    // Debug: log syscall entry
+    unsafe {
+        debug_syscall(b"[SYSCALL] ");
+        debug_hex_byte((syscall_num & 0xFF) as u8);
+        debug_syscall(b" from PID=");
+        if let Some(pid) = crate::process::current_pid() {
+            debug_hex_byte(pid as u8);
+        } else {
+            debug_syscall(b"kernel");
+        }
+        debug_syscall(b"\r\n");
+    }
 
     ctx.rax = match syscall_num {
         syscall::SYS_WRITE => {
@@ -689,9 +723,9 @@ pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
     };
 }
 
-// Syscall handler assembly stub
+// Syscall handler assembly stub - must be pub for process module to reference
 #[unsafe(naked)]
-unsafe extern "C" fn syscall_handler_asm() {
+pub unsafe extern "C" fn syscall_handler_asm() {
     core::arch::naked_asm!(
         // Save registers
         "push rax",
