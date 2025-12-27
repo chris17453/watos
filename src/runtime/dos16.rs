@@ -2763,11 +2763,34 @@ impl DosTask {
         serial_write_bytes(b"\r\n");
     }
 
-    // I/O port access (stubbed - can be extended)
-    fn port_in8(&self, _port: u16) -> u8 { 0 }
-    fn port_in16(&self, _port: u16) -> u16 { 0 }
-    fn port_out8(&self, _port: u16, _val: u8) {}
-    fn port_out16(&self, _port: u16, _val: u16) {}
+    // I/O port access - delegate to actual hardware ports
+    fn port_in8(&self, port: u16) -> u8 {
+        unsafe {
+            let value: u8;
+            core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nostack, nomem));
+            value
+        }
+    }
+    
+    fn port_in16(&self, port: u16) -> u16 {
+        unsafe {
+            let value: u16;
+            core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nostack, nomem));
+            value
+        }
+    }
+    
+    fn port_out8(&self, port: u16, val: u8) {
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack, nomem));
+        }
+    }
+    
+    fn port_out16(&self, port: u16, val: u16) {
+        unsafe {
+            core::arch::asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, nomem));
+        }
+    }
 
     // Log to serial (shows in QEMU serial log)
     fn log_serial(&mut self, msg: &str) {

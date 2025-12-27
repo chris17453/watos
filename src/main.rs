@@ -314,7 +314,7 @@ unsafe fn serial_read_char() -> Option<u8> {
 }
 
 // PS/2 keyboard scancode to ASCII (simple set 1)
-fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
+pub fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
     // Only handle key press (not release - high bit set)
     if scancode & 0x80 != 0 { return None; }
 
