@@ -396,6 +396,11 @@ pub extern "C" fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
 }
 
 #[no_mangle]
+pub extern "C" fn fb_get_pixel(x: i32, y: i32) -> u8 {
+    unsafe { fb_get_pixel_impl(x, y) }
+}
+
+#[no_mangle]
 pub extern "C" fn fb_clear_screen(r: u8, g: u8, b: u8) {
     unsafe { fb_clear_impl(r, g, b); }
 }
@@ -413,6 +418,26 @@ unsafe fn fb_put_pixel_impl(x: u32, y: u32, r: u8, g: u8, b: u8) {
         *ptr.add(1) = g;
         *ptr.add(2) = b;
     }
+}
+
+unsafe fn fb_get_pixel_impl(x: i32, y: i32) -> u8 {
+    // Return 0 if out of bounds
+    if x < 0 || y < 0 || x >= FB_WIDTH as i32 || y >= FB_HEIGHT as i32 {
+        return 0;
+    }
+    
+    let offset = (y as u32 * FB_PITCH + x as u32 * 4) as usize;
+    let ptr = (FB_ADDR as usize + offset) as *const u8;
+    
+    // Read RGB values and convert to grayscale (simple average)
+    let (r, g, b) = if FB_BGR {
+        (*ptr.add(2), *ptr.add(1), *ptr)
+    } else {
+        (*ptr, *ptr.add(1), *ptr.add(2))
+    };
+    
+    // Convert to grayscale using simple average
+    ((r as u16 + g as u16 + b as u16) / 3) as u8
 }
 
 unsafe fn fb_clear_impl(r: u8, g: u8, b: u8) {
@@ -1691,10 +1716,10 @@ pub extern "C" fn watos_get_key_no_wait() -> u8 {
     0
 }
 
-/// Get pixel at position (returns 0 for now - graphics not implemented)
+/// Get pixel at position (returns grayscale value 0-255)
 #[no_mangle]
-pub extern "C" fn watos_get_pixel(_x: i32, _y: i32) -> u8 {
-    0 // Graphics not implemented yet
+pub extern "C" fn watos_get_pixel(x: i32, y: i32) -> u8 {
+    unsafe { fb_get_pixel_impl(x, y) }
 }
 
 /// Get timer value (returns ticks since boot)

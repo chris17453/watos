@@ -221,6 +221,9 @@ pub fn init() {
         };
         asm!("lidt [{}]", in(reg) &idt_desc, options(nostack, preserves_flags));
 
+        // Initialize default VGA palette
+        init_default_palette();
+
         // Enable interrupts
         asm!("sti", options(nostack, preserves_flags));
     }
@@ -450,7 +453,16 @@ pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
 
         syscall::SYS_VGA_SET_PALETTE => {
             // Set palette: rdi=index, rsi=r, rdx=g, r10=b
-            // TODO: implement palette
+            let index = (ctx.rdi & 0xFF) as usize;
+            let r = (ctx.rsi & 0xFF) as u8;
+            let g = (ctx.rdx & 0xFF) as u8;
+            let b = (ctx.r10 & 0xFF) as u8;
+            
+            unsafe {
+                if index < 256 {
+                    VGA_PALETTE[index] = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                }
+            }
             0
         }
 
@@ -517,6 +529,7 @@ pub fn init_syscalls() {
 // External framebuffer functions from main.rs
 extern "C" {
     fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8);
+    fn fb_get_pixel(x: i32, y: i32) -> u8;
     fn fb_clear_screen(r: u8, g: u8, b: u8);
 }
 
@@ -524,6 +537,33 @@ extern "C" {
 static mut VGA_MODE: u8 = 0;
 static mut VGA_WIDTH: usize = 0;
 static mut VGA_HEIGHT: usize = 0;
+
+// VGA palette (256 entries, RGB format)
+static mut VGA_PALETTE: [u32; 256] = [0; 256];
+
+/// Initialize default VGA palette
+fn init_default_palette() {
+    unsafe {
+        // Standard 16-color EGA/VGA palette
+        const PALETTE_16: [u32; 16] = [
+            0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+            0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+            0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+            0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+        ];
+        
+        // Copy 16-color palette to first 16 entries
+        for i in 0..16 {
+            VGA_PALETTE[i] = PALETTE_16[i];
+        }
+        
+        // Generate grayscale for remaining entries
+        for i in 16..256 {
+            let gray = ((i - 16) * 255 / 239) as u8;
+            VGA_PALETTE[i] = ((gray as u32) << 16) | ((gray as u32) << 8) | (gray as u32);
+        }
+    }
+}
 
 /// Set VGA mode
 fn vga_set_mode(mode: u8) -> u64 {
@@ -546,16 +586,8 @@ fn vga_set_pixel(x: i32, y: i32, color: u8) {
         return;
     }
 
-    // Access kernel framebuffer through main module
-    // For now, use the PALETTE_16 lookup for indexed color
-    const PALETTE_16: [u32; 16] = [
-        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
-        0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
-        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
-        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
-    ];
-
-    let rgb = PALETTE_16[(color & 0x0F) as usize];
+    // Use VGA_PALETTE for indexed color lookup
+    let rgb = unsafe { VGA_PALETTE[color as usize] };
     let r = ((rgb >> 16) & 0xFF) as u8;
     let g = ((rgb >> 8) & 0xFF) as u8;
     let b = (rgb & 0xFF) as u8;
@@ -567,9 +599,11 @@ fn vga_set_pixel(x: i32, y: i32, color: u8) {
 }
 
 /// Get pixel at position
-fn vga_get_pixel(_x: i32, _y: i32) -> u8 {
-    // Would need to read back from framebuffer - not implemented yet
-    0
+fn vga_get_pixel(x: i32, y: i32) -> u8 {
+    // Read from framebuffer - return grayscale value
+    unsafe {
+        fb_get_pixel(x, y)
+    }
 }
 
 /// Blit indexed color buffer to framebuffer

@@ -245,8 +245,20 @@ pub extern "C" fn watos_get_key_no_wait() -> u8 {
 
 /// Get pixel at position
 #[no_mangle]
-pub extern "C" fn watos_get_pixel(_x: i32, _y: i32) -> u8 {
-    0 // Not implemented
+pub extern "C" fn watos_get_pixel(x: i32, y: i32) -> u8 {
+    // Use SYS_VGA_GET_PIXEL syscall (32)
+    unsafe {
+        let result: u8;
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 32u32,  // SYS_VGA_GET_PIXEL
+            in("rdi") x as i64,
+            in("rsi") y as i64,
+            lateout("al") result,
+            options(nostack)
+        );
+        result
+    }
 }
 
 /// Get timer value
