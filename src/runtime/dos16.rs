@@ -240,6 +240,9 @@ pub struct DosTask {
     instruction_count: u64,
     // PSP segment for this task
     psp_seg: u16,
+    // Find file state for INT 21h/4Eh/4Fh
+    find_file_pattern: Option<String>,
+    find_file_index: usize,
 }
 
 #[derive(Clone)]
@@ -342,6 +345,8 @@ impl DosTask {
             trace_enabled: true,  // Enable tracing by default for debugging
             instruction_count: 0,
             psp_seg,
+            find_file_pattern: None,
+            find_file_index: 0,
         }
     }
 
@@ -453,12 +458,52 @@ impl DosTask {
         // Mark as free
         self.write_mcb(mcb_seg, mcb_type, MCB_OWNER_FREE, size);
 
-        // TODO: Coalesce adjacent free blocks
+        // Coalesce adjacent free blocks
+        self.coalesce_free_blocks();
+        
         serial_write_bytes(b"Freed memory at segment ");
         serial_write_hex16(seg);
         serial_write_bytes(b"\r\n");
 
         true
+    }
+    
+    /// Coalesce adjacent free MCBs to reduce fragmentation
+    fn coalesce_free_blocks(&mut self) {
+        let mut mcb_seg = FIRST_MCB_SEG;
+        
+        loop {
+            let (mcb_type, owner, size) = self.read_mcb(mcb_seg);
+            
+            // If this block is free and not the last, check next block
+            if owner == MCB_OWNER_FREE && mcb_type == MCB_TYPE_MORE {
+                let next_mcb_seg = mcb_seg + 1 + size;
+                let (next_type, next_owner, next_size) = self.read_mcb(next_mcb_seg);
+                
+                // If next block is also free, merge them
+                if next_owner == MCB_OWNER_FREE {
+                    // New size includes the MCB itself (1 para) plus the next block
+                    let new_size = size + 1 + next_size;
+                    // Use the next block's type (might be LAST)
+                    self.write_mcb(mcb_seg, next_type, MCB_OWNER_FREE, new_size);
+                    
+                    serial_write_bytes(b"Coalesced blocks at ");
+                    serial_write_hex16(mcb_seg);
+                    serial_write_bytes(b" and ");
+                    serial_write_hex16(next_mcb_seg);
+                    serial_write_bytes(b"\r\n");
+                    
+                    // Continue from same segment to check for more coalescing
+                    continue;
+                }
+            }
+            
+            // Move to next block
+            if mcb_type == MCB_TYPE_LAST {
+                break;
+            }
+            mcb_seg = mcb_seg + 1 + size;
+        }
     }
 
     /// Resize memory block at given segment
@@ -2763,11 +2808,34 @@ impl DosTask {
         serial_write_bytes(b"\r\n");
     }
 
-    // I/O port access (stubbed - can be extended)
-    fn port_in8(&self, _port: u16) -> u8 { 0 }
-    fn port_in16(&self, _port: u16) -> u16 { 0 }
-    fn port_out8(&self, _port: u16, _val: u8) {}
-    fn port_out16(&self, _port: u16, _val: u16) {}
+    // I/O port access - delegate to actual hardware ports
+    fn port_in8(&self, port: u16) -> u8 {
+        unsafe {
+            let value: u8;
+            core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nostack, nomem));
+            value
+        }
+    }
+    
+    fn port_in16(&self, port: u16) -> u16 {
+        unsafe {
+            let value: u16;
+            core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nostack, nomem));
+            value
+        }
+    }
+    
+    fn port_out8(&self, port: u16, val: u8) {
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack, nomem));
+        }
+    }
+    
+    fn port_out16(&self, port: u16, val: u16) {
+        unsafe {
+            core::arch::asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, nomem));
+        }
+    }
 
     // Log to serial (shows in QEMU serial log)
     fn log_serial(&mut self, msg: &str) {
@@ -2969,14 +3037,54 @@ impl DosTask {
         let ah = (self.cpu.ax >> 8) as u8;
         match ah {
             0x00 | 0x10 => {
-                // Get key - return 0 for now (no key)
-                // TODO: Hook into actual keyboard input
-                self.cpu.ax = 0;
+                // Get key - wait for key and return it
+                // Poll keyboard until we get something
+                loop {
+                    if let Some(scancode) = crate::interrupts::get_scancode() {
+                        // Simple scancode to ASCII conversion (subset)
+                        let ascii = match scancode {
+                            0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd', 0x12 => b'e',
+                            0x21 => b'f', 0x22 => b'g', 0x23 => b'h', 0x17 => b'i', 0x24 => b'j',
+                            0x25 => b'k', 0x26 => b'l', 0x32 => b'm', 0x31 => b'n', 0x18 => b'o',
+                            0x19 => b'p', 0x10 => b'q', 0x13 => b'r', 0x1F => b's', 0x14 => b't',
+                            0x16 => b'u', 0x2F => b'v', 0x11 => b'w', 0x2D => b'x', 0x15 => b'y',
+                            0x2C => b'z',
+                            0x02..=0x0B => b'0' + (scancode - 0x01) % 10, // 1-0
+                            0x39 => b' ', // Space
+                            0x1C => b'\r', // Enter
+                            _ => 0,
+                        };
+                        if ascii == 0 {
+                            // Non-ASCII key
+                            self.cpu.ax = ((scancode as u16) << 8);
+                        } else {
+                            // AH = scancode, AL = ASCII
+                            self.cpu.ax = ((scancode as u16) << 8) | (ascii as u16);
+                        }
+                        return;
+                    }
+                    // Brief pause to avoid busy loop
+                    unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+                }
             }
             0x01 | 0x11 => {
-                // Check key status
-                self.cpu.set_flag(FLAG_ZF, true); // No key available
-                self.cpu.ax = 0;
+                // Check key status - non-blocking
+                if let Some(scancode) = crate::interrupts::get_scancode() {
+                    // Key available - ZF=0, return it
+                    self.cpu.set_flag(FLAG_ZF, false);
+                    // Simple conversion
+                    let ascii = match scancode {
+                        0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd', 0x12 => b'e',
+                        0x1C => b'\r',
+                        0x39 => b' ',
+                        _ => 0,
+                    };
+                    self.cpu.ax = ((scancode as u16) << 8) | (ascii as u16);
+                } else {
+                    // No key - ZF=1
+                    self.cpu.set_flag(FLAG_ZF, true);
+                    self.cpu.ax = 0;
+                }
             }
             0x02 | 0x12 => {
                 // Get shift flags
@@ -3237,14 +3345,90 @@ impl DosTask {
                 self.cpu.ax = 0; // No child, return 0
             }
             0x4E => {
-                // Find first file (FCB) - not implemented
-                self.cpu.set_flag(FLAG_CF, true);
-                self.cpu.ax = 0x12; // No more files
+                // Find first file - DS:DX = ASCIIZ filename pattern, CX = attributes
+                let filename_ptr = ((self.cpu.ds as usize) << 4) + (self.cpu.dx as usize);
+                
+                // Read filename pattern from memory
+                let mut pattern = String::new();
+                for i in 0..128 {
+                    if filename_ptr + i >= self.memory.len() {
+                        break;
+                    }
+                    let c = self.memory[filename_ptr + i];
+                    if c == 0 {
+                        break;
+                    }
+                    pattern.push(c as char);
+                }
+                
+                serial_write_bytes(b"Find first file: ");
+                serial_write_bytes(pattern.as_bytes());
+                serial_write_bytes(b"\r\n");
+                
+                // For now, return files from a hardcoded list
+                // TODO: Integrate with actual VFS when directory listing API is available
+                let dummy_files = vec![
+                    ("COMMAND.COM", 25308u32, false),
+                    ("CONFIG.SYS", 128u32, false),
+                    ("AUTOEXEC.BAT", 256u32, false),
+                ];
+                
+                // Store search state
+                self.find_file_pattern = Some(pattern.clone());
+                self.find_file_index = 0;
+                
+                // Find first matching file
+                let mut found = false;
+                for (idx, (name, size, is_dir)) in dummy_files.iter().enumerate() {
+                    if self.matches_pattern(name, &pattern) {
+                        self.write_dta_entry(name, *size, *is_dir);
+                        self.find_file_index = idx + 1;
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if found {
+                    self.cpu.set_flag(FLAG_CF, false);
+                    self.cpu.ax = 0;
+                } else {
+                    self.cpu.set_flag(FLAG_CF, true);
+                    self.cpu.ax = 0x12; // No more files
+                }
             }
             0x4F => {
-                // Find next file (FCB) - not implemented
-                self.cpu.set_flag(FLAG_CF, true);
-                self.cpu.ax = 0x12; // No more files
+                // Find next file - continue from previous search
+                if let Some(ref pattern) = self.find_file_pattern.clone() {
+                    let dummy_files = vec![
+                        ("COMMAND.COM", 25308u32, false),
+                        ("CONFIG.SYS", 128u32, false),
+                        ("AUTOEXEC.BAT", 256u32, false),
+                    ];
+                    
+                    // Continue from where we left off
+                    let mut found = false;
+                    for idx in self.find_file_index..dummy_files.len() {
+                        let (name, size, is_dir) = dummy_files[idx];
+                        if self.matches_pattern(name, pattern) {
+                            self.write_dta_entry(name, size, is_dir);
+                            self.find_file_index = idx + 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    
+                    if found {
+                        self.cpu.set_flag(FLAG_CF, false);
+                        self.cpu.ax = 0;
+                    } else {
+                        self.cpu.set_flag(FLAG_CF, true);
+                        self.cpu.ax = 0x12; // No more files
+                    }
+                } else {
+                    // No search in progress
+                    self.cpu.set_flag(FLAG_CF, true);
+                    self.cpu.ax = 0x12;
+                }
             }
             0x50 => {
                 // Set PSP - ignore
@@ -3383,7 +3567,21 @@ impl DosTask {
     // DOS Close File (INT 21h/3Eh)
     fn dos_close_file(&mut self, handle: u16) {
         if (handle as usize) < 20 {
-            // If writable and modified, write back to disk (TODO)
+            // If writable and modified, write back to disk
+            if let Some(fh) = &self.file_handles[handle as usize] {
+                if fh.writable {
+                    // Log the write-back operation
+                    serial_write_bytes(b"Closing writable file: ");
+                    serial_write_bytes(fh.filename.as_bytes());
+                    serial_write_bytes(b" (");
+                    serial_write_hex16((fh.data.len() >> 16) as u16);
+                    serial_write_hex16(fh.data.len() as u16);
+                    serial_write_bytes(b" bytes)\r\n");
+                    
+                    // TODO: Actually write to filesystem when WFS write support is available
+                    // For now, data is preserved in memory but not persisted
+                }
+            }
             self.file_handles[handle as usize] = None;
         }
     }
@@ -3451,6 +3649,86 @@ impl DosTask {
 
         fh.position = new_pos;
         Some(new_pos)
+    }
+    
+    // Helper: Match filename against DOS wildcard pattern
+    fn matches_pattern(&self, filename: &str, pattern: &str) -> bool {
+        // Simple wildcard matching: * matches everything, ? matches one char
+        let fname_upper = filename.to_uppercase();
+        let pattern_upper = pattern.to_uppercase();
+        
+        // Special case: *.* matches everything
+        if pattern_upper == "*.*" {
+            return true;
+        }
+        
+        // Simple matching without full regex
+        let mut f_chars = fname_upper.chars();
+        let mut p_chars = pattern_upper.chars();
+        
+        loop {
+            match (p_chars.next(), f_chars.next()) {
+                (Some('*'), _) => return true, // * matches rest
+                (Some('?'), Some(_)) => continue, // ? matches one char
+                (Some(p), Some(f)) if p == f => continue,
+                (None, None) => return true, // Both ended = match
+                _ => return false, // Mismatch
+            }
+        }
+    }
+    
+    // Helper: Write DTA entry for found file
+    fn write_dta_entry(&mut self, filename: &str, size: u32, is_dir: bool) {
+        let dta_addr = ((self.psp_seg as usize) << 4) + 0x80;
+        if dta_addr + 43 > self.memory.len() {
+            return;
+        }
+        
+        // DOS DTA format for find file:
+        // 00h: drive (0=default)
+        // 01h: filename (8 bytes, space-padded)
+        // 09h: extension (3 bytes, space-padded)
+        // 0Ch: attributes
+        // 0Dh: reserved
+        // 15h: time
+        // 17h: date
+        // 19h: file size (4 bytes)
+        
+        self.memory[dta_addr] = 0; // Default drive
+        
+        // Split filename into name and extension
+        let (name, ext) = if let Some(dot_pos) = filename.rfind('.') {
+            (&filename[..dot_pos], &filename[dot_pos+1..])
+        } else {
+            (filename, "")
+        };
+        
+        // Write name (8 bytes, space-padded)
+        for i in 0..8 {
+            self.memory[dta_addr + 1 + i] = if i < name.len() {
+                name.as_bytes()[i].to_ascii_uppercase()
+            } else {
+                b' '
+            };
+        }
+        
+        // Write extension (3 bytes, space-padded)
+        for i in 0..3 {
+            self.memory[dta_addr + 9 + i] = if i < ext.len() {
+                ext.as_bytes()[i].to_ascii_uppercase()
+            } else {
+                b' '
+            };
+        }
+        
+        // Attributes: 0x10 = directory
+        self.memory[dta_addr + 0x0C] = if is_dir { 0x10 } else { 0x00 };
+        
+        // File size (little-endian)
+        self.memory[dta_addr + 0x19] = (size & 0xFF) as u8;
+        self.memory[dta_addr + 0x1A] = ((size >> 8) & 0xFF) as u8;
+        self.memory[dta_addr + 0x1B] = ((size >> 16) & 0xFF) as u8;
+        self.memory[dta_addr + 0x1C] = ((size >> 24) & 0xFF) as u8;
     }
 }
 

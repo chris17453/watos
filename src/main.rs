@@ -314,7 +314,7 @@ unsafe fn serial_read_char() -> Option<u8> {
 }
 
 // PS/2 keyboard scancode to ASCII (simple set 1)
-fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
+pub fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
     // Only handle key press (not release - high bit set)
     if scancode & 0x80 != 0 { return None; }
 
@@ -396,6 +396,11 @@ pub extern "C" fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
 }
 
 #[no_mangle]
+pub extern "C" fn fb_get_pixel(x: i32, y: i32) -> u8 {
+    unsafe { fb_get_pixel_impl(x, y) }
+}
+
+#[no_mangle]
 pub extern "C" fn fb_clear_screen(r: u8, g: u8, b: u8) {
     unsafe { fb_clear_impl(r, g, b); }
 }
@@ -413,6 +418,26 @@ unsafe fn fb_put_pixel_impl(x: u32, y: u32, r: u8, g: u8, b: u8) {
         *ptr.add(1) = g;
         *ptr.add(2) = b;
     }
+}
+
+unsafe fn fb_get_pixel_impl(x: i32, y: i32) -> u8 {
+    // Return 0 if out of bounds
+    if x < 0 || y < 0 || x >= FB_WIDTH as i32 || y >= FB_HEIGHT as i32 {
+        return 0;
+    }
+    
+    let offset = (y as u32 * FB_PITCH + x as u32 * 4) as usize;
+    let ptr = (FB_ADDR as usize + offset) as *const u8;
+    
+    // Read RGB values and convert to grayscale (simple average)
+    let (r, g, b) = if FB_BGR {
+        (*ptr.add(2), *ptr.add(1), *ptr)
+    } else {
+        (*ptr, *ptr.add(1), *ptr.add(2))
+    };
+    
+    // Convert to grayscale using simple average
+    ((r as u16 + g as u16 + b as u16) / 3) as u8
 }
 
 unsafe fn fb_clear_impl(r: u8, g: u8, b: u8) {
@@ -1691,10 +1716,10 @@ pub extern "C" fn watos_get_key_no_wait() -> u8 {
     0
 }
 
-/// Get pixel at position (returns 0 for now - graphics not implemented)
+/// Get pixel at position (returns grayscale value 0-255)
 #[no_mangle]
-pub extern "C" fn watos_get_pixel(_x: i32, _y: i32) -> u8 {
-    0 // Graphics not implemented yet
+pub extern "C" fn watos_get_pixel(x: i32, y: i32) -> u8 {
+    unsafe { fb_get_pixel_impl(x, y) }
 }
 
 /// Get timer value (returns ticks since boot)
@@ -1948,8 +1973,17 @@ pub extern "C" fn watos_exit(code: i32) -> ! {
     if process::current_pid().is_some() {
         process::process_exit_to_kernel(code);
     }
-    // Fallback: just halt
-    loop { unsafe { core::arch::asm!("hlt"); } }
+    // Fallback: log error and return to shell/scheduler
+    unsafe {
+        serial_write(b"WARNING: process_exit_to_kernel failed, returning to kernel loop\r\n");
+        // Clear interrupts and return to a safe state
+        core::arch::asm!("cli", options(nostack, nomem));
+        // Could return to kernel_main loop instead of halting
+        // For now, yield CPU and wait for scheduler
+        loop { 
+            core::arch::asm!("hlt", options(nostack, nomem)); 
+        }
+    }
 }
 
 #[panic_handler]

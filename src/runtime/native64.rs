@@ -724,8 +724,48 @@ fn handle_syscall(task: &mut Native64Task) {
 
         syscall::SYS_READ => {
             // arg1 = fd, arg2 = buf ptr, arg3 = max len
-            // For now, just return 0 (EOF)
-            task.cpu.rax = 0;
+            let buf_addr = arg2;
+            let max_len = arg3 as usize;
+            
+            // For stdin (fd 0 or any fd), read from keyboard buffer
+            let mut bytes_read = 0usize;
+            for i in 0..max_len {
+                // Try to get a character from keyboard
+                if let Some(scancode) = crate::interrupts::get_scancode() {
+                    // Convert scancode to ASCII (basic conversion)
+                    let ascii = match scancode {
+                        0x1C => b'\n', // Enter
+                        0x0E => 8,     // Backspace
+                        _ => {
+                            // Try to convert to ASCII - use simple mapping
+                            // For simplicity, just use basic alphanumeric keys
+                            match scancode {
+                                0x10..=0x19 => (scancode - 0x10 + b'q'),  // qwertyuiop
+                                0x1E..=0x26 => (scancode - 0x1E + b'a'),  // asdfghjkl
+                                0x2C..=0x32 => (scancode - 0x2C + b'z'),  // zxcvbnm
+                                0x39 => b' ',  // Space
+                                0x02..=0x0B => (scancode - 0x02 + b'1'),  // 1-0
+                                _ => continue, // Skip unknown keys
+                            }
+                        }
+                    };
+                    
+                    // Write to buffer
+                    if mem_write_u8(task, buf_addr + i as u64, ascii) {
+                        bytes_read += 1;
+                        // Stop at newline
+                        if ascii == b'\n' {
+                            break;
+                        }
+                    } else {
+                        break; // Buffer write failed
+                    }
+                } else {
+                    break; // No more keys
+                }
+            }
+            
+            task.cpu.rax = bytes_read as u64;
         }
 
         syscall::SYS_GETKEY => {
@@ -751,12 +791,22 @@ fn handle_syscall(task: &mut Native64Task) {
         }
 
         syscall::SYS_TIMER => {
-            // Return timer ticks (placeholder)
-            task.cpu.rax = 0;
+            // Return timer ticks
+            task.cpu.rax = crate::interrupts::get_ticks();
         }
 
         syscall::SYS_SLEEP => {
-            // arg1 = milliseconds - just return for now
+            // arg1 = milliseconds to sleep
+            let ms = arg1;
+            // Convert ms to ticks (18.2 ticks per second = ~55ms per tick)
+            let ticks_to_wait = (ms * 18 + 999) / 1000;  // Round up
+            let start_ticks = crate::interrupts::get_ticks();
+            
+            // Simple busy wait for now
+            while crate::interrupts::get_ticks() < start_ticks + ticks_to_wait {
+                // Yield CPU by halting briefly
+                unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+            }
             task.cpu.rax = 0;
         }
 
