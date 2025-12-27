@@ -171,28 +171,80 @@ pub extern "C" fn watos_console_read(buf: *mut u8, max_len: usize) -> usize {
     }
 }
 
-/// File open syscall stub
+/// File open syscall - delegates to kernel via INT 0x80
 #[no_mangle]
-pub extern "C" fn watos_file_open(_path: *const u8, _len: usize, _mode: u64) -> i64 {
-    -1 // Not implemented - return error
+pub extern "C" fn watos_file_open(path: *const u8, len: usize, mode: u64) -> i64 {
+    if path.is_null() || len == 0 {
+        return -1;
+    }
+    unsafe {
+        let result: i64;
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 3u32,     // SYS_OPEN
+            in("rdi") path,
+            in("rsi") len,
+            in("rdx") mode,
+            lateout("rax") result,
+            options(nostack)
+        );
+        result
+    }
 }
 
-/// File close syscall stub
+/// File close syscall - delegates to kernel via INT 0x80
 #[no_mangle]
-pub extern "C" fn watos_file_close(_handle: i64) {
-    // Not implemented
+pub extern "C" fn watos_file_close(handle: i64) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 4u32,     // SYS_CLOSE
+            in("rdi") handle,
+            options(nostack)
+        );
+    }
 }
 
-/// File read syscall stub
+/// File read syscall - delegates to kernel via INT 0x80
 #[no_mangle]
-pub extern "C" fn watos_file_read(_handle: i64, _buf: *mut u8, _len: usize) -> usize {
-    0 // Not implemented
+pub extern "C" fn watos_file_read(handle: i64, buf: *mut u8, len: usize) -> usize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    unsafe {
+        let result: usize;
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 2u32,     // SYS_READ (can also handle files)
+            in("rdi") handle,
+            in("rsi") buf,
+            in("rdx") len,
+            lateout("rax") result,
+            options(nostack)
+        );
+        result
+    }
 }
 
-/// File write syscall stub
+/// File write syscall - delegates to kernel via INT 0x80
 #[no_mangle]
-pub extern "C" fn watos_file_write(_handle: i64, _buf: *const u8, _len: usize) -> usize {
-    0 // Not implemented
+pub extern "C" fn watos_file_write(handle: i64, buf: *const u8, len: usize) -> usize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    unsafe {
+        let result: usize;
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 1u32,     // SYS_WRITE (can handle both console and files)
+            in("rdi") handle,
+            in("rsi") buf,
+            in("rdx") len,
+            lateout("rax") result,
+            options(nostack)
+        );
+        result
+    }
 }
 
 /// Get free memory
