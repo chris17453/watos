@@ -279,3 +279,341 @@ pub fn sleep_ms(ms: u32) {
         halt();
     }
 }
+
+// =============================================================================
+// Syscall Handler (INT 0x80)
+// =============================================================================
+
+/// Syscall numbers
+pub mod syscall {
+    // Console/IO
+    pub const SYS_WRITE: u32 = 1;
+    pub const SYS_READ: u32 = 2;
+    pub const SYS_OPEN: u32 = 3;
+    pub const SYS_CLOSE: u32 = 4;
+    pub const SYS_GETKEY: u32 = 5;
+    pub const SYS_EXIT: u32 = 6;
+
+    // VGA Graphics
+    pub const SYS_VGA_SET_MODE: u32 = 30;
+    pub const SYS_VGA_SET_PIXEL: u32 = 31;
+    pub const SYS_VGA_GET_PIXEL: u32 = 32;
+    pub const SYS_VGA_BLIT: u32 = 33;
+    pub const SYS_VGA_CLEAR: u32 = 34;
+    pub const SYS_VGA_FLIP: u32 = 35;
+    pub const SYS_VGA_SET_PALETTE: u32 = 36;
+}
+
+/// Syscall context passed from assembly handler
+#[repr(C)]
+pub struct SyscallContext {
+    pub r11: u64,
+    pub r10: u64,  // arg4
+    pub r9: u64,   // arg6
+    pub r8: u64,   // arg5
+    pub rdi: u64,  // arg1
+    pub rsi: u64,  // arg2
+    pub rdx: u64,  // arg3
+    pub rcx: u64,
+    pub rax: u64,  // syscall number / return value
+}
+
+/// Syscall handler - dispatches based on syscall number
+/// Returns result in rax
+#[no_mangle]
+pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
+    let syscall_num = ctx.rax as u32;
+
+    // Debug: log syscall number
+    unsafe {
+        // Write to serial port directly
+        let port: u16 = 0x3F8;
+        let msg = b"SC:";
+        for &b in msg {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack));
+        }
+        let hex = b"0123456789ABCDEF";
+        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[((syscall_num >> 4) & 0xF) as usize], options(nostack));
+        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[(syscall_num & 0xF) as usize], options(nostack));
+        core::arch::asm!("out dx, al", in("dx") port, in("al") b' ', options(nostack));
+    }
+
+    ctx.rax = match syscall_num {
+        syscall::SYS_WRITE => {
+            // Write to console: rdi=fd (ignored), rsi=buf, rdx=len
+            let buf = ctx.rsi as *const u8;
+            let len = ctx.rdx as usize;
+            // Debug: print buf address and first byte
+            unsafe {
+                let port: u16 = 0x3F8;
+                let hex = b"0123456789ABCDEF";
+                let msg = b"WR:@";
+                for &b in msg { core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack)); }
+                for i in (0..16).rev() {
+                    let n = ((ctx.rsi >> (i*4)) & 0xF) as usize;
+                    core::arch::asm!("out dx, al", in("dx") port, in("al") hex[n], options(nostack));
+                }
+                let msg2 = b" L=";
+                for &b in msg2 { core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack)); }
+                for i in (0..8).rev() {
+                    let n = ((len as u64 >> (i*4)) & 0xF) as usize;
+                    core::arch::asm!("out dx, al", in("dx") port, in("al") hex[n], options(nostack));
+                }
+                if !buf.is_null() && len > 0 {
+                    let msg3 = b" D=";
+                    for &b in msg3 { core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack)); }
+                    for i in 0..len.min(16) {
+                        let byte = *buf.add(i);
+                        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[(byte >> 4) as usize], options(nostack));
+                        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[(byte & 0xF) as usize], options(nostack));
+                    }
+                }
+                core::arch::asm!("out dx, al", in("dx") port, in("al") b'\r', options(nostack));
+                core::arch::asm!("out dx, al", in("dx") port, in("al") b'\n', options(nostack));
+            }
+            if !buf.is_null() && len > 0 {
+                unsafe {
+                    let slice = core::slice::from_raw_parts(buf, len);
+                    crate::console::print(slice);
+                }
+            }
+            len as u64
+        }
+
+        syscall::SYS_READ => {
+            // Read from console: rdi=fd (ignored), rsi=buf, rdx=max_len
+            // Returns number of bytes read
+            0 // Handled by watos_console_read for now
+        }
+
+        syscall::SYS_GETKEY => {
+            // Get key without blocking
+            if let Some(scancode) = get_scancode() {
+                scancode as u64
+            } else {
+                0
+            }
+        }
+
+        syscall::SYS_EXIT => {
+            // Exit process: rdi=exit_code
+            let code = ctx.rdi as i32;
+            crate::process::exit_current(code);
+            // Mark that we should return to kernel after syscall
+            // The actual return happens when the process returns from its entry
+            0
+        }
+
+        syscall::SYS_VGA_SET_MODE => {
+            // Set VGA mode: rdi=mode_num
+            let mode = ctx.rdi as u8;
+            vga_set_mode(mode)
+        }
+
+        syscall::SYS_VGA_SET_PIXEL => {
+            // Set pixel: rdi=x, rsi=y, rdx=color
+            let x = ctx.rdi as i32;
+            let y = ctx.rsi as i32;
+            let color = ctx.rdx as u8;
+            vga_set_pixel(x, y, color);
+            0
+        }
+
+        syscall::SYS_VGA_GET_PIXEL => {
+            // Get pixel: rdi=x, rsi=y
+            let x = ctx.rdi as i32;
+            let y = ctx.rsi as i32;
+            vga_get_pixel(x, y) as u64
+        }
+
+        syscall::SYS_VGA_BLIT => {
+            // Blit buffer: rdi=buf_ptr, rsi=width, rdx=height, r10=stride
+            let buf = ctx.rdi as *const u8;
+            let width = ctx.rsi as usize;
+            let height = ctx.rdx as usize;
+            let stride = ctx.r10 as usize;
+            vga_blit(buf, width, height, stride);
+            0
+        }
+
+        syscall::SYS_VGA_CLEAR => {
+            // Clear screen: rdi=color
+            let color = ctx.rdi as u8;
+            vga_clear(color);
+            0
+        }
+
+        syscall::SYS_VGA_FLIP => {
+            // Flip/commit buffer (no-op for now, direct framebuffer)
+            0
+        }
+
+        syscall::SYS_VGA_SET_PALETTE => {
+            // Set palette: rdi=index, rsi=r, rdx=g, r10=b
+            // TODO: implement palette
+            0
+        }
+
+        _ => {
+            // Unknown syscall
+            u64::MAX
+        }
+    };
+}
+
+// Syscall handler assembly stub
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_handler_asm() {
+    core::arch::naked_asm!(
+        // Save registers
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+
+        // Call Rust handler with pointer to context
+        "mov rdi, rsp",
+        "call {handler}",
+
+        // Restore registers
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+
+        "iretq",
+        handler = sym syscall_handler,
+    );
+}
+
+
+/// Install syscall handler at INT 0x80
+pub fn init_syscalls() {
+    unsafe {
+        let cs: u16;
+        asm!("mov {0:x}, cs", out(reg) cs, options(nostack, preserves_flags));
+
+        let handler_addr = syscall_handler_asm as *const () as u64;
+        IDT[0x80].set_handler(handler_addr, cs);
+        // Set type to 0x8E for interrupt gate, or 0xEE for user-callable
+        IDT[0x80].type_attr = 0xEE; // Present, Ring 3 callable, Interrupt Gate
+    }
+}
+
+// =============================================================================
+// VGA Syscall Implementations
+// =============================================================================
+
+// External framebuffer functions from main.rs
+extern "C" {
+    fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8);
+    fn fb_clear_screen(r: u8, g: u8, b: u8);
+}
+
+// VGA mode state
+static mut VGA_MODE: u8 = 0;
+static mut VGA_WIDTH: usize = 0;
+static mut VGA_HEIGHT: usize = 0;
+
+/// Set VGA mode
+fn vga_set_mode(mode: u8) -> u64 {
+    unsafe {
+        VGA_MODE = mode;
+        match mode {
+            0 => { VGA_WIDTH = 80; VGA_HEIGHT = 25; }  // Text mode
+            1 => { VGA_WIDTH = 320; VGA_HEIGHT = 200; } // 320x200
+            2 => { VGA_WIDTH = 640; VGA_HEIGHT = 200; } // 640x200
+            3 => { VGA_WIDTH = 640; VGA_HEIGHT = 480; } // 640x480
+            _ => return u64::MAX,
+        }
+        0
+    }
+}
+
+/// Set pixel using kernel framebuffer
+fn vga_set_pixel(x: i32, y: i32, color: u8) {
+    if x < 0 || y < 0 {
+        return;
+    }
+
+    // Access kernel framebuffer through main module
+    // For now, use the PALETTE_16 lookup for indexed color
+    const PALETTE_16: [u32; 16] = [
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+        0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+    ];
+
+    let rgb = PALETTE_16[(color & 0x0F) as usize];
+    let r = ((rgb >> 16) & 0xFF) as u8;
+    let g = ((rgb >> 8) & 0xFF) as u8;
+    let b = (rgb & 0xFF) as u8;
+
+    // Call into framebuffer drawing
+    unsafe {
+        fb_put_pixel(x as u32, y as u32, r, g, b);
+    }
+}
+
+/// Get pixel at position
+fn vga_get_pixel(_x: i32, _y: i32) -> u8 {
+    // Would need to read back from framebuffer - not implemented yet
+    0
+}
+
+/// Blit indexed color buffer to framebuffer
+fn vga_blit(buf: *const u8, width: usize, height: usize, stride: usize) {
+    if buf.is_null() {
+        return;
+    }
+
+    const PALETTE_16: [u32; 16] = [
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+        0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+    ];
+
+    unsafe {
+        for y in 0..height {
+            for x in 0..width {
+                let color = *buf.add(y * stride + x);
+                let rgb = PALETTE_16[(color & 0x0F) as usize];
+                let r = ((rgb >> 16) & 0xFF) as u8;
+                let g = ((rgb >> 8) & 0xFF) as u8;
+                let b = (rgb & 0xFF) as u8;
+                fb_put_pixel(x as u32, y as u32, r, g, b);
+            }
+        }
+    }
+}
+
+/// Clear screen with color
+fn vga_clear(color: u8) {
+    const PALETTE_16: [u32; 16] = [
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
+        0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
+        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+    ];
+
+    let rgb = PALETTE_16[(color & 0x0F) as usize];
+    let r = ((rgb >> 16) & 0xFF) as u8;
+    let g = ((rgb >> 8) & 0xFF) as u8;
+    let b = (rgb & 0xFF) as u8;
+
+    unsafe {
+        fb_clear_screen(r, g, b);
+    }
+}

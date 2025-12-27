@@ -186,7 +186,50 @@ if [ ! -f "$MKFS_WFS" ]; then
     cd "$PROJECT_ROOT"
 fi
 
-# Step 7: Create WFS data disk image (if mkfs.wfs available)
+# Step 7: Build WATOS native applications
+log "Building WATOS native applications..."
+mkdir -p "$PROJECT_ROOT/rootfs/BIN"
+
+# Build GWBASIC for WATOS
+log "Building GWBASIC for WATOS..."
+cd "$PROJECT_ROOT/crates/gwbasic"
+
+# Build the library
+if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --no-default-features \
+    --features watos \
+    --lib 2>&1; then
+    success "GWBASIC library built"
+else
+    echo -e "${YELLOW}[WARN]${NC} GWBASIC library build failed (optional)"
+fi
+
+# Build the executable binary
+if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --no-default-features \
+    --features watos \
+    --bin gwbasic 2>&1; then
+
+    # Copy to rootfs/BIN
+    if [ "$BUILD_TYPE" = "release" ]; then
+        GWBASIC_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/gwbasic"
+    else
+        GWBASIC_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/gwbasic"
+    fi
+
+    if [ -f "$GWBASIC_BIN" ]; then
+        # Copy to rootfs root (mkfs_wfs doesn't support subdirs yet)
+        cp "$GWBASIC_BIN" "$PROJECT_ROOT/rootfs/GWBASIC.EXE"
+        success "GWBASIC binary built and copied to rootfs/GWBASIC.EXE ($(du -h "$GWBASIC_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} GWBASIC binary build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Step 8: Create WFS data disk image (if mkfs.wfs available)
 if [ -f "$MKFS_WFS" ]; then
     log "Creating WFS data disk image..."
     mkdir -p "$PROJECT_ROOT/rootfs"

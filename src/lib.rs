@@ -11,6 +11,7 @@ pub mod interrupts;
 pub mod net;
 pub mod disk;
 pub mod runtime;
+pub mod process;
 pub mod console;
 
 #[panic_handler]

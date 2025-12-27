@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+
 use alloc::string::{String, ToString};
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
@@ -13,6 +14,7 @@ mod interrupts;
 mod net;
 mod disk;
 mod runtime;
+mod process;
 pub mod console;
 
 // Boot info structure from bootloader at 0x80000
@@ -299,7 +301,7 @@ unsafe fn serial_init() {
     outb(SERIAL_PORT + 4, 0x0B);
 }
 
-unsafe fn serial_write(s: &[u8]) {
+pub unsafe fn serial_write(s: &[u8]) {
     for &byte in s {
         for _ in 0..1000 { core::arch::asm!("nop", options(nostack)); }
         outb(SERIAL_PORT, byte);
@@ -387,8 +389,18 @@ unsafe fn kb_read_char(shift: &mut bool) -> Option<u8> {
     scancode_to_ascii(scancode, *shift)
 }
 
-// Framebuffer functions
-unsafe fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
+// Framebuffer functions (extern for syscall access from interrupts module)
+#[no_mangle]
+pub extern "C" fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
+    unsafe { fb_put_pixel_impl(x, y, r, g, b); }
+}
+
+#[no_mangle]
+pub extern "C" fn fb_clear_screen(r: u8, g: u8, b: u8) {
+    unsafe { fb_clear_impl(r, g, b); }
+}
+
+unsafe fn fb_put_pixel_impl(x: u32, y: u32, r: u8, g: u8, b: u8) {
     if x >= FB_WIDTH || y >= FB_HEIGHT { return; }
     let offset = (y * FB_PITCH + x * 4) as usize;
     let ptr = (FB_ADDR as usize + offset) as *mut u8;
@@ -403,10 +415,10 @@ unsafe fn fb_put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) {
     }
 }
 
-unsafe fn fb_clear(r: u8, g: u8, b: u8) {
+unsafe fn fb_clear_impl(r: u8, g: u8, b: u8) {
     for y in 0..FB_HEIGHT {
         for x in 0..FB_WIDTH {
-            fb_put_pixel(x, y, r, g, b);
+            fb_put_pixel_impl(x, y, r, g, b);
         }
     }
 }
@@ -421,9 +433,9 @@ unsafe fn fb_draw_char(x: u32, y: u32, c: u8, fg_r: u8, fg_g: u8, fg_b: u8, bg_r
             let px = x + col;
             let py = y + row;
             if (bits >> (7 - col)) & 1 != 0 {
-                fb_put_pixel(px, py, fg_r, fg_g, fg_b);
+                fb_put_pixel_impl(px, py, fg_r, fg_g, fg_b);
             } else {
-                fb_put_pixel(px, py, bg_r, bg_g, bg_b);
+                fb_put_pixel_impl(px, py, bg_r, bg_g, bg_b);
             }
         }
     }
@@ -444,7 +456,7 @@ unsafe fn fb_scroll() {
     let last_row_y = (TEXT_ROWS - 1) * CHAR_HEIGHT;
     for y in last_row_y..last_row_y + CHAR_HEIGHT {
         for x in 0..FB_WIDTH {
-            fb_put_pixel(x, y, 0, 0, 170); // Blue background
+            fb_put_pixel_impl(x, y, 0, 0, 170); // Blue background
         }
     }
 }
@@ -488,7 +500,7 @@ pub unsafe fn render_console(con: &console::Console) {
         let cy = con.cursor_y as u32 * CHAR_HEIGHT + CHAR_HEIGHT - 2;
         for row in 0..2 {
             for col in 0..CHAR_WIDTH {
-                fb_put_pixel(cx + col, cy + row, 255, 255, 255);
+                fb_put_pixel_impl(cx + col, cy + row, 255, 255, 255);
             }
         }
     }
@@ -503,7 +515,7 @@ unsafe fn fb_draw_cursor(show: bool) {
     let (r, g, b) = if show { (255, 255, 255) } else { (0, 0, 170) }; // White or background
     for row in 0..2 {
         for col in 0..CHAR_WIDTH {
-            fb_put_pixel(px + col, py + row, r, g, b);
+            fb_put_pixel_impl(px + col, py + row, r, g, b);
         }
     }
 }
@@ -722,6 +734,7 @@ fn wildcard_match_impl(pattern: &[u8], text: &[u8]) -> bool {
     p == pattern.len()
 }
 
+
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     unsafe {
@@ -749,7 +762,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Clear screen to blue
     unsafe {
-        fb_clear(0, 0, 170);
+        fb_clear_impl(0, 0, 170);
         serial_write(b"Screen cleared\r\n");
     }
 
@@ -768,8 +781,9 @@ pub extern "C" fn kernel_main() -> ! {
         serial_write(b"Initializing interrupts...\r\n");
     }
     interrupts::init();
+    interrupts::init_syscalls();
     unsafe {
-        serial_write(b"Interrupts enabled\r\n");
+        serial_write(b"Interrupts + syscalls enabled\r\n");
     }
 
     // Display boot banner
@@ -840,6 +854,32 @@ pub extern "C" fn kernel_main() -> ! {
         console_print(b"\nType 'help' for commands.\n");
         console_print(b"\n");
         runtime::register_default_runtimes();
+
+        // DEBUG: Try to auto-run GWBASIC.EXE
+        console_print(b"DEBUG: Attempting to run GWBASIC.EXE...\n");
+        serial_write(b"DEBUG: Looking for GWBASIC.EXE...\r\n");
+        let mut found = false;
+        if let Some(mut vfs) = disk::drive_manager().get_current_vfs() {
+            if let Ok(data) = vfs.read_file("GWBASIC.EXE") {
+                serial_write(b"DEBUG: Found GWBASIC.EXE, running...\r\n");
+                found = true;
+                match runtime::detect_and_run("GWBASIC.EXE", &data) {
+                    runtime::RunResult::Scheduled(_pid) => {
+                        serial_write(b"DEBUG: Process finished\r\n");
+                        console_print(b"Process finished\n");
+                    }
+                    runtime::RunResult::Failed => {
+                        serial_write(b"DEBUG: Process failed to run\r\n");
+                        console_print(b"Failed to run GWBASIC.EXE\n");
+                    }
+                }
+            }
+        }
+        if !found {
+            serial_write(b"DEBUG: GWBASIC.EXE not found\r\n");
+            console_print(b"GWBASIC.EXE not found\n");
+        }
+
         print_prompt();
     }
 
@@ -923,6 +963,7 @@ pub extern "C" fn kernel_main() -> ! {
                             console_print(b"  netdiag     - Network diagnostics\n");
                             console_print(b"  ping <ip>   - Ping a host\n");
                             console_print(b"  cls         - Clear screen\n");
+                            console_print(b"  gwbasic     - GW-BASIC interpreter\n");
                             console_print(b"  exit        - Shutdown\n");
                         },
                         "ver" => unsafe {
@@ -1275,11 +1316,15 @@ pub extern "C" fn kernel_main() -> ! {
                             }
                         },
                         "cls" => unsafe {
-                            fb_clear(0, 0, 170);
+                            fb_clear_impl(0, 0, 170);
                             CURSOR_X = 0;
                             CURSOR_Y = 0;
                             // Also clear the active console's buffer
                             console::manager().active().clear();
+                        },
+                        "gwbasic" | "basic" => {
+                            // Tell user to run GWBASIC.EXE
+                            unsafe { console_print(b"Run 'GWBASIC.EXE' from disk\n"); }
                         },
                         "exit" => unsafe {
                             console_print(b"System shutting down...\n");
@@ -1608,6 +1653,303 @@ pub extern "C" fn kernel_main() -> ! {
             }
         }
     }
+}
+
+// =============================================================================
+// WATOS Syscall Functions for gwbasic
+// These are called by the gwbasic library when running on WATOS
+// =============================================================================
+
+/// Get amount of free memory
+#[no_mangle]
+pub extern "C" fn watos_get_free_memory() -> usize {
+    // Return a reasonable amount - the kernel has 4MB heap
+    // Just return a fixed value for now
+    2 * 1024 * 1024 // 2MB free
+}
+
+/// Get cursor column position
+#[no_mangle]
+pub extern "C" fn watos_get_cursor_col() -> u8 {
+    unsafe { CURSOR_X as u8 }
+}
+
+/// Get cursor row position
+#[no_mangle]
+pub extern "C" fn watos_get_cursor_row() -> u8 {
+    unsafe { CURSOR_Y as u8 }
+}
+
+/// Get a key without waiting (returns 0 if no key available)
+#[no_mangle]
+pub extern "C" fn watos_get_key_no_wait() -> u8 {
+    if let Some(scancode) = interrupts::get_scancode() {
+        if let Some(ascii) = scancode_to_ascii(scancode, false) {
+            return ascii;
+        }
+    }
+    0
+}
+
+/// Get pixel at position (returns 0 for now - graphics not implemented)
+#[no_mangle]
+pub extern "C" fn watos_get_pixel(_x: i32, _y: i32) -> u8 {
+    0 // Graphics not implemented yet
+}
+
+/// Get timer value (returns ticks since boot)
+#[no_mangle]
+pub extern "C" fn watos_timer_syscall() -> u64 {
+    interrupts::get_ticks()
+}
+
+/// Console write function for gwbasic
+#[no_mangle]
+pub extern "C" fn watos_console_write(buf: *const u8, len: usize) {
+    if buf.is_null() || len == 0 {
+        return;
+    }
+    unsafe {
+        let slice = core::slice::from_raw_parts(buf, len);
+        console_print(slice);
+    }
+}
+
+/// Console read function for gwbasic
+#[no_mangle]
+pub extern "C" fn watos_console_read(buf: *mut u8, max_len: usize) -> usize {
+    if buf.is_null() || max_len == 0 {
+        return 0;
+    }
+
+    let mut pos = 0;
+    loop {
+        if let Some(scancode) = interrupts::get_scancode() {
+            if let Some(ascii) = scancode_to_ascii(scancode, false) {
+                if ascii == b'\r' || ascii == b'\n' {
+                    unsafe { *buf.add(pos) = b'\n'; }
+                    return pos + 1;
+                }
+                if pos < max_len {
+                    unsafe { *buf.add(pos) = ascii; }
+                    pos += 1;
+                }
+            }
+        }
+        interrupts::halt();
+    }
+}
+
+// =============================================================================
+// File Handle Table for gwbasic file I/O
+// =============================================================================
+
+/// Maximum open files
+const MAX_OPEN_FILES: usize = 16;
+
+/// Open file state
+struct OpenFile {
+    in_use: bool,
+    data: Option<alloc::vec::Vec<u8>>,  // File data (read into memory)
+    position: usize,                     // Current read position
+    name: [u8; 12],                      // 8.3 filename
+    mode: u8,                            // 0=read, 1=write, 2=append
+}
+
+impl OpenFile {
+    const fn empty() -> Self {
+        OpenFile {
+            in_use: false,
+            data: None,
+            position: 0,
+            name: [0; 12],
+            mode: 0,
+        }
+    }
+}
+
+/// File handle table
+static mut FILE_TABLE: [OpenFile; MAX_OPEN_FILES] = [
+    OpenFile::empty(), OpenFile::empty(), OpenFile::empty(), OpenFile::empty(),
+    OpenFile::empty(), OpenFile::empty(), OpenFile::empty(), OpenFile::empty(),
+    OpenFile::empty(), OpenFile::empty(), OpenFile::empty(), OpenFile::empty(),
+    OpenFile::empty(), OpenFile::empty(), OpenFile::empty(), OpenFile::empty(),
+];
+
+/// Open a file for reading or writing
+/// mode: 0=read, 1=write, 2=append
+#[no_mangle]
+pub extern "C" fn watos_file_open(path: *const u8, len: usize, mode: u64) -> i64 {
+    if path.is_null() || len == 0 {
+        return -1;
+    }
+
+    // Convert path to string
+    let path_slice = unsafe { core::slice::from_raw_parts(path, len) };
+    let filename = match core::str::from_utf8(path_slice) {
+        Ok(s) => s.trim(),
+        Err(_) => return -1,
+    };
+
+    // Find a free handle
+    let handle = unsafe {
+        FILE_TABLE.iter().position(|f| !f.in_use)
+    };
+
+    let handle = match handle {
+        Some(h) => h,
+        None => return -1, // No free handles
+    };
+
+    // For read mode, load the file from disk
+    if mode == 0 {
+        // Get the current drive's VFS
+        if let Some(mut vfs) = disk::drive_manager().get_current_vfs() {
+            // Read the file
+            if let Ok(data) = vfs.read_file(filename) {
+                unsafe {
+                    FILE_TABLE[handle].in_use = true;
+                    FILE_TABLE[handle].data = Some(data);
+                    FILE_TABLE[handle].position = 0;
+                    FILE_TABLE[handle].mode = 0;
+                    // Store filename (truncate to 12 chars)
+                    let name_bytes = filename.as_bytes();
+                    for i in 0..12.min(name_bytes.len()) {
+                        FILE_TABLE[handle].name[i] = name_bytes[i];
+                    }
+                }
+                return handle as i64;
+            }
+        }
+        return -1; // File not found
+    }
+
+    // For write/append mode, create empty buffer
+    unsafe {
+        FILE_TABLE[handle].in_use = true;
+        FILE_TABLE[handle].data = Some(alloc::vec::Vec::new());
+        FILE_TABLE[handle].position = 0;
+        FILE_TABLE[handle].mode = mode as u8;
+        let name_bytes = filename.as_bytes();
+        for i in 0..12.min(name_bytes.len()) {
+            FILE_TABLE[handle].name[i] = name_bytes[i];
+        }
+    }
+
+    handle as i64
+}
+
+/// Close a file handle
+#[no_mangle]
+pub extern "C" fn watos_file_close(handle: i64) {
+    if handle < 0 || handle >= MAX_OPEN_FILES as i64 {
+        return;
+    }
+
+    let h = handle as usize;
+    unsafe {
+        if !FILE_TABLE[h].in_use {
+            return;
+        }
+
+        // If write mode, flush to disk
+        if FILE_TABLE[h].mode == 1 || FILE_TABLE[h].mode == 2 {
+            // Get filename
+            let name_end = FILE_TABLE[h].name.iter().position(|&c| c == 0).unwrap_or(12);
+            if let Ok(filename) = core::str::from_utf8(&FILE_TABLE[h].name[..name_end]) {
+                if let Some(mut vfs) = disk::drive_manager().get_current_vfs() {
+                    if let Some(ref data) = FILE_TABLE[h].data {
+                        let _ = vfs.write_file(filename, data);
+                    }
+                }
+            }
+        }
+
+        // Free the handle
+        FILE_TABLE[h].in_use = false;
+        FILE_TABLE[h].data = None;
+        FILE_TABLE[h].position = 0;
+    }
+}
+
+/// Read from a file
+#[no_mangle]
+pub extern "C" fn watos_file_read(handle: i64, buf: *mut u8, len: usize) -> usize {
+    if handle < 0 || handle >= MAX_OPEN_FILES as i64 || buf.is_null() || len == 0 {
+        return 0;
+    }
+
+    let h = handle as usize;
+    unsafe {
+        if !FILE_TABLE[h].in_use {
+            return 0;
+        }
+
+        if let Some(ref data) = FILE_TABLE[h].data {
+            let pos = FILE_TABLE[h].position;
+            let available = data.len().saturating_sub(pos);
+            let to_read = len.min(available);
+
+            if to_read > 0 {
+                core::ptr::copy_nonoverlapping(
+                    data[pos..].as_ptr(),
+                    buf,
+                    to_read
+                );
+                FILE_TABLE[h].position += to_read;
+            }
+
+            to_read
+        } else {
+            0
+        }
+    }
+}
+
+/// Write to a file
+#[no_mangle]
+pub extern "C" fn watos_file_write(handle: i64, buf: *const u8, len: usize) -> usize {
+    if handle < 0 || handle >= MAX_OPEN_FILES as i64 || buf.is_null() || len == 0 {
+        return 0;
+    }
+
+    let h = handle as usize;
+    unsafe {
+        if !FILE_TABLE[h].in_use || FILE_TABLE[h].mode == 0 {
+            return 0; // Not open or read-only
+        }
+
+        let data_slice = core::slice::from_raw_parts(buf, len);
+        if let Some(ref mut data) = FILE_TABLE[h].data {
+            data.extend_from_slice(data_slice);
+            len
+        } else {
+            0
+        }
+    }
+}
+
+/// Get current date (year, month, day)
+#[no_mangle]
+pub extern "C" fn watos_get_date() -> (u16, u8, u8) {
+    (2025, 1, 1) // Placeholder
+}
+
+/// Get current time (hour, minute, second)
+#[no_mangle]
+pub extern "C" fn watos_get_time() -> (u8, u8, u8) {
+    (12, 0, 0) // Placeholder
+}
+
+/// Exit the program
+#[no_mangle]
+pub extern "C" fn watos_exit(code: i32) -> ! {
+    // If we're in a process context, return to kernel
+    if process::current_pid().is_some() {
+        process::process_exit_to_kernel(code);
+    }
+    // Fallback: just halt
+    loop { unsafe { core::arch::asm!("hlt"); } }
 }
 
 #[panic_handler]

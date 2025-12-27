@@ -1,0 +1,39 @@
+10 REM Multiple Flowers Program
+20 PRINT "=== Garden of Flowers ==="
+30 SCREEN 1
+40 CLS
+50 COLOR 0, 1
+60 REM Draw multiple flowers
+70 LET CX = 80: LET CY = 60
+75 GOSUB 1000: REM Draw flower at 80, 60
+80 LET CX = 240: LET CY = 60
+90 GOSUB 1000: REM Draw flower at 240, 60
+100 LET CX = 160: LET CY = 140
+110 GOSUB 1000: REM Draw flower at 160, 140
+120 REM Draw grass
+130 LINE (0, 180)-(319, 180), 1
+140 FOR I = 0 TO 319 STEP 5
+150   LINE (I, 180)-(I, 199), 1
+160 NEXT I
+170 REM Title
+180 LOCATE 1, 1
+190 PRINT "FLOWER GARDEN"
+200 REM Wait
+210 LOCATE 23, 1
+220 PRINT "Press any key..."
+250 END
+1000 REM Subroutine: Draw a flower
+1010 REM Uses CX, CY as center coordinates
+1020 REM Draw petals
+1030 FOR I = 0 TO 5
+1040   LET ANGLE = I * 60 * 3.14159 / 180
+1050   LET PX = CX + 20 * COS(ANGLE)
+1060   LET PY = CY + 20 * SIN(ANGLE)
+1070   CIRCLE (PX, PY), 10, 2
+1080 NEXT I
+1090 REM Draw center
+1100 CIRCLE (CX, CY), 8, 3
+1110 PAINT (CX, CY), 3, 3
+1120 REM Draw stem
+1130 LINE (CX, CY + 8)-(CX, CY + 40), 1
+1140 RETURN

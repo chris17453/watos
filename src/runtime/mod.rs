@@ -2,10 +2,13 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec, string::String};
 
 pub mod dos16;
+pub mod native64;
+
 use dos16::Dos16Runtime;
+use native64::Native64Runtime;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub enum BinaryFormat { RuNative, EightBit, DosCom, DosExe, Unknown }
+pub enum BinaryFormat { RuNative, EightBit, DosCom, DosExe, Elf64, Unknown }
 
 pub enum RunResult { Scheduled(u32), Failed }
 
@@ -28,11 +31,22 @@ pub fn register_default_runtimes() {
         }
         if let Some(reg) = REGISTRY.as_mut() {
             reg.push(Box::new(Dos16Runtime::new()));
+            // Native64Runtime disabled - ELF64 binaries need proper process support
+            // reg.push(Box::new(Native64Runtime::new()));
         }
     }
 }
 
 pub fn detect_format(_filename: &str, data: &[u8]) -> BinaryFormat {
+    // Check for ELF64 header (0x7F 'E' 'L' 'F')
+    if data.len() >= 18 && data[0..4] == [0x7F, b'E', b'L', b'F'] {
+        // Check class (64-bit = 2) and machine (x86-64 = 0x3E)
+        let class = data[4];
+        let machine = u16::from_le_bytes([data[18], data[19]]);
+        if class == 2 && machine == 0x3E {
+            return BinaryFormat::Elf64;
+        }
+    }
     if data.starts_with(b"RU64\x01") || data.starts_with(b"RUARM\x01") { return BinaryFormat::RuNative; }
     if data.starts_with(b"RU8\x01") { return BinaryFormat::EightBit; }
     if data.len() >= 2 && &data[0..2] == b"MZ" { return BinaryFormat::DosExe; }
@@ -42,6 +56,22 @@ pub fn detect_format(_filename: &str, data: &[u8]) -> BinaryFormat {
 
 pub fn detect_and_run(filename: &str, data: &[u8]) -> RunResult {
     let fmt = detect_format(filename, data);
+
+    // Handle ELF64 via process module (native execution)
+    if fmt == BinaryFormat::Elf64 {
+        match crate::process::exec(filename, data) {
+            Ok(pid) => {
+                // Process ran and completed
+                crate::process::cleanup();
+                return RunResult::Scheduled(pid);
+            }
+            Err(_e) => {
+                return RunResult::Failed;
+            }
+        }
+    }
+
+    // Handle other formats via legacy runtimes
     unsafe {
         if let Some(reg) = REGISTRY.as_mut() {
             for r in reg.iter() {
@@ -65,7 +95,13 @@ pub fn schedule_task_record(id: u32, filename: String) {
     }
 }
 
-// Poll registered runtimes (currently only Dos16)
+// Poll registered runtimes
 pub fn poll_tasks() {
     dos16::poll_tasks();
+    // native64::poll_tasks(); // Disabled
+}
+
+/// Check if any native64 tasks are running
+pub fn has_native64_tasks() -> bool {
+    false // native64::has_running_tasks() // Disabled
 }

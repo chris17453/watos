@@ -13,7 +13,8 @@ wfs-common = { path = "crates/wfs-common", default-features = false }
 [workspace]
 members = [
     "src/bootloader",
-    "crates/dos16-core"
+    "crates/dos16-core",
+    "crates/gwbasic"
 ]
 exclude = ["junk"]
 
