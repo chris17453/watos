@@ -5,7 +5,7 @@
 use super::e1000::E1000;
 use alloc::vec;
 use smoltcp::wire::{
-    ArpHardware, ArpOperation, ArpPacket, ArpRepr,
+    ArpOperation, ArpPacket, ArpRepr,
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr,
     Icmpv4Message, Icmpv4Packet, Icmpv4Repr,
     IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,

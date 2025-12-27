@@ -3,7 +3,7 @@
 //! Supports Intel 82545EM and compatible NICs
 //! Works on QEMU, VMware, VirtualBox, Hyper-V
 
-use super::pci::{self, PciDevice};
+use super::pci;
 use core::ptr::{read_volatile, write_volatile};
 
 // e1000 Register offsets

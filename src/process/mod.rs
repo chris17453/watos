@@ -1,9 +1,11 @@
 //! Process Management for WATOS
 //!
-//! Handles loading and executing native x86-64 ELF binaries.
+//! Handles loading and executing native x86-64 ELF binaries with memory protection.
 
 extern crate alloc;
 use alloc::string::String;
+use crate::mmu::{ProcessPageTable, page_flags};
+use crate::io::{HandleTable};
 
 pub mod elf;
 
@@ -47,6 +49,8 @@ pub struct Process {
     pub stack_top: u64,
     pub heap_base: u64,
     pub heap_size: usize,
+    pub page_table: ProcessPageTable,
+    pub handle_table: HandleTable,
 }
 
 /// Process table - tracks all processes
@@ -57,6 +61,9 @@ static mut PROCESSES: [Option<Process>; MAX_PROCESSES] = [
 ];
 static mut NEXT_PID: u32 = 1;
 static mut CURRENT_PROCESS: Option<u32> = None;
+
+/// Kernel page table (saved at startup)
+static mut KERNEL_PML4: u64 = 0;
 
 /// Memory regions for user processes
 /// Each process gets 1MB of space (reduced to fit in lower memory)
@@ -106,10 +113,34 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
         debug_serial(b"\r\n");
     }
 
-    // Load program segments
+    // Create process page table
+    unsafe { debug_serial(b"exec: creating page table...\r\n"); }
+    let mut page_table = ProcessPageTable::new();
+
+    // Load program segments with memory protection
     unsafe { debug_serial(b"exec: loading segments...\r\n"); }
-    elf.load_segments(data, load_base)?;
+    elf.load_segments_protected(data, load_base, &mut page_table)?;
     unsafe { debug_serial(b"exec: segments loaded\r\n"); }
+
+    // Map stack pages (user-writable)
+    unsafe { debug_serial(b"exec: mapping stack...\r\n"); }
+    let stack_pages = PROCESS_STACK_SIZE / crate::mmu::PAGE_SIZE as u64;
+    for i in 0..stack_pages {
+        let virt_addr = stack_top - (i as u64 + 1) * crate::mmu::PAGE_SIZE as u64;
+        let phys_addr = stack_top - (i as u64 + 1) * crate::mmu::PAGE_SIZE as u64; // Identity mapping for now
+        page_table.map_user_page(virt_addr, phys_addr, 
+            page_flags::PRESENT | page_flags::WRITABLE)?;
+    }
+
+    // Map heap pages (user-writable)
+    unsafe { debug_serial(b"exec: mapping heap...\r\n"); }
+    let heap_pages = (PROCESS_MEM_SIZE - PROCESS_STACK_SIZE - 0x80000) / crate::mmu::PAGE_SIZE as u64;
+    for i in 0..heap_pages {
+        let virt_addr = heap_base + i as u64 * crate::mmu::PAGE_SIZE as u64;
+        let phys_addr = heap_base + i as u64 * crate::mmu::PAGE_SIZE as u64; // Identity mapping for now
+        page_table.map_user_page(virt_addr, phys_addr,
+            page_flags::PRESENT | page_flags::WRITABLE)?;
+    }
 
     // Calculate actual entry point (relocated)
     // Find the lowest vaddr to calculate entry offset
@@ -120,7 +151,9 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
         .unwrap_or(0);
     let entry = load_base + (elf.entry - min_vaddr);
 
-    // Create process entry
+    // Create process entry with handle table
+    // In WATOS, processes get no handles by default for security
+    // Applications can request console access explicitly
     let process = Process {
         id: pid,
         name: String::from(name),
@@ -128,7 +161,9 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
         entry_point: entry,
         stack_top,
         heap_base,
-        heap_size: (PROCESS_MEM_SIZE - PROCESS_STACK_SIZE - 0x1000) as usize, // Leave 4KB for code
+        heap_size: heap_pages as usize * crate::mmu::PAGE_SIZE,
+        page_table,
+        handle_table: HandleTable::new(), // No inherited handles
     };
 
     // Store in process table
@@ -147,26 +182,33 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
     Ok(pid)
 }
 
-/// Run a process by jumping to its entry point
+/// Run a process by jumping to its entry point  
 fn run_process(pid: u32) -> Result<(), &'static str> {
-    let (entry, _stack_top) = unsafe {
+    let (entry, _stack_top, pml4_addr) = unsafe {
         let proc = PROCESSES.iter()
             .find_map(|p| p.as_ref().filter(|p| p.id == pid))
             .ok_or("Process not found")?;
 
         CURRENT_PROCESS = Some(pid);
-        (proc.entry_point, proc.stack_top)
+        (proc.entry_point, proc.stack_top, proc.page_table.pml4_phys_addr())
     };
 
-    // Debug: print entry point
+    // Debug: print entry point and page table
     unsafe {
         debug_serial(b"Process entry: 0x");
         debug_hex(entry);
+        debug_serial(b" PML4: 0x");
+        debug_hex(pml4_addr);
         debug_serial(b"\r\n");
     }
 
-    // Simply call the entry point as a function
-    // The binary's _start will call watos_exit which handles returning
+    // Switch to process page table
+    unsafe {
+        debug_serial(b"Switching to process page table...\r\n");
+        crate::mmu::enable_paging(pml4_addr);
+    }
+
+    // Execute the process
     unsafe {
         // Save kernel context for watos_exit to return to
         core::arch::asm!(
@@ -297,9 +339,48 @@ pub fn current_pid() -> Option<u32> {
     unsafe { CURRENT_PROCESS }
 }
 
+/// Get current process's handle table
+pub fn current_handle_table() -> Option<&'static mut HandleTable> {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(ref mut p) = slot {
+                    if p.id == pid {
+                        return Some(&mut p.handle_table);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+
+/// Initialize process management
+pub fn init() {
+    unsafe {
+        // Save current kernel page table
+        KERNEL_PML4 = crate::mmu::get_current_cr3();
+        debug_serial(b"Process subsystem initialized, kernel PML4: 0x");
+        debug_hex(KERNEL_PML4);
+        debug_serial(b"\r\n");
+    }
+}
+
+/// Restore kernel page table
+unsafe fn restore_kernel_paging() {
+    if KERNEL_PML4 != 0 {
+        debug_serial(b"Restoring kernel page table...\r\n");
+        crate::mmu::enable_paging(KERNEL_PML4);
+    }
+}
+
 /// Clean up terminated processes
 pub fn cleanup() {
     unsafe {
+        // Restore kernel page table when cleaning up
+        restore_kernel_paging();
+        
         for slot in PROCESSES.iter_mut() {
             if let Some(ref p) = slot {
                 if matches!(p.state, ProcessState::Terminated(_)) {

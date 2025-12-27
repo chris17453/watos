@@ -101,11 +101,11 @@ impl PciDevice {
 
 /// Build PCI configuration address
 fn pci_config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    ((1u32 << 31) |                    // Enable bit
+    (1u32 << 31) |                    // Enable bit
      ((bus as u32) << 16) |            // Bus number
      ((device as u32) << 11) |         // Device number
      ((function as u32) << 8) |        // Function number
-     ((offset as u32) & 0xFC))         // Register offset (aligned)
+     ((offset as u32) & 0xFC)         // Register offset (aligned)
 }
 
 /// Write to PCI configuration address port

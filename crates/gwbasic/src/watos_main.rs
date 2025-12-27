@@ -25,6 +25,9 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn main() {
+    // Initialize console handles first
+    init_console_handles();
+    
     let mut console = WatosConsole::new();
 
     console.print("GW-BASIC (Rust) v");
@@ -131,22 +134,78 @@ unsafe impl alloc::alloc::GlobalAlloc for WatosAllocator {
     }
 }
 
+// Global console handles for the GWBASIC application
+static mut STDOUT_HANDLE: Option<u64> = None;
+static mut STDIN_HANDLE: Option<u64> = None;
+static mut STDERR_HANDLE: Option<u64> = None;
+
+/// Initialize console handles - should be called early
+fn init_console_handles() {
+    unsafe {
+        // Request console handles from WATOS
+        let stdout: u64;
+        let stdin: u64;
+        let stderr: u64;
+        
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 21u32, // SYS_CONSOLE_OUT
+            lateout("rax") stdout,
+            options(nostack)
+        );
+        
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 20u32, // SYS_CONSOLE_IN
+            lateout("rax") stdin,
+            options(nostack)
+        );
+        
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") 22u32, // SYS_CONSOLE_ERR
+            lateout("rax") stderr,
+            options(nostack)
+        );
+        
+        // Store handles if valid (errors are > 2^32)
+        STDOUT_HANDLE = if stdout < 0x100000000 { Some(stdout) } else { None };
+        STDIN_HANDLE = if stdin < 0x100000000 { Some(stdin) } else { None };
+        STDERR_HANDLE = if stderr < 0x100000000 { Some(stderr) } else { None };
+    }
+}
+
 /// Console write function expected by the gwbasic library
 #[no_mangle]
 pub extern "C" fn watos_console_write(buf: *const u8, len: usize) {
     if buf.is_null() || len == 0 {
         return;
     }
+    
     unsafe {
-        // SYS_WRITE syscall via INT 0x80
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") 1u32,     // SYS_WRITE
-            in("rdi") 1u64,    // stdout fd (ignored, just writes to console)
-            in("rsi") buf,
-            in("rdx") len,
-            options(nostack)
-        );
+        if let Some(handle) = STDOUT_HANDLE {
+            // Use proper handle-based I/O
+            core::arch::asm!(
+                "int 0x80",
+                in("eax") 1u32,     // SYS_WRITE
+                in("rdi") handle,   // stdout handle
+                in("rsi") buf,
+                in("rdx") len,
+                options(nostack)
+            );
+        }
+        // Fallback: try direct putchar
+        else {
+            for i in 0..len {
+                let ch = *buf.add(i);
+                core::arch::asm!(
+                    "int 0x80",
+                    in("eax") 16u32,    // SYS_PUTCHAR
+                    in("rdi") ch as u64,
+                    options(nostack)
+                );
+            }
+        }
     }
 }
 
@@ -156,18 +215,37 @@ pub extern "C" fn watos_console_read(buf: *mut u8, max_len: usize) -> usize {
     if buf.is_null() || max_len == 0 {
         return 0;
     }
+    
     unsafe {
-        let result: u64;
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") 2u32,     // SYS_READ
-            in("rdi") 0u64,    // stdin fd
-            in("rsi") buf,
-            in("rdx") max_len,
-            lateout("rax") result,
-            options(nostack)
-        );
-        result as usize
+        if let Some(handle) = STDIN_HANDLE {
+            // Use proper handle-based I/O
+            let result: u64;
+            core::arch::asm!(
+                "int 0x80",
+                in("eax") 2u32,     // SYS_READ
+                in("rdi") handle,   // stdin handle
+                in("rsi") buf,
+                in("rdx") max_len,
+                lateout("rax") result,
+                options(nostack)
+            );
+            result as usize
+        } else {
+            // Fallback: direct keyboard input
+            let result: u64;
+            core::arch::asm!(
+                "int 0x80",
+                in("eax") 5u32,     // SYS_GETKEY
+                lateout("rax") result,
+                options(nostack)
+            );
+            if result > 0 && max_len > 0 {
+                *buf = result as u8;
+                1
+            } else {
+                0
+            }
+        }
     }
 }
 
@@ -178,7 +256,7 @@ pub extern "C" fn watos_file_open(path: *const u8, len: usize, mode: u64) -> i64
         return -1;
     }
     unsafe {
-        let result: i64;
+        let result: u64;
         core::arch::asm!(
             "int 0x80",
             in("eax") 3u32,     // SYS_OPEN
@@ -188,7 +266,12 @@ pub extern "C" fn watos_file_open(path: *const u8, len: usize, mode: u64) -> i64
             lateout("rax") result,
             options(nostack)
         );
-        result
+        // Check for error (WATOS returns error codes > 2^32 for failures)
+        if result > 0x100000000 {
+            -1  // Return error
+        } else {
+            result as i64  // Return valid handle
+        }
     }
 }
 

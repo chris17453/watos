@@ -1,0 +1,12 @@
+[package]
+name = "watos-syscall"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS system call interface - shared between kernel and applications"
+
+[features]
+default = []
+# Feature for no_std environments (applications)
+no-std = []
+
+[dependencies]

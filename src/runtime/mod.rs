@@ -2,10 +2,8 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec, string::String};
 
 pub mod dos16;
-pub mod native64;
 
 use dos16::Dos16Runtime;
-use native64::Native64Runtime;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum BinaryFormat { RuNative, EightBit, DosCom, DosExe, Elf64, Unknown }
@@ -31,8 +29,7 @@ pub fn register_default_runtimes() {
         }
         if let Some(reg) = REGISTRY.as_mut() {
             reg.push(Box::new(Dos16Runtime::new()));
-            // Native64Runtime disabled - ELF64 binaries need proper process support
-            // reg.push(Box::new(Native64Runtime::new()));
+            // ELF64 binaries handled directly via process::exec with memory protection
         }
     }
 }
@@ -98,10 +95,5 @@ pub fn schedule_task_record(id: u32, filename: String) {
 // Poll registered runtimes
 pub fn poll_tasks() {
     dos16::poll_tasks();
-    // native64::poll_tasks(); // Disabled
-}
-
-/// Check if any native64 tasks are running
-pub fn has_native64_tasks() -> bool {
-    false // native64::has_running_tasks() // Disabled
+    // ELF64 processes handled separately via process module
 }

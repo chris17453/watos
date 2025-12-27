@@ -22,7 +22,7 @@ const FLAG_PF: u16 = 0x0004;  // Parity
 const FLAG_AF: u16 = 0x0010;  // Auxiliary carry
 const FLAG_ZF: u16 = 0x0040;  // Zero
 const FLAG_SF: u16 = 0x0080;  // Sign
-const FLAG_TF: u16 = 0x0100;  // Trap
+const _FLAG_TF: u16 = 0x0100;  // Trap
 const FLAG_IF: u16 = 0x0200;  // Interrupt enable
 const FLAG_DF: u16 = 0x0400;  // Direction
 const FLAG_OF: u16 = 0x0800;  // Overflow
@@ -37,7 +37,7 @@ const FLAG_OF: u16 = 0x0800;  // Overflow
 const MCB_TYPE_MORE: u8 = 0x4D;  // 'M' - more blocks follow
 const MCB_TYPE_LAST: u8 = 0x5A;  // 'Z' - last block in chain
 const MCB_OWNER_FREE: u16 = 0x0000;  // Free block
-const MCB_OWNER_DOS: u16 = 0x0008;   // DOS system block
+const _MCB_OWNER_DOS: u16 = 0x0008;   // DOS system block
 
 // Memory layout:
 // 0x00000 - 0x003FF: Interrupt Vector Table (256 vectors × 4 bytes)
@@ -569,7 +569,7 @@ impl DosTask {
     }
 
     /// Write bytes to this task's console
-    fn console_write(&self, data: &[u8]) {
+    fn _console_write(&self, data: &[u8]) {
         if let Some(con) = console::manager().get(self.console_id) as Option<&mut console::Console> {
             con.print(data);
         }
@@ -2147,7 +2147,7 @@ impl DosTask {
             self.cpu.set_flag(FLAG_AF, true);
             self.cpu.set_flag(FLAG_CF, true);
         } else {
-            self.cpu.ax = (self.cpu.ax & 0xFF0F);
+            self.cpu.ax = self.cpu.ax & 0xFF0F;
             self.cpu.set_flag(FLAG_AF, false);
             self.cpu.set_flag(FLAG_CF, false);
         }
@@ -2164,7 +2164,7 @@ impl DosTask {
             self.cpu.set_flag(FLAG_AF, true);
             self.cpu.set_flag(FLAG_CF, true);
         } else {
-            self.cpu.ax = (self.cpu.ax & 0xFF0F);
+            self.cpu.ax = self.cpu.ax & 0xFF0F;
             self.cpu.set_flag(FLAG_AF, false);
             self.cpu.set_flag(FLAG_CF, false);
         }
@@ -2838,7 +2838,7 @@ impl DosTask {
     }
 
     // Log to serial (shows in QEMU serial log)
-    fn log_serial(&mut self, msg: &str) {
+    fn _log_serial(&mut self, msg: &str) {
         serial_write_bytes(msg.as_bytes());
         serial_write_bytes(b"\r\n");
     }
@@ -3056,7 +3056,7 @@ impl DosTask {
                         };
                         if ascii == 0 {
                             // Non-ASCII key
-                            self.cpu.ax = ((scancode as u16) << 8);
+                            self.cpu.ax = (scancode as u16) << 8;
                         } else {
                             // AH = scancode, AL = ASCII
                             self.cpu.ax = ((scancode as u16) << 8) | (ascii as u16);
@@ -3192,8 +3192,44 @@ impl DosTask {
                 let dx = self.cpu.dx;
 
                 if handle == 0 {
-                    // stdin - return 0 for now
-                    self.cpu.ax = 0;
+                    // stdin - read from keyboard
+                    let mut bytes_read = 0;
+                    let mut buffer = vec![0u8; count];
+                    
+                    // Read up to 'count' characters from keyboard
+                    for i in 0..count {
+                        if let Some(scancode) = crate::interrupts::get_scancode() {
+                            // Convert scancode to ASCII using same mapping as INT 16h
+                            let ascii = match scancode {
+                                0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd', 0x12 => b'e',
+                                0x21 => b'f', 0x22 => b'g', 0x23 => b'h', 0x17 => b'i', 0x24 => b'j',
+                                0x25 => b'k', 0x26 => b'l', 0x32 => b'm', 0x31 => b'n', 0x18 => b'o',
+                                0x19 => b'p', 0x10 => b'q', 0x13 => b'r', 0x1F => b's', 0x14 => b't',
+                                0x16 => b'u', 0x2F => b'v', 0x11 => b'w', 0x2D => b'x', 0x15 => b'y',
+                                0x2C => b'z',
+                                0x02..=0x0B => b'0' + (scancode - 0x01) % 10, // 1-0
+                                0x39 => b' ', // Space
+                                0x1C => b'\r', // Enter - stop reading and return
+                                _ => continue, // Ignore other keys
+                            };
+                            buffer[i] = ascii;
+                            bytes_read += 1;
+                            
+                            // Stop on Enter key
+                            if ascii == b'\r' {
+                                break;
+                            }
+                        } else {
+                            break; // No more input available
+                        }
+                    }
+                    
+                    // Copy data to DOS memory
+                    for (i, &b) in buffer[..bytes_read].iter().enumerate() {
+                        self.write_u8(ds, dx.wrapping_add(i as u16), b);
+                    }
+                    
+                    self.cpu.ax = bytes_read as u16;
                     self.cpu.set_flag(FLAG_CF, false);
                 } else if let Some(bytes_read) = self.dos_read_file(handle, count) {
                     // Copy data to buffer
@@ -3578,8 +3614,19 @@ impl DosTask {
                     serial_write_hex16(fh.data.len() as u16);
                     serial_write_bytes(b" bytes)\r\n");
                     
-                    // TODO: Actually write to filesystem when WFS write support is available
-                    // For now, data is preserved in memory but not persisted
+                    // Write to filesystem using VFS
+                    if let Some(mut vfs) = crate::disk::drive_manager().get_current_vfs() {
+                        match vfs.write_file(&fh.filename, &fh.data) {
+                            Ok(_) => {
+                                serial_write_bytes(b"File written to disk successfully\r\n");
+                            }
+                            Err(_) => {
+                                serial_write_bytes(b"Error writing file to disk\r\n");
+                            }
+                        }
+                    } else {
+                        serial_write_bytes(b"No filesystem available for write-back\r\n");
+                    }
                 }
             }
             self.file_handles[handle as usize] = None;
@@ -3730,6 +3777,29 @@ impl DosTask {
         self.memory[dta_addr + 0x1B] = ((size >> 16) & 0xFF) as u8;
         self.memory[dta_addr + 0x1C] = ((size >> 24) & 0xFF) as u8;
     }
+
+    /// Calculate total free memory by walking MCB chain
+    pub fn get_free_memory_bytes(&self) -> usize {
+        let mut total_free = 0usize;
+        let mut mcb_seg = FIRST_MCB_SEG;
+        
+        loop {
+            let (mcb_type, owner, size) = self.read_mcb(mcb_seg);
+            
+            // If this block is free, add to total
+            if owner == MCB_OWNER_FREE {
+                total_free += (size as usize) * 16; // Convert paragraphs to bytes
+            }
+            
+            // Move to next block
+            if mcb_type == MCB_TYPE_LAST {
+                break;
+            }
+            mcb_seg = mcb_seg + 1 + size;
+        }
+        
+        total_free
+    }
 }
 
 const NONE_FILE: Option<FileHandle> = None;
@@ -3742,7 +3812,7 @@ fn serial_write_bytes(s: &[u8]) {
     for &b in s { outb(0x3F8, b); }
 }
 
-fn serial_write_u16(n: u16) {
+fn _serial_write_u16(n: u16) {
     let mut buf = [b'0'; 5];
     let mut val = n;
     let mut i = 4isize;
@@ -3820,5 +3890,17 @@ pub fn has_running_tasks() -> bool {
         } else {
             false
         }
+    }
+}
+
+/// Get total free memory from the first DOS task (they share memory)
+pub fn get_dos_free_memory() -> Option<usize> {
+    unsafe {
+        if let Some(list) = TASK_LIST.as_ref() {
+            if !list.is_empty() {
+                return Some(list[0].get_free_memory_bytes());
+            }
+        }
+        None
     }
 }

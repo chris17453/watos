@@ -421,7 +421,7 @@ impl DriveManager {
     /// Rename a drive
     pub fn rename_drive(&mut self, old_name: &str, new_name: &str) -> bool {
         let old_upper = old_name.to_ascii_uppercase();
-        let new_upper = new_name.to_ascii_uppercase();
+        let _new_upper = new_name.to_ascii_uppercase();
 
         // Check new name doesn't exist
         if self.get_drive_by_name(new_name).is_some() {

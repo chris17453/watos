@@ -384,7 +384,7 @@ impl FatFs {
         let mut cluster = entry.first_cluster();
         let mut sector_buf = [0u8; 512];
 
-        let bytes_per_cluster = (self.sectors_per_cluster * self.bytes_per_sector) as usize;
+        let _bytes_per_cluster = (self.sectors_per_cluster * self.bytes_per_sector) as usize;
 
         while remaining > 0 && !self.is_end_of_chain(cluster) && cluster >= 2 {
             let sector = self.cluster_to_sector(cluster);

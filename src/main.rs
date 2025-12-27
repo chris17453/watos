@@ -3,7 +3,7 @@
 
 extern crate alloc;
 
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 
@@ -15,6 +15,8 @@ mod net;
 mod disk;
 mod runtime;
 mod process;
+mod mmu;
+mod io;
 pub mod console;
 
 // Boot info structure from bootloader at 0x80000
@@ -42,8 +44,8 @@ static mut FB_BGR: bool = false;
 // Text cursor
 const CHAR_WIDTH: u32 = 8;
 const CHAR_HEIGHT: u32 = 16;
-static mut CURSOR_X: u32 = 0;
-static mut CURSOR_Y: u32 = 0;
+pub static mut CURSOR_X: u32 = 0;
+pub static mut CURSOR_Y: u32 = 0;
 static mut TEXT_COLS: u32 = 80;
 static mut TEXT_ROWS: u32 = 25;
 static mut CURSOR_VISIBLE: bool = true;
@@ -375,7 +377,7 @@ pub fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
     Some(c)
 }
 
-unsafe fn kb_read_char(shift: &mut bool) -> Option<u8> {
+unsafe fn _kb_read_char(shift: &mut bool) -> Option<u8> {
     // Check if keyboard has data
     let status = inb(KB_STATUS_PORT);
     if status & 1 == 0 { return None; }
@@ -440,7 +442,8 @@ unsafe fn fb_get_pixel_impl(x: i32, y: i32) -> u8 {
     ((r as u16 + g as u16 + b as u16) / 3) as u8
 }
 
-unsafe fn fb_clear_impl(r: u8, g: u8, b: u8) {
+#[no_mangle]
+pub unsafe extern "C" fn fb_clear_impl(r: u8, g: u8, b: u8) {
     for y in 0..FB_HEIGHT {
         for x in 0..FB_WIDTH {
             fb_put_pixel_impl(x, y, r, g, b);
@@ -805,11 +808,29 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe {
         const HEAP_START: usize = 0x300000;
         const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-        ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE);
+        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
     // Initialize console system (multi-session support)
     console::init();
+
+    // Initialize MMU subsystem  
+    unsafe {
+        serial_write(b"Initializing MMU...\r\n");
+    }
+    mmu::init();
+
+    // Initialize process management
+    unsafe {
+        serial_write(b"Initializing process management...\r\n");
+    }
+    process::init();
+
+    // Initialize file I/O system
+    unsafe {
+        serial_write(b"Initializing file I/O...\r\n");
+    }
+    io::init_file_io();
 
     // Initialize interrupts (timer + keyboard)
     unsafe {
@@ -885,6 +906,12 @@ pub extern "C" fn kernel_main() -> ! {
         let num_drives = disk::init_drives();
         print_u8(num_drives);
         console_print(b" drive(s) mounted\n");
+
+        // Mount filesystems for I/O operations
+        console_print(b"Mounting filesystems... ");
+        let fs_count = mount_filesystems();
+        print_u8(fs_count);
+        console_print(b" filesystem(s) available\n");
 
         console_print(b"\nType 'help' for commands.\n");
         console_print(b"\n");
@@ -1281,7 +1308,7 @@ pub extern "C" fn kernel_main() -> ! {
                                 ];
 
                                 // Send multiple times
-                                for i in 0..3 {
+                                for _i in 0..3 {
                                     if nic.send(&test_pkt) {
                                         console_print(b".");
                                     } else {
@@ -1673,8 +1700,14 @@ pub extern "C" fn kernel_main() -> ! {
 /// Get amount of free memory
 #[no_mangle]
 pub extern "C" fn watos_get_free_memory() -> usize {
-    // Return a reasonable amount - the kernel has 4MB heap
-    // Just return a fixed value for now
+    // Try to get actual free memory from DOS16 runtime if available
+    let free_mem = runtime::dos16::get_dos_free_memory().unwrap_or(0);
+    if free_mem > 0 {
+        return free_mem;
+    }
+    
+    // Fallback: return reasonable amount for native tasks
+    // The kernel has 4MB heap allocated
     2 * 1024 * 1024 // 2MB free
 }
 
@@ -1688,6 +1721,25 @@ pub extern "C" fn watos_get_cursor_col() -> u8 {
 #[no_mangle]
 pub extern "C" fn watos_get_cursor_row() -> u8 {
     unsafe { CURSOR_Y as u8 }
+}
+
+/// Set cursor position (called from syscalls)
+#[no_mangle]
+pub extern "C" fn watos_set_cursor(x: u32, y: u32) {
+    unsafe {
+        CURSOR_X = x;
+        CURSOR_Y = y;
+    }
+}
+
+/// Clear screen and reset cursor (called from syscalls)
+#[no_mangle]
+pub extern "C" fn watos_clear_screen() {
+    unsafe {
+        fb_clear_impl(0, 0, 170); // Clear to blue
+        CURSOR_X = 0;
+        CURSOR_Y = 0;
+    }
 }
 
 /// Get a key without waiting (returns 0 if no key available)
@@ -1949,6 +2001,26 @@ pub extern "C" fn watos_get_date() -> (u16, u8, u8) {
 #[no_mangle]
 pub extern "C" fn watos_get_time() -> (u8, u8, u8) {
     (12, 0, 0) // Placeholder
+}
+
+/// Mount available filesystems for I/O operations
+fn mount_filesystems() -> u8 {
+    let mut fs_count = 0u8;
+    
+    // Try to mount WFS and FAT filesystems on available drives
+    // This is a simple scan - in a full OS you'd parse partition tables
+    for port in 0..6u8 {
+        // Try WFS first (our native filesystem)
+        if let Some(_fs_id) = io::mount_filesystem(disk::drives::FsType::Wfs, port, 0) {
+            fs_count += 1;
+        }
+        // Try FAT16 as fallback
+        else if let Some(_fs_id) = io::mount_filesystem(disk::drives::FsType::Fat16, port, 0) {
+            fs_count += 1;
+        }
+    }
+    
+    fs_count
 }
 
 /// Exit the program

@@ -135,7 +135,7 @@ if [ ! -f "$KERNEL_ELF" ]; then
     error "Kernel ELF not found at $KERNEL_ELF"
 fi
 
-rust-objcopy --binary-architecture=i386:x86-64 "$KERNEL_ELF" -O binary "$PROJECT_ROOT/kernel.bin"
+$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy --binary-architecture=i386:x86-64 "$KERNEL_ELF" -O binary "$PROJECT_ROOT/kernel.bin"
 success "Kernel binary extracted: kernel.bin ($(du -h "$PROJECT_ROOT/kernel.bin" | cut -f1))"
 
 # Step 3: Build bootloader
@@ -232,6 +232,77 @@ else
 fi
 cd "$PROJECT_ROOT"
 
+# Build echo application
+log "Building echo for WATOS..."
+cd "$PROJECT_ROOT/crates/echo"
+
+if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --no-default-features \
+    --bin echo 2>&1; then
+
+    # Copy to rootfs and uefi_test
+    if [ "$BUILD_TYPE" = "release" ]; then
+        ECHO_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/echo"
+    else
+        ECHO_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/echo"
+    fi
+
+    if [ -f "$ECHO_BIN" ]; then
+        # Copy to rootfs root
+        cp "$ECHO_BIN" "$PROJECT_ROOT/rootfs/ECHO.EXE"
+        # Also copy to uefi_test for FAT filesystem boot
+        cp "$ECHO_BIN" "$PROJECT_ROOT/uefi_test/ECHO.EXE"
+        success "Echo binary built and copied to rootfs and uefi_test ($(du -h "$ECHO_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} Echo binary build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Auto-discover and build other WATOS applications
+log "Auto-discovering WATOS applications..."
+for app_dir in "$PROJECT_ROOT/crates"/*; do
+    if [ -d "$app_dir" ] && [ -f "$app_dir/Cargo.toml" ]; then
+        app_name=$(basename "$app_dir")
+        
+        # Skip already processed apps and non-WATOS crates
+        if [ "$app_name" = "gwbasic" ] || [ "$app_name" = "echo" ] || [ "$app_name" = "watos-syscall" ]; then
+            continue
+        fi
+        
+        # Check if this is a WATOS application (has watos feature or dependency)
+        if grep -q "watos" "$app_dir/Cargo.toml" 2>/dev/null; then
+            log "Building WATOS application: $app_name..."
+            cd "$app_dir"
+            
+            if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+                --target x86_64-unknown-none \
+                --no-default-features \
+                --bin "$app_name" 2>&1; then
+                
+                # Copy to rootfs and uefi_test
+                if [ "$BUILD_TYPE" = "release" ]; then
+                    APP_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/$app_name"
+                else
+                    APP_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/$app_name"
+                fi
+                
+                if [ -f "$APP_BIN" ]; then
+                    # Convert to uppercase for DOS-style naming
+                    APP_NAME_UPPER=$(echo "$app_name" | tr '[:lower:]' '[:upper:]')
+                    cp "$APP_BIN" "$PROJECT_ROOT/rootfs/${APP_NAME_UPPER}.EXE"
+                    cp "$APP_BIN" "$PROJECT_ROOT/uefi_test/${APP_NAME_UPPER}.EXE"
+                    success "$app_name binary built and copied ($(du -h "$APP_BIN" | cut -f1))"
+                fi
+            else
+                echo -e "${YELLOW}[WARN]${NC} $app_name build failed (optional)"
+            fi
+            cd "$PROJECT_ROOT"
+        fi
+    fi
+done
+
 # Step 8: Create WFS data disk image (if mkfs.wfs available)
 if [ -f "$MKFS_WFS" ]; then
     log "Creating WFS data disk image..."
@@ -263,6 +334,24 @@ fi
 if [ -f "$PROJECT_ROOT/output/watos.img" ]; then
     echo "  - output/watos.img (WFS data disk)"
 fi
+
+echo ""
+echo "Built Applications:"
+if [ -f "$PROJECT_ROOT/rootfs/GWBASIC.EXE" ]; then
+    echo "  - GWBASIC.EXE      (GWBASIC interpreter)"
+fi
+if [ -f "$PROJECT_ROOT/rootfs/ECHO.EXE" ]; then
+    echo "  - ECHO.EXE         (Echo utility)"
+fi
+# Show any other discovered applications
+for app_file in "$PROJECT_ROOT/rootfs"/*.EXE; do
+    if [ -f "$app_file" ]; then
+        app_filename=$(basename "$app_file")
+        if [ "$app_filename" != "GWBASIC.EXE" ] && [ "$app_filename" != "ECHO.EXE" ]; then
+            echo "  - $app_filename"
+        fi
+    fi
+done
 echo ""
 echo "Next steps:"
 echo "  ./scripts/test.sh        - Run automated tests"

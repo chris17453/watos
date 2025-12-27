@@ -1,0 +1,11 @@
+[package]
+name = "echo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+watos-syscall = { path = "../watos-syscall", features = ["no-std"] }
+
+[[bin]]
+name = "echo"
+path = "src/main.rs"

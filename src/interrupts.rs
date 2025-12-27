@@ -3,6 +3,12 @@
 //! Sets up IDT, PIC, timer and keyboard interrupts
 
 use core::arch::asm;
+// External functions from main.rs
+extern "C" {
+    fn watos_set_cursor(x: u32, y: u32);
+    fn watos_clear_screen();
+    fn fb_clear_impl(r: u8, g: u8, b: u8);
+}
 
 // PIC ports
 const PIC1_COMMAND: u16 = 0x20;
@@ -114,7 +120,7 @@ unsafe fn init_pic() {
 
 /// Send End-Of-Interrupt to PIC
 #[inline(always)]
-unsafe fn pic_eoi(irq: u8) {
+unsafe fn _pic_eoi(irq: u8) {
     if irq >= 8 {
         outb(PIC2_COMMAND, PIC_EOI);
     }
@@ -287,28 +293,8 @@ pub fn sleep_ms(ms: u32) {
 // Syscall Handler (INT 0x80)
 // =============================================================================
 
-/// Syscall numbers
-pub mod syscall {
-    // Console/IO
-    pub const SYS_WRITE: u32 = 1;
-    pub const SYS_READ: u32 = 2;
-    pub const SYS_OPEN: u32 = 3;
-    pub const SYS_CLOSE: u32 = 4;
-    pub const SYS_GETKEY: u32 = 5;
-    pub const SYS_EXIT: u32 = 6;
-
-    // System
-    pub const SYS_SLEEP: u32 = 11;
-
-    // VGA Graphics
-    pub const SYS_VGA_SET_MODE: u32 = 30;
-    pub const SYS_VGA_SET_PIXEL: u32 = 31;
-    pub const SYS_VGA_GET_PIXEL: u32 = 32;
-    pub const SYS_VGA_BLIT: u32 = 33;
-    pub const SYS_VGA_CLEAR: u32 = 34;
-    pub const SYS_VGA_FLIP: u32 = 35;
-    pub const SYS_VGA_SET_PALETTE: u32 = 36;
-}
+/// WATOS Syscall numbers - import from shared crate
+pub use watos_syscall::numbers as syscall;
 
 /// Syscall context passed from assembly handler
 #[repr(C)]
@@ -332,24 +318,148 @@ pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
 
     ctx.rax = match syscall_num {
         syscall::SYS_WRITE => {
-            // Write to console: rdi=fd (ignored), rsi=buf, rdx=len
+            // Write to handle: rdi=handle, rsi=buf, rdx=len
+            let handle = ctx.rdi as u32;
             let buf = ctx.rsi as *const u8;
             let len = ctx.rdx as usize;
+            
             if !buf.is_null() && len > 0 {
-                extern "C" {
-                    fn syscall_write(buf: *const u8, len: usize);
-                }
+                // Copy data from user memory
+                let mut data = alloc::vec::Vec::with_capacity(len);
                 unsafe {
-                    syscall_write(buf, len);
+                    for i in 0..len {
+                        data.push(*buf.add(i));
+                    }
                 }
+                
+                // Get current process handle table
+                if let Some(handle_table) = crate::process::current_handle_table() {
+                    // Try writing to file handle first
+                    if let Ok(bytes_written) = crate::io::HandleIO::write_file(handle_table, handle, &data) {
+                        bytes_written as u64
+                    }
+                    // If not a file handle, try console
+                    else if let Ok(bytes_written) = crate::io::HandleIO::write_console(handle_table, handle, &data) {
+                        bytes_written as u64
+                    }
+                    // Handle not found or invalid
+                    else {
+                        crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotFound)
+                    }
+                } else {
+                    // No process context - write to kernel console as fallback
+                    crate::console::print(&data);
+                    len as u64
+                }
+            } else {
+                0
             }
-            len as u64
         }
 
         syscall::SYS_READ => {
-            // Read from console: rdi=fd (ignored), rsi=buf, rdx=max_len
-            // Returns number of bytes read
-            0 // Handled by watos_console_read for now
+            // Read from handle: rdi=handle, rsi=buf, rdx=max_len
+            let handle = ctx.rdi as u32;
+            let buf = ctx.rsi as *mut u8;
+            let max_len = ctx.rdx as usize;
+            
+            if !buf.is_null() && max_len > 0 {
+                // Create buffer to read into
+                let mut buffer = alloc::vec![0u8; max_len];
+                
+                if let Some(handle_table) = crate::process::current_handle_table() {
+                    // Try reading from file handle first
+                    let bytes_read = if let Ok(n) = crate::io::HandleIO::read_file(handle_table, handle, &mut buffer) {
+                        n
+                    }
+                    // If not a file handle, try console
+                    else if let Ok(n) = crate::io::HandleIO::read_console(handle_table, handle, &mut buffer) {
+                        n
+                    }
+                    // Handle not found or invalid
+                    else {
+                        return ctx.rax = crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotFound);
+                    };
+                    
+                    // Copy data back to user buffer
+                    unsafe {
+                        for i in 0..bytes_read {
+                            *buf.add(i) = buffer[i];
+                        }
+                    }
+                    bytes_read as u64
+                } else {
+                    // No process context - fall back to keyboard input
+                    if let Some(scancode) = get_scancode() {
+                        // Simple scancode to ASCII conversion
+                        let ascii = match scancode {
+                            0x1C => b'\n', // Enter
+                            0x39 => b' ',  // Space  
+                            0x1E..=0x26 => b'a' + (scancode - 0x1E), // a-l
+                            0x10..=0x19 => b'q' + (scancode - 0x10), // q-p
+                            0x2C..=0x32 => b'z' + (scancode - 0x2C), // z-m
+                            0x02..=0x0B => b'1' + (scancode - 0x02), // 1-0
+                            _ => b'?',
+                        };
+                        unsafe {
+                            *buf = ascii;
+                        }
+                        1
+                    } else {
+                        0
+                    }
+                }
+            } else {
+                0
+            }
+        }
+
+        syscall::SYS_OPEN => {
+            // Open file: rdi=path_ptr, rsi=path_len, rdx=mode
+            let path_ptr = ctx.rdi as *const u8;
+            let path_len = ctx.rsi as usize;
+            let mode = ctx.rdx;
+            
+            if !path_ptr.is_null() && path_len > 0 && path_len < 256 {
+                // Copy path from user memory
+                let mut path_bytes = alloc::vec![0u8; path_len];
+                unsafe {
+                    for i in 0..path_len {
+                        path_bytes[i] = *path_ptr.add(i);
+                    }
+                }
+                
+                if let Ok(path_str) = alloc::string::String::from_utf8(path_bytes) {
+                    if let Some(handle_table) = crate::process::current_handle_table() {
+                        let open_mode = crate::io::OpenMode::from(mode);
+                        // For now, use filesystem ID 1 (first mounted filesystem)
+                        // TODO: Implement proper path resolution
+                        match crate::io::HandleIO::open(handle_table, &path_str, open_mode, 1) {
+                            Ok(handle) => handle as u64,
+                            Err(error) => crate::io::fs_error_to_errno(error),
+                        }
+                    } else {
+                        crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotSupported)
+                    }
+                } else {
+                    crate::io::fs_error_to_errno(crate::disk::vfs::FsError::InvalidName)
+                }
+            } else {
+                crate::io::fs_error_to_errno(crate::disk::vfs::FsError::InvalidName)
+            }
+        }
+
+        syscall::SYS_CLOSE => {
+            // Close handle: rdi=handle
+            let handle = ctx.rdi as u32;
+            
+            if let Some(handle_table) = crate::process::current_handle_table() {
+                match crate::io::HandleIO::close(handle_table, handle) {
+                    Ok(_) => 0,
+                    Err(error) => crate::io::fs_error_to_errno(error),
+                }
+            } else {
+                crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotSupported)
+            }
         }
 
         syscall::SYS_GETKEY => {
@@ -365,15 +475,151 @@ pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
             // Exit process: rdi=exit_code
             let code = ctx.rdi as i32;
             crate::process::exit_current(code);
-            // Mark that we should return to kernel after syscall
-            // The actual return happens when the process returns from its entry
-            0
+            // Call the exit handler to return to kernel
+            crate::process::process_exit_to_kernel(code);
         }
 
         syscall::SYS_SLEEP => {
             // Sleep for rdi milliseconds
             let ms = ctx.rdi as u32;
             sleep_ms(ms);
+            0
+        }
+
+        syscall::SYS_GETPID => {
+            // Get current process ID
+            if let Some(pid) = crate::process::current_pid() {
+                pid as u64
+            } else {
+                0
+            }
+        }
+
+        syscall::SYS_TIME => {
+            // Get system time (ticks since boot)
+            get_ticks()
+        }
+
+        syscall::SYS_MALLOC => {
+            // Allocate memory: rdi=size
+            let size = ctx.rdi as usize;
+            // For now, just return a simple allocation from heap
+            // TODO: Implement proper user heap management
+            if size > 0 {
+                use alloc::alloc::{alloc, Layout};
+                unsafe {
+                    let layout = Layout::from_size_align(size, 8).unwrap();
+                    alloc(layout) as u64
+                }
+            } else {
+                0
+            }
+        }
+
+        syscall::SYS_FREE => {
+            // Free memory: rdi=ptr
+            let _ptr = ctx.rdi;
+            // TODO: Implement proper deallocation
+            // For now just return success
+            0
+        }
+
+        syscall::SYS_PUTCHAR => {
+            // Output single character: rdi=char
+            let ch = ctx.rdi as u8;
+            let buf = [ch];
+            crate::console::print(&buf);
+            1
+        }
+
+        syscall::SYS_CURSOR => {
+            // Set cursor position: rdi=x, rsi=y
+            let x = ctx.rdi as u32;
+            let y = ctx.rsi as u32;
+            unsafe { watos_set_cursor(x, y); }
+            0
+        }
+
+        syscall::SYS_CLEAR => {
+            // Clear screen
+            unsafe { watos_clear_screen(); }
+            0
+        }
+
+        syscall::SYS_COLOR => {
+            // Set text color: rdi=color
+            // For now, just return success (VGA text colors not implemented)
+            0
+        }
+
+        syscall::SYS_CONSOLE_IN => {
+            // Get stdin handle - creates console handle for current process
+            if let Some(handle_table) = crate::process::current_handle_table() {
+                let handle = handle_table.add_console_handle(crate::io::ConsoleKind::Stdin);
+                handle as u64
+            } else {
+                crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotSupported)
+            }
+        }
+
+        syscall::SYS_CONSOLE_OUT => {
+            // Get stdout handle - creates console handle for current process
+            if let Some(handle_table) = crate::process::current_handle_table() {
+                let handle = handle_table.add_console_handle(crate::io::ConsoleKind::Stdout);
+                handle as u64
+            } else {
+                crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotSupported)
+            }
+        }
+
+        syscall::SYS_CONSOLE_ERR => {
+            // Get stderr handle - creates console handle for current process
+            if let Some(handle_table) = crate::process::current_handle_table() {
+                let handle = handle_table.add_console_handle(crate::io::ConsoleKind::Stderr);
+                handle as u64
+            } else {
+                crate::io::fs_error_to_errno(crate::disk::vfs::FsError::NotSupported)
+            }
+        }
+
+        syscall::SYS_GFX_PSET => {
+            // Set pixel: rdi=x, rsi=y, rdx=color
+            let x = ctx.rdi as i32;
+            let y = ctx.rsi as i32;  
+            let color = ctx.rdx as u8;
+            vga_set_pixel(x, y, color);
+            0
+        }
+
+        syscall::SYS_GFX_LINE => {
+            // Draw line (basic implementation)
+            // For now just return success - TODO: implement line drawing
+            0
+        }
+
+        syscall::SYS_GFX_CIRCLE => {
+            // Draw circle (basic implementation) 
+            // For now just return success - TODO: implement circle drawing
+            0
+        }
+
+        syscall::SYS_GFX_CLS => {
+            // Clear graphics screen
+            unsafe {
+                fb_clear_impl(0, 0, 0); // Clear to black
+            }
+            0
+        }
+
+        syscall::SYS_GFX_MODE => {
+            // Set graphics mode: rdi=mode
+            // For now just return success
+            0
+        }
+
+        syscall::SYS_GFX_DISPLAY => {
+            // Display/flip graphics buffer
+            // For now just return success 
             0
         }
 

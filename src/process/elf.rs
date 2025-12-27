@@ -47,6 +47,11 @@ pub const PT_NULL: u32 = 0;
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
+
+// Program header flags
+pub const PF_X: u32 = 1;        // Execute
+pub const PF_W: u32 = 2;        // Write  
+pub const PF_R: u32 = 4;        // Read
 pub const PT_NOTE: u32 = 4;
 
 // ELF machine types
@@ -231,6 +236,67 @@ impl Elf64 {
                 if mem_size > file_size {
                     core::ptr::write_bytes(dest.add(file_size), 0, mem_size - file_size);
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load ELF segments with memory protection via page tables
+    pub fn load_segments_protected(&self, data: &[u8], load_base: u64, page_table: &mut crate::mmu::ProcessPageTable) -> Result<(), &'static str> {
+        use crate::mmu::{page_flags, PAGE_SIZE};
+
+        for phdr in self.phdrs {
+            if phdr.ptype != PT_LOAD {
+                continue;
+            }
+
+            let src_offset = phdr.offset as usize;
+            let file_size = phdr.filesz as usize;
+            let mem_size = phdr.memsz as usize;
+            
+            // Calculate destination with relocation
+            let dest_addr = load_base + (phdr.vaddr - self.phdrs.iter()
+                .filter(|p| p.ptype == PT_LOAD)
+                .map(|p| p.vaddr)
+                .min()
+                .unwrap_or(0));
+
+            // Validate ranges
+            if src_offset + file_size > data.len() {
+                return Err("Segment outside file");
+            }
+
+            // Copy segment data first
+            unsafe {
+                let dest = dest_addr as *mut u8;
+                let src = data.as_ptr().add(src_offset);
+                core::ptr::copy_nonoverlapping(src, dest, file_size);
+
+                // Zero BSS section
+                if mem_size > file_size {
+                    core::ptr::write_bytes(dest.add(file_size), 0, mem_size - file_size);
+                }
+            }
+
+            // Map pages with appropriate permissions
+            let page_start = dest_addr & !(PAGE_SIZE as u64 - 1);
+            let page_end = (dest_addr + mem_size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            
+            // Determine page flags from ELF flags
+            let mut flags = page_flags::PRESENT;
+            if phdr.flags & PF_W != 0 {
+                flags |= page_flags::WRITABLE;
+            }
+            if phdr.flags & PF_X == 0 {
+                flags |= page_flags::NO_EXECUTE;
+            }
+
+            // Map each page
+            let mut current_page = page_start;
+            while current_page < page_end {
+                page_table.map_user_page(current_page, current_page, flags)?;
+                current_page += PAGE_SIZE as u64;
             }
         }
 

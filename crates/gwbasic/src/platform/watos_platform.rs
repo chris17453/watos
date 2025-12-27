@@ -9,84 +9,41 @@ use super::{Console, FileSystem, Graphics, System, FileOpenMode, FileHandle};
 use alloc::string::{String, ToString};
 use alloc::collections::BTreeMap;
 
-/// WATOS syscall numbers
-pub mod syscall {
-    pub const SYS_EXIT: u32 = 0;
-    pub const SYS_WRITE: u32 = 1;
-    pub const SYS_READ: u32 = 2;
-    pub const SYS_OPEN: u32 = 3;
-    pub const SYS_CLOSE: u32 = 4;
-    pub const SYS_GETKEY: u32 = 5;
-    pub const SYS_PUTCHAR: u32 = 6;
-    pub const SYS_CURSOR: u32 = 7;
-    pub const SYS_CLEAR: u32 = 8;
-    pub const SYS_COLOR: u32 = 9;
-    pub const SYS_TIMER: u32 = 10;
-    pub const SYS_SLEEP: u32 = 11;
-    pub const SYS_GFX_PSET: u32 = 20;
-    pub const SYS_GFX_LINE: u32 = 21;
-    pub const SYS_GFX_CIRCLE: u32 = 22;
-    pub const SYS_GFX_CLS: u32 = 23;
-    pub const SYS_GFX_MODE: u32 = 24;
-    pub const SYS_GFX_DISPLAY: u32 = 25;
+// Use shared WATOS syscall interface  
+#[cfg(feature = "watos")]
+use watos_syscall::{numbers as syscall, raw_syscall0, raw_syscall1, raw_syscall2, raw_syscall3};
+
+// Add console syscall numbers if not in shared interface
+#[cfg(feature = "watos")]
+mod console_syscalls {
+    pub const SYS_CONSOLE_IN: u32 = 20;
+    pub const SYS_CONSOLE_OUT: u32 = 21; 
+    pub const SYS_CONSOLE_ERR: u32 = 22;
 }
 
-/// Make a syscall to WATOS kernel
-///
-/// # Safety
-/// This function performs a raw syscall into the WATOS kernel.
+/// Syscall wrapper functions using shared interface
+#[cfg(feature = "watos")]
 #[inline(always)]
 unsafe fn syscall0(num: u32) -> u64 {
-    let ret: u64;
-    core::arch::asm!(
-        "int 0x80",
-        in("eax") num,
-        lateout("rax") ret,
-        options(nostack)
-    );
-    ret
+    raw_syscall0(num)
 }
 
+#[cfg(feature = "watos")]
 #[inline(always)]
 unsafe fn syscall1(num: u32, arg1: u64) -> u64 {
-    let ret: u64;
-    core::arch::asm!(
-        "int 0x80",
-        in("eax") num,
-        in("rdi") arg1,
-        lateout("rax") ret,
-        options(nostack)
-    );
-    ret
+    raw_syscall1(num, arg1)
 }
 
+#[cfg(feature = "watos")]
 #[inline(always)]
 unsafe fn syscall2(num: u32, arg1: u64, arg2: u64) -> u64 {
-    let ret: u64;
-    core::arch::asm!(
-        "int 0x80",
-        in("eax") num,
-        in("rdi") arg1,
-        in("rsi") arg2,
-        lateout("rax") ret,
-        options(nostack)
-    );
-    ret
+    raw_syscall2(num, arg1, arg2)
 }
 
+#[cfg(feature = "watos")]
 #[inline(always)]
 unsafe fn syscall3(num: u32, arg1: u64, arg2: u64, arg3: u64) -> u64 {
-    let ret: u64;
-    core::arch::asm!(
-        "int 0x80",
-        in("eax") num,
-        in("rdi") arg1,
-        in("rsi") arg2,
-        in("rdx") arg3,
-        lateout("rax") ret,
-        options(nostack)
-    );
-    ret
+    raw_syscall3(num, arg1, arg2, arg3)
 }
 
 #[inline(always)]
@@ -130,15 +87,31 @@ pub struct WatosConsole {
     cursor_col: usize,
     input_buffer: [u8; 256],
     input_len: usize,
+    stdout_handle: Option<u64>,
+    stdin_handle: Option<u64>,
+    stderr_handle: Option<u64>,
 }
 
 impl WatosConsole {
     pub fn new() -> Self {
+        // Request console handles from WATOS
+        let stdout_handle = unsafe { syscall0(console_syscalls::SYS_CONSOLE_OUT) };
+        let stdin_handle = unsafe { syscall0(console_syscalls::SYS_CONSOLE_IN) };
+        let stderr_handle = unsafe { syscall0(console_syscalls::SYS_CONSOLE_ERR) };
+        
+        // Check if handles are valid (errors are > 2^32)
+        let stdout = if stdout_handle < 0x100000000 { Some(stdout_handle) } else { None };
+        let stdin = if stdin_handle < 0x100000000 { Some(stdin_handle) } else { None };
+        let stderr = if stderr_handle < 0x100000000 { Some(stderr_handle) } else { None };
+        
         WatosConsole {
             cursor_row: 0,
             cursor_col: 0,
             input_buffer: [0; 256],
             input_len: 0,
+            stdout_handle: stdout,
+            stdin_handle: stdin,
+            stderr_handle: stderr,
         }
     }
 }
@@ -151,10 +124,19 @@ impl Default for WatosConsole {
 
 impl Console for WatosConsole {
     fn print(&mut self, s: &str) {
-        let bytes = s.as_bytes();
-        unsafe {
-            // SYS_WRITE: rdi=fd (ignored), rsi=buf, rdx=len
-            syscall3(syscall::SYS_WRITE, 1, bytes.as_ptr() as u64, bytes.len() as u64);
+        if let Some(handle) = self.stdout_handle {
+            let bytes = s.as_bytes();
+            unsafe {
+                syscall3(syscall::SYS_WRITE, handle, bytes.as_ptr() as u64, bytes.len() as u64);
+            }
+        }
+        // Fallback to putchar if no stdout handle
+        else {
+            for ch in s.chars() {
+                unsafe {
+                    syscall1(syscall::SYS_PUTCHAR, ch as u64);
+                }
+            }
         }
     }
 
@@ -198,6 +180,18 @@ impl Console for WatosConsole {
     }
 
     fn read_char(&mut self) -> Option<char> {
+        // Try reading from stdin handle first
+        if let Some(handle) = self.stdin_handle {
+            let mut buffer = [0u8; 1];
+            unsafe {
+                let bytes_read = syscall3(syscall::SYS_READ, handle, buffer.as_mut_ptr() as u64, 1);
+                if bytes_read > 0 {
+                    return Some(buffer[0] as char);
+                }
+            }
+        }
+        
+        // Fallback to direct keyboard input
         let key = unsafe { syscall0(syscall::SYS_GETKEY) } as u8;
         if key == 0 {
             None
@@ -263,22 +257,25 @@ impl FileSystem for WatosFileSystem {
             FileOpenMode::Random => 3,
         };
         let bytes = path.as_bytes();
-        let kernel_handle = unsafe {
+        let watos_handle = unsafe {
             syscall3(syscall::SYS_OPEN, bytes.as_ptr() as u64, bytes.len() as u64, mode_num)
         };
-        if kernel_handle == u64::MAX {
+        
+        // Check for error (WATOS returns error codes > 2^32 for failures)
+        if watos_handle > 0x100000000 {
             return Err("Cannot open file");
         }
+        
         let handle = self.next_handle;
         self.next_handle += 1;
-        self.open_files.insert(handle, kernel_handle);
+        self.open_files.insert(handle, watos_handle);
         Ok(FileHandle(handle))
     }
 
     fn close(&mut self, handle: FileHandle) -> Result<(), &'static str> {
-        if let Some(kernel_handle) = self.open_files.remove(&handle.0) {
+        if let Some(watos_handle) = self.open_files.remove(&handle.0) {
             unsafe {
-                syscall1(syscall::SYS_CLOSE, kernel_handle);
+                syscall1(syscall::SYS_CLOSE, watos_handle);
             }
             Ok(())
         } else {
@@ -287,10 +284,10 @@ impl FileSystem for WatosFileSystem {
     }
 
     fn read_line(&mut self, handle: FileHandle) -> Result<String, &'static str> {
-        if let Some(&kernel_handle) = self.open_files.get(&handle.0) {
+        if let Some(&watos_handle) = self.open_files.get(&handle.0) {
             let mut buffer = [0u8; 256];
             let len = unsafe {
-                syscall3(syscall::SYS_READ, kernel_handle, buffer.as_mut_ptr() as u64, 256)
+                syscall3(syscall::SYS_READ, watos_handle, buffer.as_mut_ptr() as u64, 256)
             } as usize;
             if len == 0 {
                 return Err("EOF");
@@ -302,14 +299,14 @@ impl FileSystem for WatosFileSystem {
     }
 
     fn write_line(&mut self, handle: FileHandle, data: &str) -> Result<(), &'static str> {
-        if let Some(&kernel_handle) = self.open_files.get(&handle.0) {
+        if let Some(&watos_handle) = self.open_files.get(&handle.0) {
             let bytes = data.as_bytes();
             unsafe {
-                syscall3(syscall::SYS_WRITE, kernel_handle, bytes.as_ptr() as u64, bytes.len() as u64);
+                syscall3(syscall::SYS_WRITE, watos_handle, bytes.as_ptr() as u64, bytes.len() as u64);
             }
             // Write newline
             unsafe {
-                syscall3(syscall::SYS_WRITE, kernel_handle, b"\n".as_ptr() as u64, 1);
+                syscall3(syscall::SYS_WRITE, watos_handle, b"\n".as_ptr() as u64, 1);
             }
             Ok(())
         } else {

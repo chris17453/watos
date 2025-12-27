@@ -2,7 +2,7 @@
 //!
 //! Minimal driver for reading/writing sectors from SATA drives
 
-use crate::net::pci::{self, PciDevice};
+use crate::net::pci;
 use core::ptr::{read_volatile, write_volatile};
 
 // AHCI HBA Memory Registers
