@@ -1,0 +1,36 @@
+[package]
+name = "watos-coreutils"
+version = "0.1.0"
+edition = "2021"
+description = "Core utilities for WATOS operating system"
+
+[workspace]
+
+# Binary executables
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+
+[[bin]]
+name = "copy"
+path = "src/bin/copy.rs"
+
+[[bin]]
+name = "del"
+path = "src/bin/del.rs"
+
+[[bin]]
+name = "ren"
+path = "src/bin/ren.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1

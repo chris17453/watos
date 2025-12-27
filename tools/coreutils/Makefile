@@ -1,36 +1,43 @@
 # Makefile for WATOS Core Utilities
-# Builds DOS .COM files from assembly source
+# Builds native 64-bit Rust binaries (ELF64)
 
-# Assembler
-AS = nasm
-ASFLAGS = -f bin -O0
+# Rust build settings
+CARGO = cargo +nightly
+TARGET = x86_64-unknown-none
+RELEASE_FLAGS = -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem --release --target $(TARGET)
 
-# Output directory
+# Output directories
 OUTDIR = ../../rootfs/BIN
+TARGET_DIR = target/$(TARGET)/release
 
-# Source files
-SOURCES = $(wildcard *.asm)
-TARGETS = $(patsubst %.asm,$(OUTDIR)/%.COM,$(SOURCES))
+# Utilities to build
+UTILS = echo cat copy del ren
 
 # Default target
-all: $(OUTDIR) $(TARGETS)
+all: $(addprefix $(OUTDIR)/,$(addsuffix .EXE,$(UTILS)))
 
-# Create output directory
-$(OUTDIR):
-	mkdir -p $(OUTDIR)
-
-# Build .COM files from .asm
-$(OUTDIR)/%.COM: %.asm
-	$(AS) $(ASFLAGS) -o $@ $<
+# Build a utility
+$(OUTDIR)/%.EXE:
+	@mkdir -p $(OUTDIR)
+	$(CARGO) build $(RELEASE_FLAGS) --bin $*
+	cp $(TARGET_DIR)/$* $@
 	@echo "Built $@"
 
-# Clean target
+# Clean
 clean:
-	rm -f $(TARGETS)
+	$(CARGO) clean
+	rm -f $(OUTDIR)/*.EXE
 
-# List targets
-list:
+# Help
+help:
+	@echo "WATOS Core Utilities Build System"
+	@echo ""
 	@echo "Targets:"
-	@echo "$(TARGETS)" | tr ' ' '\n'
+	@echo "  all       - Build all utilities (default)"
+	@echo "  clean     - Remove build artifacts"
+	@echo "  help      - Show this help"
+	@echo ""
+	@echo "Utilities:"
+	@echo "  $(UTILS)"
 
-.PHONY: all clean list
+.PHONY: all clean help

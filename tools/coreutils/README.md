@@ -1,11 +1,16 @@
 # WATOS Core Utilities
 
-This directory contains basic DOS utilities written in x86 assembly for the WATOS operating system.
+Native 64-bit utilities written in Rust for the WATOS operating system.
+
+## Overview
+
+These utilities are compiled as ELF64 binaries that run directly on WATOS using the native64 runtime. They use WATOS syscalls (INT 0x80) for system interaction.
 
 ## Building
 
 Prerequisites:
-- NASM (Netwide Assembler)
+- Rust nightly toolchain
+- `x86_64-unknown-none` target installed
 
 To build all utilities:
 ```bash
@@ -13,7 +18,7 @@ cd tools/coreutils
 make
 ```
 
-This will create .COM files in `rootfs/BIN/`.
+This will create `.EXE` files (ELF64 format) in `rootfs/BIN/`.
 
 To clean:
 ```bash
@@ -22,92 +27,67 @@ make clean
 
 ## Utilities
 
-### ECHO.COM
+### ECHO.EXE
 Display text to console.
 
 **Usage:** `ECHO <text>`
 
-**Example:**
-```
-ECHO Hello, World!
-```
+**Status:** Basic implementation (args parsing TODO)
 
-### COPY.COM
+### CAT.EXE
+Concatenate and display files.
+
+**Usage:** `CAT <file1> [file2] ...`
+
+**Status:** Stub (file I/O TODO)
+
+### COPY.EXE
 Copy files from source to destination.
 
 **Usage:** `COPY <source> <dest>`
 
-**Example:**
-```
-COPY file1.txt file2.txt
-```
+**Status:** Stub (file I/O TODO)
 
-### DEL.COM
+### DEL.EXE
 Delete a file.
 
 **Usage:** `DEL <filename>`
 
-**Example:**
-```
-DEL oldfile.txt
-```
+**Status:** Stub (file I/O TODO)
 
-### REN.COM
+### REN.EXE
 Rename a file.
 
 **Usage:** `REN <oldname> <newname>`
 
-**Example:**
-```
-REN old.txt new.txt
-```
+**Status:** Stub (file I/O TODO)
 
-### MORE.COM
-Display file contents with paging (23 lines at a time).
+## Implementation Details
 
-**Usage:** `MORE <filename>`
+### no_std Environment
+All utilities are built with `#![no_std]` and `#![no_main]` to run directly on WATOS without requiring a standard library.
 
-**Example:**
-```
-MORE longfile.txt
-```
+### Syscalls
+Uses WATOS syscalls via INT 0x80:
+- **SYS_EXIT (0)** - Exit program
+- **SYS_WRITE (1)** - Write to stdout
+- **SYS_READ (2)** - Read from stdin
+- **SYS_OPEN (3)** - Open file (TODO)
+- **SYS_CLOSE (4)** - Close file (TODO)
 
-Press any key to continue to the next page.
+### Entry Point
+Each utility has a `_start()` function that serves as the entry point:
 
-### CAT.COM
-Concatenate and display files.
-
-**Usage:** `CAT <file1> [file2] [file3] ...`
-
-**Examples:**
-```
-CAT file.txt
-CAT file1.txt file2.txt file3.txt
+```rust
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    // Utility code here
+    exit(0)
+}
 ```
 
-## Implementation Notes
-
-All utilities are written as DOS .COM files using the flat binary format:
-- Load address: 0x100 (DOS COM format)
-- Maximum size: ~64KB minus PSP (Program Segment Prefix)
-- Use DOS INT 21h for system calls
-
-### DOS INT 21h Functions Used
-
-- **AH=02h** - Write character to stdout
-- **AH=09h** - Write string to stdout ($ terminated)
-- **AH=3Ch** - Create file
-- **AH=3Dh** - Open file
-- **AH=3Eh** - Close file
-- **AH=3Fh** - Read from file
-- **AH=40h** - Write to file
-- **AH=41h** - Delete file
-- **AH=56h** - Rename file
-- **AH=4Ch** - Exit program
-
-### DOS INT 16h Functions Used
-
-- **AH=00h** - Read keyboard (blocking)
+### Linker Script
+A custom linker script (`linker.ld`) places the code at 0x100000 (1MB), standard for ELF executables.
 
 ## Testing
 
@@ -117,29 +97,41 @@ After building, test the utilities in WATOS:
 2. Run WATOS: `./scripts/boot_test.sh --interactive`
 3. In WATOS shell:
    ```
-   ECHO Hello from WATOS!
-   COPY HELLO.COM TEST.COM
-   CAT HELLO.COM
-   MORE HELLO.COM
-   REN TEST.COM RENAMED.COM
-   DEL RENAMED.COM
+   run echo.exe
+   run cat.exe
    ```
 
-## Adding New Utilities
+## Future Work
 
-1. Create a new `.asm` file in this directory
-2. Use the DOS .COM format (`org 0x100`)
-3. Implement using DOS INT 21h functions
-4. The Makefile will automatically build it
+- [ ] Implement command-line argument parsing
+- [ ] Add file I/O syscalls (SYS_OPEN, SYS_CLOSE, SYS_READ file, SYS_WRITE file)
+- [ ] Implement full functionality for COPY, DEL, REN, CAT
+- [ ] Add MORE utility for paginated display
+- [ ] Add MKDIR, RMDIR, CD for directory operations
+- [ ] Add LS utility (list files, replacement for DIR)
+- [ ] Add FIND utility for searching
+- [ ] Add system utilities (DATE, TIME, MEM, etc.)
 
-## Future Utilities
+## Architecture Notes
 
-Planned utilities to add:
-- MKDIR - Create directories
-- RMDIR - Remove directories
-- CD - Change directory
-- DATE - Display/set date
-- TIME - Display/set time
-- SORT - Sort text files
-- FIND - Search for text in files
-- COMP - Compare files
+WATOS utilities run in the native64 runtime which:
+- Interprets x86-64 instructions
+- Provides syscall interface via INT 0x80
+- Manages task memory and execution
+- Handles process lifecycle
+
+This approach provides:
+- **Safety**: Memory isolation per task
+- **Portability**: ELF64 standard format
+- **Simplicity**: Direct syscall interface
+- **Performance**: Native 64-bit execution
+
+## Comparison to DOS COM/EXE Format
+
+Unlike the original DOS approach:
+- **Not** 16-bit x86 assembly
+- **Not** using DOS INT 21h interrupts
+- **Not** limited to 64KB segments
+- Uses native 64-bit instructions and calling conventions
+- Uses WATOS-specific syscalls
+- Can leverage Rust's safety features
