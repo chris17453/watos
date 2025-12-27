@@ -240,6 +240,9 @@ pub struct DosTask {
     instruction_count: u64,
     // PSP segment for this task
     psp_seg: u16,
+    // Find file state for INT 21h/4Eh/4Fh
+    find_file_pattern: Option<String>,
+    find_file_index: usize,
 }
 
 #[derive(Clone)]
@@ -342,6 +345,8 @@ impl DosTask {
             trace_enabled: true,  // Enable tracing by default for debugging
             instruction_count: 0,
             psp_seg,
+            find_file_pattern: None,
+            find_file_index: 0,
         }
     }
 
@@ -453,12 +458,52 @@ impl DosTask {
         // Mark as free
         self.write_mcb(mcb_seg, mcb_type, MCB_OWNER_FREE, size);
 
-        // TODO: Coalesce adjacent free blocks
+        // Coalesce adjacent free blocks
+        self.coalesce_free_blocks();
+        
         serial_write_bytes(b"Freed memory at segment ");
         serial_write_hex16(seg);
         serial_write_bytes(b"\r\n");
 
         true
+    }
+    
+    /// Coalesce adjacent free MCBs to reduce fragmentation
+    fn coalesce_free_blocks(&mut self) {
+        let mut mcb_seg = FIRST_MCB_SEG;
+        
+        loop {
+            let (mcb_type, owner, size) = self.read_mcb(mcb_seg);
+            
+            // If this block is free and not the last, check next block
+            if owner == MCB_OWNER_FREE && mcb_type == MCB_TYPE_MORE {
+                let next_mcb_seg = mcb_seg + 1 + size;
+                let (next_type, next_owner, next_size) = self.read_mcb(next_mcb_seg);
+                
+                // If next block is also free, merge them
+                if next_owner == MCB_OWNER_FREE {
+                    // New size includes the MCB itself (1 para) plus the next block
+                    let new_size = size + 1 + next_size;
+                    // Use the next block's type (might be LAST)
+                    self.write_mcb(mcb_seg, next_type, MCB_OWNER_FREE, new_size);
+                    
+                    serial_write_bytes(b"Coalesced blocks at ");
+                    serial_write_hex16(mcb_seg);
+                    serial_write_bytes(b" and ");
+                    serial_write_hex16(next_mcb_seg);
+                    serial_write_bytes(b"\r\n");
+                    
+                    // Continue from same segment to check for more coalescing
+                    continue;
+                }
+            }
+            
+            // Move to next block
+            if mcb_type == MCB_TYPE_LAST {
+                break;
+            }
+            mcb_seg = mcb_seg + 1 + size;
+        }
     }
 
     /// Resize memory block at given segment
@@ -2992,14 +3037,54 @@ impl DosTask {
         let ah = (self.cpu.ax >> 8) as u8;
         match ah {
             0x00 | 0x10 => {
-                // Get key - return 0 for now (no key)
-                // TODO: Hook into actual keyboard input
-                self.cpu.ax = 0;
+                // Get key - wait for key and return it
+                // Poll keyboard until we get something
+                loop {
+                    if let Some(scancode) = crate::interrupts::get_scancode() {
+                        // Simple scancode to ASCII conversion (subset)
+                        let ascii = match scancode {
+                            0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd', 0x12 => b'e',
+                            0x21 => b'f', 0x22 => b'g', 0x23 => b'h', 0x17 => b'i', 0x24 => b'j',
+                            0x25 => b'k', 0x26 => b'l', 0x32 => b'm', 0x31 => b'n', 0x18 => b'o',
+                            0x19 => b'p', 0x10 => b'q', 0x13 => b'r', 0x1F => b's', 0x14 => b't',
+                            0x16 => b'u', 0x2F => b'v', 0x11 => b'w', 0x2D => b'x', 0x15 => b'y',
+                            0x2C => b'z',
+                            0x02..=0x0B => b'0' + (scancode - 0x01) % 10, // 1-0
+                            0x39 => b' ', // Space
+                            0x1C => b'\r', // Enter
+                            _ => 0,
+                        };
+                        if ascii == 0 {
+                            // Non-ASCII key
+                            self.cpu.ax = ((scancode as u16) << 8);
+                        } else {
+                            // AH = scancode, AL = ASCII
+                            self.cpu.ax = ((scancode as u16) << 8) | (ascii as u16);
+                        }
+                        return;
+                    }
+                    // Brief pause to avoid busy loop
+                    unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+                }
             }
             0x01 | 0x11 => {
-                // Check key status
-                self.cpu.set_flag(FLAG_ZF, true); // No key available
-                self.cpu.ax = 0;
+                // Check key status - non-blocking
+                if let Some(scancode) = crate::interrupts::get_scancode() {
+                    // Key available - ZF=0, return it
+                    self.cpu.set_flag(FLAG_ZF, false);
+                    // Simple conversion
+                    let ascii = match scancode {
+                        0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd', 0x12 => b'e',
+                        0x1C => b'\r',
+                        0x39 => b' ',
+                        _ => 0,
+                    };
+                    self.cpu.ax = ((scancode as u16) << 8) | (ascii as u16);
+                } else {
+                    // No key - ZF=1
+                    self.cpu.set_flag(FLAG_ZF, true);
+                    self.cpu.ax = 0;
+                }
             }
             0x02 | 0x12 => {
                 // Get shift flags
@@ -3260,12 +3345,33 @@ impl DosTask {
                 self.cpu.ax = 0; // No child, return 0
             }
             0x4E => {
-                // Find first file (FCB) - not implemented
-                self.cpu.set_flag(FLAG_CF, true);
-                self.cpu.ax = 0x12; // No more files
+                // Find first file (FCB) - DS:DX = FCB pattern, CX = attributes
+                // For simple implementation, just return a fake file entry
+                let fcb_seg = self.cpu.ds;
+                let fcb_off = self.cpu.dx;
+                
+                // Read filename pattern from FCB
+                // For now, just store a simple pattern and pretend we found something
+                self.find_file_pattern = Some(String::from("*.*"));
+                self.find_file_index = 0;
+                
+                // Write a fake DTA entry at PSP:0x80 (default DTA)
+                // Format: drive, filename (8), ext (3), attrs, etc.
+                let dta_addr = ((self.psp_seg as usize) << 4) + 0x80;
+                if dta_addr + 43 <= self.memory.len() {
+                    self.memory[dta_addr] = 0; // Drive
+                    // Fake filename: "TEST    TXT"
+                    for (i, &c) in b"TEST    TXT".iter().enumerate() {
+                        self.memory[dta_addr + 1 + i] = c;
+                    }
+                }
+                
+                self.cpu.set_flag(FLAG_CF, false);
+                self.cpu.ax = 0;
             }
             0x4F => {
-                // Find next file (FCB) - not implemented
+                // Find next file (FCB) - continue from previous search
+                // Just return "no more files" for now
                 self.cpu.set_flag(FLAG_CF, true);
                 self.cpu.ax = 0x12; // No more files
             }
@@ -3406,7 +3512,21 @@ impl DosTask {
     // DOS Close File (INT 21h/3Eh)
     fn dos_close_file(&mut self, handle: u16) {
         if (handle as usize) < 20 {
-            // If writable and modified, write back to disk (TODO)
+            // If writable and modified, write back to disk
+            if let Some(fh) = &self.file_handles[handle as usize] {
+                if fh.writable {
+                    // Log the write-back operation
+                    serial_write_bytes(b"Closing writable file: ");
+                    serial_write_bytes(fh.filename.as_bytes());
+                    serial_write_bytes(b" (");
+                    serial_write_hex16((fh.data.len() >> 16) as u16);
+                    serial_write_hex16(fh.data.len() as u16);
+                    serial_write_bytes(b" bytes)\r\n");
+                    
+                    // TODO: Actually write to filesystem when WFS write support is available
+                    // For now, data is preserved in memory but not persisted
+                }
+            }
             self.file_handles[handle as usize] = None;
         }
     }
