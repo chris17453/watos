@@ -153,7 +153,8 @@ impl Console for WatosConsole {
     fn print(&mut self, s: &str) {
         let bytes = s.as_bytes();
         unsafe {
-            syscall2(syscall::SYS_WRITE, bytes.as_ptr() as u64, bytes.len() as u64);
+            // SYS_WRITE: rdi=fd (ignored), rsi=buf, rdx=len
+            syscall3(syscall::SYS_WRITE, 1, bytes.as_ptr() as u64, bytes.len() as u64);
         }
     }
 
@@ -168,6 +169,8 @@ impl Console for WatosConsole {
         loop {
             let key = unsafe { syscall0(syscall::SYS_GETKEY) } as u8;
             if key == 0 {
+                // Small delay to avoid busy-waiting at 100% CPU
+                unsafe { syscall1(syscall::SYS_SLEEP, 10); } // 10ms
                 continue;
             }
             if key == b'\r' || key == b'\n' {

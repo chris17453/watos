@@ -205,8 +205,9 @@ else
     echo -e "${YELLOW}[WARN]${NC} GWBASIC library build failed (optional)"
 fi
 
-# Build the executable binary
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+# Build the executable binary with linker script for proper load address (0x400000)
+GWBASIC_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/gwbasic/linker.ld -C relocation-model=static"
+if RUSTFLAGS="$GWBASIC_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
     --features watos \
@@ -222,7 +223,9 @@ if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     if [ -f "$GWBASIC_BIN" ]; then
         # Copy to rootfs root (mkfs_wfs doesn't support subdirs yet)
         cp "$GWBASIC_BIN" "$PROJECT_ROOT/rootfs/GWBASIC.EXE"
-        success "GWBASIC binary built and copied to rootfs/GWBASIC.EXE ($(du -h "$GWBASIC_BIN" | cut -f1))"
+        # Also copy to uefi_test for FAT filesystem boot
+        cp "$GWBASIC_BIN" "$PROJECT_ROOT/uefi_test/GWBASIC.EXE"
+        success "GWBASIC binary built and copied to rootfs and uefi_test ($(du -h "$GWBASIC_BIN" | cut -f1))"
     fi
 else
     echo -e "${YELLOW}[WARN]${NC} GWBASIC binary build failed (optional)"

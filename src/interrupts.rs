@@ -297,6 +297,9 @@ pub mod syscall {
     pub const SYS_GETKEY: u32 = 5;
     pub const SYS_EXIT: u32 = 6;
 
+    // System
+    pub const SYS_SLEEP: u32 = 11;
+
     // VGA Graphics
     pub const SYS_VGA_SET_MODE: u32 = 30;
     pub const SYS_VGA_SET_PIXEL: u32 = 31;
@@ -327,57 +330,17 @@ pub struct SyscallContext {
 pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
     let syscall_num = ctx.rax as u32;
 
-    // Debug: log syscall number
-    unsafe {
-        // Write to serial port directly
-        let port: u16 = 0x3F8;
-        let msg = b"SC:";
-        for &b in msg {
-            core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack));
-        }
-        let hex = b"0123456789ABCDEF";
-        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[((syscall_num >> 4) & 0xF) as usize], options(nostack));
-        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[(syscall_num & 0xF) as usize], options(nostack));
-        core::arch::asm!("out dx, al", in("dx") port, in("al") b' ', options(nostack));
-    }
-
     ctx.rax = match syscall_num {
         syscall::SYS_WRITE => {
             // Write to console: rdi=fd (ignored), rsi=buf, rdx=len
             let buf = ctx.rsi as *const u8;
             let len = ctx.rdx as usize;
-            // Debug: print buf address and first byte
-            unsafe {
-                let port: u16 = 0x3F8;
-                let hex = b"0123456789ABCDEF";
-                let msg = b"WR:@";
-                for &b in msg { core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack)); }
-                for i in (0..16).rev() {
-                    let n = ((ctx.rsi >> (i*4)) & 0xF) as usize;
-                    core::arch::asm!("out dx, al", in("dx") port, in("al") hex[n], options(nostack));
-                }
-                let msg2 = b" L=";
-                for &b in msg2 { core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack)); }
-                for i in (0..8).rev() {
-                    let n = ((len as u64 >> (i*4)) & 0xF) as usize;
-                    core::arch::asm!("out dx, al", in("dx") port, in("al") hex[n], options(nostack));
-                }
-                if !buf.is_null() && len > 0 {
-                    let msg3 = b" D=";
-                    for &b in msg3 { core::arch::asm!("out dx, al", in("dx") port, in("al") b, options(nostack)); }
-                    for i in 0..len.min(16) {
-                        let byte = *buf.add(i);
-                        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[(byte >> 4) as usize], options(nostack));
-                        core::arch::asm!("out dx, al", in("dx") port, in("al") hex[(byte & 0xF) as usize], options(nostack));
-                    }
-                }
-                core::arch::asm!("out dx, al", in("dx") port, in("al") b'\r', options(nostack));
-                core::arch::asm!("out dx, al", in("dx") port, in("al") b'\n', options(nostack));
-            }
             if !buf.is_null() && len > 0 {
+                extern "C" {
+                    fn syscall_write(buf: *const u8, len: usize);
+                }
                 unsafe {
-                    let slice = core::slice::from_raw_parts(buf, len);
-                    crate::console::print(slice);
+                    syscall_write(buf, len);
                 }
             }
             len as u64
@@ -404,6 +367,13 @@ pub extern "C" fn syscall_handler(ctx: &mut SyscallContext) {
             crate::process::exit_current(code);
             // Mark that we should return to kernel after syscall
             // The actual return happens when the process returns from its entry
+            0
+        }
+
+        syscall::SYS_SLEEP => {
+            // Sleep for rdi milliseconds
+            let ms = ctx.rdi as u32;
+            sleep_ms(ms);
             0
         }
 

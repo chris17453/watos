@@ -603,6 +603,16 @@ unsafe fn fb_print(s: &[u8]) {
     for &c in s { fb_putchar(c); }
 }
 
+/// Syscall write handler - writes to framebuffer
+#[no_mangle]
+pub extern "C" fn syscall_write(buf: *const u8, len: usize) {
+    if buf.is_null() || len == 0 { return; }
+    unsafe {
+        let slice = core::slice::from_raw_parts(buf, len);
+        fb_print(slice);
+    }
+}
+
 pub unsafe fn console_print(s: &[u8]) {
     serial_write(s);
     fb_print(s);
@@ -879,31 +889,6 @@ pub extern "C" fn kernel_main() -> ! {
         console_print(b"\nType 'help' for commands.\n");
         console_print(b"\n");
         runtime::register_default_runtimes();
-
-        // DEBUG: Try to auto-run GWBASIC.EXE
-        console_print(b"DEBUG: Attempting to run GWBASIC.EXE...\n");
-        serial_write(b"DEBUG: Looking for GWBASIC.EXE...\r\n");
-        let mut found = false;
-        if let Some(mut vfs) = disk::drive_manager().get_current_vfs() {
-            if let Ok(data) = vfs.read_file("GWBASIC.EXE") {
-                serial_write(b"DEBUG: Found GWBASIC.EXE, running...\r\n");
-                found = true;
-                match runtime::detect_and_run("GWBASIC.EXE", &data) {
-                    runtime::RunResult::Scheduled(_pid) => {
-                        serial_write(b"DEBUG: Process finished\r\n");
-                        console_print(b"Process finished\n");
-                    }
-                    runtime::RunResult::Failed => {
-                        serial_write(b"DEBUG: Process failed to run\r\n");
-                        console_print(b"Failed to run GWBASIC.EXE\n");
-                    }
-                }
-            }
-        }
-        if !found {
-            serial_write(b"DEBUG: GWBASIC.EXE not found\r\n");
-            console_print(b"GWBASIC.EXE not found\n");
-        }
 
         print_prompt();
     }
