@@ -59,9 +59,20 @@ impl IdtEntry {
         self.offset_low = handler as u16;
         self.offset_mid = (handler >> 16) as u16;
         self.offset_high = (handler >> 32) as u32;
-        self.selector = code_selector; // Use actual CS from CPU
+        self.selector = code_selector; // Kernel code segment
+        self.ist = 0;  // Don't use IST (Interrupt Stack Table)
+        self.type_attr = 0x8E; // Present, Ring 0, Interrupt Gate (DPL=0)
+        self.reserved = 0;
+    }
+
+    /// Set handler accessible from Ring 3 (for syscalls)
+    fn set_user_handler(&mut self, handler: u64, code_selector: u16) {
+        self.offset_low = handler as u16;
+        self.offset_mid = (handler >> 16) as u16;
+        self.offset_high = (handler >> 32) as u32;
+        self.selector = code_selector; // Kernel code segment
         self.ist = 0;
-        self.type_attr = 0x8E; // Present, Ring 0, Interrupt Gate
+        self.type_attr = 0xEE; // Present, Ring 3 callable (DPL=3), Interrupt Gate
         self.reserved = 0;
     }
 }
@@ -201,24 +212,23 @@ unsafe extern "C" fn keyboard_handler_asm() {
     );
 }
 
-/// Initialize interrupt system
+/// Initialize interrupt system with Ring 3 support
 pub fn init() {
     unsafe {
         // Disable interrupts during setup
         asm!("cli", options(nostack, preserves_flags));
 
-        // Read actual code segment selector from CS register
-        let cs: u16;
-        asm!("mov {0:x}, cs", out(reg) cs, options(nostack, preserves_flags));
+        // Use kernel code segment from GDT
+        let kernel_cs = crate::gdt::selectors::KERNEL_CODE;
 
         // Initialize PIC with remapped IRQs
         init_pic();
 
-        // Set up IDT entries for timer and keyboard using actual CS
+        // Set up IDT entries for timer and keyboard using kernel CS
         let timer_addr = timer_handler_asm as *const () as u64;
         let keyboard_addr = keyboard_handler_asm as *const () as u64;
-        IDT[IRQ_TIMER as usize].set_handler(timer_addr, cs);
-        IDT[IRQ_KEYBOARD as usize].set_handler(keyboard_addr, cs);
+        IDT[IRQ_TIMER as usize].set_handler(timer_addr, kernel_cs);
+        IDT[IRQ_KEYBOARD as usize].set_handler(keyboard_addr, kernel_cs);
 
         // Load IDT
         let idt_desc = IdtDescriptor {
@@ -759,16 +769,25 @@ pub unsafe extern "C" fn syscall_handler_asm() {
 }
 
 
-/// Install syscall handler at INT 0x80
+/// Install syscall handler at INT 0x80 (user-callable)
 pub fn init_syscalls() {
     unsafe {
-        let cs: u16;
-        asm!("mov {0:x}, cs", out(reg) cs, options(nostack, preserves_flags));
-
+        // Use kernel code segment for handler
+        let kernel_cs = crate::gdt::selectors::KERNEL_CODE;
         let handler_addr = syscall_handler_asm as *const () as u64;
-        IDT[0x80].set_handler(handler_addr, cs);
-        // Set type to 0x8E for interrupt gate, or 0xEE for user-callable
-        IDT[0x80].type_attr = 0xEE; // Present, Ring 3 callable, Interrupt Gate
+        
+        // Set INT 0x80 as user-callable (DPL=3)
+        IDT[0x80].set_user_handler(handler_addr, kernel_cs);
+        
+        debug_syscall(b"[SYSCALL] INT 0x80 handler installed at 0x");
+        unsafe {
+            let hex = b"0123456789ABCDEF";
+            for i in (0..16).rev() {
+                let nibble = ((handler_addr >> (i * 4)) & 0xF) as usize;
+                core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") hex[nibble], options(nostack));
+            }
+        }
+        debug_syscall(b"\r\n");
     }
 }
 

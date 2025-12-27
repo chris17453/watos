@@ -77,15 +77,22 @@ impl ProcessPageTable {
     }
 
     /// Map kernel space into process page table (shared across all processes)
+    /// 
+    /// For Ring 3 user mode, kernel must be mapped but NOT writable from user mode:
+    /// - Kernel code/data: Read-only from user (no USER flag = kernel-only access)
+    /// - This allows kernel to remain accessible for interrupts/syscalls
+    /// - User code cannot write to kernel memory (enforced by CPU)
     fn map_kernel_space(&mut self) {
-        // Map kernel at high addresses (0xFFFFFFFF80000000+)
-        // Use large pages (2MB) for efficiency
+        // Kernel flags: Present, Writable, but NO USER flag
+        // This makes kernel accessible in Ring 0 but NOT Ring 3
         let kernel_flags = page_flags::PRESENT | page_flags::WRITABLE | page_flags::GLOBAL;
         
         // Map first 1GB of physical memory in TWO locations:
-        // 1. Identity mapping (virt = phys) - needed for current kernel execution
+        // 1. Identity mapping (virt = phys) - for kernel execution
         // 2. High virtual addresses - canonical kernel space
-        // This includes kernel, stack, MMIO regions, etc.
+        // 
+        // NOTE: Without USER flag, these are kernel-only mappings
+        // User code at Ring 3 cannot access these addresses
         for i in 0..512 {  // 512 * 2MB = 1GB
             let phys_addr = i * 0x200000; // 2MB increments
             
