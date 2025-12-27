@@ -23,7 +23,7 @@ QEMU_PID=""
 
 # Success patterns - kernel boot indicators
 SUCCESS_PATTERNS=(
-    "DOS64"
+    "WATOS"
     "C:\\\\>"
     "kernel"
     "boot"
@@ -141,10 +141,11 @@ success "Prerequisites satisfied"
 
 # Build QEMU command
 # Attach boot disk and WFS data disk to ICH9's IDE buses (SATA emulation)
+# Use KVM if available for proper CPU idle handling (hlt instruction)
 QEMU_CMD=(
     qemu-system-x86_64
-    -machine q35
-    -cpu max
+    -machine q35,accel=kvm:tcg
+    -cpu max,+invtsc
     -smp 2
     -m 256M
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
@@ -179,9 +180,10 @@ if [ "$INTERACTIVE" = true ]; then
     log "Close the QEMU window to exit (Ctrl+C in terminal)"
 
     # Build QEMU command with optional WFS data disk
+    # Use KVM if available for proper CPU idle handling (hlt instruction)
     QEMU_ARGS=(
-        -machine q35
-        -cpu max
+        -machine q35,accel=kvm:tcg
+        -cpu max,+invtsc
         -smp 2
         -m 256M
         -bios "$OVMF_CODE"

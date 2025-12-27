@@ -1,6 +1,6 @@
 #!/bin/bash
 # WATOS Container Runner
-# Build and run DOS64 in a container
+# Build and run  in a container
 
 set -e
 
@@ -58,12 +58,12 @@ case "${1:-run}" in
         check_build
         log "Running WATOS in container (interactive)..."
         log "Ports: 8080 (HTTP), 2323 (Telnet)"
-        log "Type 'exit' in DOS64 to shutdown"
+        log "Type 'exit' in  to shutdown"
         echo ""
         docker run -it --rm \
             -p 8080:8080 \
             -p 2323:2323 \
-            --name watos-dos64 \
+            --name watos \
             watos:latest
         ;;
     daemon)
@@ -72,7 +72,7 @@ case "${1:-run}" in
         docker run -d \
             -p 8080:8080 \
             -p 2323:2323 \
-            --name watos-dos64 \
+            --name watos \
             watos:latest
         success "WATOS running in background"
         log "Use '$0 logs' to see output"
@@ -80,15 +80,15 @@ case "${1:-run}" in
         ;;
     stop)
         log "Stopping WATOS container..."
-        docker stop watos-dos64 2>/dev/null || true
-        docker rm watos-dos64 2>/dev/null || true
+        docker stop watos 2>/dev/null || true
+        docker rm watos 2>/dev/null || true
         success "Container stopped"
         ;;
     logs)
-        docker logs -f watos-dos64
+        docker logs -f watos
         ;;
     shell)
-        docker exec -it watos-dos64 /bin/bash
+        docker exec -it watos /bin/bash
         ;;
     -h|--help|help)
         usage

@@ -1,0 +1,14 @@
+[package]
+name = "watos-fat"
+version = "0.1.0"
+edition = "2021"
+description = "FAT12/16/32 filesystem implementation for WATOS"
+
+[dependencies]
+spin = "0.5.2"
+watos-vfs = { path = "../vfs" }
+watos-driver-traits = { path = "../../drivers/traits" }
+
+[features]
+default = []
+debug = ["watos-driver-traits/debug-storage"]

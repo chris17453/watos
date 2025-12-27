@@ -77,7 +77,7 @@ rm "$OUTPUT_DIR/watos.img"
 log "Creating VMX configuration file..."
 cat > "$OUTPUT_DIR/watos.vmx" << 'EOF'
 .encoding = "UTF-8"
-displayName = "WATOS DOS64"
+displayName = "WATOS"
 guestOS = "other-64"
 memsize = "256"
 numvcpus = "2"
@@ -127,8 +127,8 @@ cat > "$OUTPUT_DIR/watos.ovf" << 'EOF'
     <Disk ovf:diskId="watos-disk" ovf:capacity="67108864" ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html"/>
   </DiskSection>
   <VirtualSystem ovf:id="WATOS">
-    <Info>WATOS DOS64 - 64-bit DOS-compatible OS</Info>
-    <Name>WATOS DOS64</Name>
+    <Info>WATOS 64-bit OS</Info>
+    <Name>WATOS</Name>
     <OperatingSystemSection ovf:id="100">
       <Info>64-bit OS</Info>
     </OperatingSystemSection>

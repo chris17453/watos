@@ -5,22 +5,76 @@ edition = "2021"
 
 [dependencies]
 linked_list_allocator = "0.10.5"
-spin = "0.5.2"
-volatile = "0.3.0"
-smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-raw", "alloc"] }
-wfs-common = { path = "crates/wfs-common", default-features = false }
-watos-syscall = { path = "crates/watos-syscall", features = ["no-std"] }
+
+# Core crates
+watos-arch = { path = "crates/core/arch" }
+watos-mem = { path = "crates/core/mem" }
+
+# Process management
+watos-process = { path = "crates/sys/process" }
 
 [workspace]
 members = [
-    "src/bootloader",
-    "crates/dos16-core",
-    "crates/gwbasic",
-    "crates/watos-syscall",
-    "crates/echo"
+    # Bootloader
+    "crates/boot",
+
+    # Core crates (no internal deps)
+    "crates/core/arch",
+    "crates/core/mem",
+    "crates/core/syscall",
+
+    # Driver traits
+    "crates/drivers/traits",
+
+    # Bus drivers
+    "crates/drivers/bus/pci",
+
+    # Storage drivers
+    "crates/drivers/storage/ahci",
+
+    # Network drivers
+    "crates/drivers/network/e1000",
+
+    # Input drivers
+    "crates/drivers/input/ps2",
+
+    # Storage subsystem
+    "crates/storage/vfs",
+    "crates/storage/fat",
+    "crates/storage/wfs",
+
+    # Network subsystem
+    "crates/network/stack",
+
+    # System services
+    "crates/sys/console",
+    "crates/sys/process",
+    "crates/sys/runtime",
+    "crates/sys/terminal",
+
+    # Emulation
+    "crates/emu/dos16",
+
+    # Applications
+    "crates/apps/gwbasic",
+    "crates/apps/echo",
+    "crates/apps/console",
+    "crates/apps/date",
 ]
 exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
 
 [workspace.dependencies]
 uefi = "0.25"
 uefi-services = "0.21"
+spin = "0.5.2"
+
+[features]
+default = []
+# Debug features - passed down to driver traits
+debug-all = []
+debug-storage = []
+debug-network = []
+debug-input = []
+debug-video = []
+debug-audio = []
+debug-bus = []

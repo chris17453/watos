@@ -1,0 +1,14 @@
+[package]
+name = "watos-mem"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS memory management: heap allocator and paging"
+
+[features]
+default = []
+# Enable global allocator (only use if no other global allocator is defined)
+global-allocator = []
+
+[dependencies]
+linked_list_allocator = "0.10.5"
+spin = "0.5.2"

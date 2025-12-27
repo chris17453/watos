@@ -1,0 +1,8 @@
+[package]
+name = "watos-dos-emulator"
+version = "0.1.0"
+edition = "2021"
+description = "DOS 16-bit x86 CPU emulator for running COM/EXE programs"
+
+[dependencies]
+watos-runtime = { path = "../../sys/runtime" }

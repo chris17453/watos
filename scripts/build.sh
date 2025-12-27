@@ -141,7 +141,7 @@ success "Kernel binary extracted: kernel.bin ($(du -h "$PROJECT_ROOT/kernel.bin"
 # Step 3: Build bootloader
 log "Building UEFI bootloader (target: x86_64-unknown-uefi)..."
 cd "$PROJECT_ROOT"
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS --target x86_64-unknown-uefi -p bootloader --manifest-path src/bootloader/Cargo.toml 2>&1; then
+if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS --target x86_64-unknown-uefi -p bootloader --manifest-path crates/boot/Cargo.toml 2>&1; then
     success "Bootloader build complete"
 else
     error "Bootloader build failed"
@@ -192,7 +192,7 @@ mkdir -p "$PROJECT_ROOT/rootfs/BIN"
 
 # Build GWBASIC for WATOS
 log "Building GWBASIC for WATOS..."
-cd "$PROJECT_ROOT/crates/gwbasic"
+cd "$PROJECT_ROOT/crates/apps/gwbasic"
 
 # Build the library
 if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
@@ -206,7 +206,7 @@ else
 fi
 
 # Build the executable binary with linker script for proper load address (0x400000)
-GWBASIC_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/gwbasic/linker.ld -C relocation-model=static"
+GWBASIC_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/gwbasic/linker.ld -C relocation-model=static"
 if RUSTFLAGS="$GWBASIC_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
@@ -232,16 +232,19 @@ else
 fi
 cd "$PROJECT_ROOT"
 
+# Create /apps/system directory for system utilities
+mkdir -p "$PROJECT_ROOT/rootfs/apps/system"
+mkdir -p "$PROJECT_ROOT/uefi_test/apps/system"
+
 # Build echo application
 log "Building echo for WATOS..."
-cd "$PROJECT_ROOT/crates/echo"
+cd "$PROJECT_ROOT/crates/apps/echo"
 
 if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
     --bin echo 2>&1; then
 
-    # Copy to rootfs and uefi_test
     if [ "$BUILD_TYPE" = "release" ]; then
         ECHO_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/echo"
     else
@@ -249,14 +252,68 @@ if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     fi
 
     if [ -f "$ECHO_BIN" ]; then
-        # Copy to rootfs root
-        cp "$ECHO_BIN" "$PROJECT_ROOT/rootfs/ECHO.EXE"
-        # Also copy to uefi_test for FAT filesystem boot
-        cp "$ECHO_BIN" "$PROJECT_ROOT/uefi_test/ECHO.EXE"
-        success "Echo binary built and copied to rootfs and uefi_test ($(du -h "$ECHO_BIN" | cut -f1))"
+        cp "$ECHO_BIN" "$PROJECT_ROOT/rootfs/apps/system/echo"
+        cp "$ECHO_BIN" "$PROJECT_ROOT/uefi_test/apps/system/echo"
+        success "echo built -> /apps/system/echo ($(du -h "$ECHO_BIN" | cut -f1))"
     fi
 else
-    echo -e "${YELLOW}[WARN]${NC} Echo binary build failed (optional)"
+    echo -e "${YELLOW}[WARN]${NC} echo build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build date application
+log "Building date for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/date"
+
+if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --no-default-features \
+    --bin date 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        DATE_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/date"
+    else
+        DATE_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/date"
+    fi
+
+    if [ -f "$DATE_BIN" ]; then
+        cp "$DATE_BIN" "$PROJECT_ROOT/rootfs/apps/system/date"
+        cp "$DATE_BIN" "$PROJECT_ROOT/uefi_test/apps/system/date"
+        success "date built -> /apps/system/date ($(du -h "$DATE_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} date build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build console/terminal application (TERM.EXE)
+log "Building console (TERM.EXE) for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/console"
+
+# Build with linker script for proper load address (0x400000)
+CONSOLE_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/console/linker.ld -C relocation-model=static"
+if RUSTFLAGS="$CONSOLE_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin console 2>&1; then
+
+    # Copy to rootfs and uefi_test
+    if [ "$BUILD_TYPE" = "release" ]; then
+        CONSOLE_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/console"
+    else
+        CONSOLE_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/console"
+    fi
+
+    if [ -f "$CONSOLE_BIN" ]; then
+        # Create SYSTEM folder for system apps
+        mkdir -p "$PROJECT_ROOT/rootfs/SYSTEM"
+        mkdir -p "$PROJECT_ROOT/uefi_test/SYSTEM"
+        # Copy as TERM.EXE - the terminal emulator (autostart)
+        cp "$CONSOLE_BIN" "$PROJECT_ROOT/rootfs/SYSTEM/TERM.EXE"
+        cp "$CONSOLE_BIN" "$PROJECT_ROOT/uefi_test/SYSTEM/TERM.EXE"
+        success "Console (SYSTEM/TERM.EXE) built and copied to rootfs and uefi_test ($(du -h "$CONSOLE_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} Console binary build failed (optional)"
 fi
 cd "$PROJECT_ROOT"
 
@@ -267,7 +324,7 @@ for app_dir in "$PROJECT_ROOT/crates"/*; do
         app_name=$(basename "$app_dir")
         
         # Skip already processed apps and non-WATOS crates
-        if [ "$app_name" = "gwbasic" ] || [ "$app_name" = "echo" ] || [ "$app_name" = "watos-syscall" ]; then
+        if [ "$app_name" = "gwbasic" ] || [ "$app_name" = "echo" ] || [ "$app_name" = "console" ] || [ "$app_name" = "watos-syscall" ]; then
             continue
         fi
         
@@ -337,18 +394,30 @@ fi
 
 echo ""
 echo "Built Applications:"
+if [ -f "$PROJECT_ROOT/rootfs/SYSTEM/TERM.EXE" ]; then
+    echo "  - SYSTEM/TERM.EXE  (Terminal emulator - autostart)"
+fi
 if [ -f "$PROJECT_ROOT/rootfs/GWBASIC.EXE" ]; then
     echo "  - GWBASIC.EXE      (GWBASIC interpreter)"
 fi
 if [ -f "$PROJECT_ROOT/rootfs/ECHO.EXE" ]; then
     echo "  - ECHO.EXE         (Echo utility)"
 fi
-# Show any other discovered applications
+# Show any other discovered applications in root
 for app_file in "$PROJECT_ROOT/rootfs"/*.EXE; do
     if [ -f "$app_file" ]; then
         app_filename=$(basename "$app_file")
         if [ "$app_filename" != "GWBASIC.EXE" ] && [ "$app_filename" != "ECHO.EXE" ]; then
             echo "  - $app_filename"
+        fi
+    fi
+done
+# Show SYSTEM folder apps
+for app_file in "$PROJECT_ROOT/rootfs/SYSTEM"/*.EXE; do
+    if [ -f "$app_file" ]; then
+        app_filename=$(basename "$app_file")
+        if [ "$app_filename" != "TERM.EXE" ]; then
+            echo "  - SYSTEM/$app_filename"
         fi
     fi
 done

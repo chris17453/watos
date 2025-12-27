@@ -1,0 +1,27 @@
+#![no_std]
+
+extern crate alloc;
+use core::panic::PanicInfo;
+
+
+pub mod interrupts;
+pub mod drivers;
+pub mod net;
+pub mod disk;
+pub mod runtime;
+pub mod process;
+pub mod console;
+pub mod io;
+pub mod globals;
+
+// Re-export from system crates
+pub use watos_arch::{gdt, tss};
+pub use watos_mem::paging as mmu;  // Alias for backward compatibility
+
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {
+        unsafe { core::arch::asm!("hlt") };
+    }
+}

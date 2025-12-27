@@ -1,0 +1,13 @@
+[package]
+name = "console-app"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS Console Application (user-space terminal)"
+
+[dependencies]
+watos-syscall = { path = "../../core/syscall", features = ["no-std"] }
+watos-terminal = { path = "../../sys/terminal" }
+
+[[bin]]
+name = "console"
+path = "src/main.rs"

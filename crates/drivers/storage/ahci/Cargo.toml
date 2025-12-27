@@ -1,0 +1,13 @@
+[package]
+name = "watos-driver-ahci"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS AHCI (SATA) driver"
+
+[dependencies]
+watos-driver-traits = { path = "../../traits" }
+watos-driver-pci = { path = "../../bus/pci" }
+
+[features]
+default = []
+debug = ["watos-driver-traits/debug-storage"]

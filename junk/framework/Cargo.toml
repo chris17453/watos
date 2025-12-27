@@ -1,0 +1,11 @@
+[package]
+name = "watos-driver-framework"
+version = "0.1.0"
+edition = "2021"
+description = "Driver abstraction layer for WATOS"
+
+[dependencies]
+spin = "0.5.2"
+
+[features]
+default = []

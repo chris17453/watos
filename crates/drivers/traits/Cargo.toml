@@ -1,0 +1,19 @@
+[package]
+name = "watos-driver-traits"
+version = "0.1.0"
+edition = "2021"
+description = "Hardware driver traits for WATOS"
+
+[features]
+default = []
+
+# Debug features - enable verbose logging for specific subsystems
+debug-all = ["debug-storage", "debug-network", "debug-input", "debug-video", "debug-audio", "debug-bus"]
+debug-storage = []
+debug-network = []
+debug-input = []
+debug-video = []
+debug-audio = []
+debug-bus = []
+
+[dependencies]

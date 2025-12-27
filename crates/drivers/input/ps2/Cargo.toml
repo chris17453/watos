@@ -1,0 +1,12 @@
+[package]
+name = "watos-driver-ps2"
+version = "0.1.0"
+edition = "2021"
+description = "PS/2 keyboard and mouse driver for WATOS"
+
+[dependencies]
+watos-driver-traits = { path = "../../traits" }
+
+[features]
+default = []
+debug = ["watos-driver-traits/debug-input"]

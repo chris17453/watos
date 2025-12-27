@@ -1,0 +1,13 @@
+[package]
+name = "watos-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal emulator for WATOS - no_std ANSI/VT100 compatible"
+
+[dependencies]
+bitflags = "2.6"
+
+[features]
+default = []
+alloc = []
+scrollback = ["alloc"]

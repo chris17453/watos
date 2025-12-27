@@ -1,0 +1,12 @@
+[package]
+name = "watos-process"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS Process Management"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+watos-mem = { path = "../../core/mem" }
+watos-arch = { path = "../../core/arch" }

@@ -1,0 +1,11 @@
+[package]
+name = "watos-network"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS Network Stack"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-raw", "alloc"] }

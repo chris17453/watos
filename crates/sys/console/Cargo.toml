@@ -1,0 +1,10 @@
+[package]
+name = "watos-console"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS Virtual Console System"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

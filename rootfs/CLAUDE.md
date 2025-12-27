@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-WATOS (DOS64) is a bare-metal 64-bit operating system kernel with UEFI bootloader, written in Rust. It provides a DOS-compatible command shell interface while running in 64-bit long mode.
+WATOS  is a bare-metal 64-bit operating system kernel with UEFI bootloader, written in Rust. It provides a DOS-compatible command shell interface while running in 64-bit long mode.
 
 ## Architecture
 
 ```
-UEFI Firmware -> BOOTX64.EFI (bootloader) -> kernel.bin (DOS64 kernel)
+UEFI Firmware -> BOOTX64.EFI (bootloader) -> kernel.bin 
 ```
 
 ### Key Components
@@ -79,7 +79,7 @@ See `ai-temp/CURRENT_TASK.md` for active development tasks.
 
 - Boot tests use QEMU with OVMF firmware
 - Serial output is captured to `ai-temp/logs/`
-- Tests look for "DOS64" or shell prompt in output
+- Tests look for "WATOS" or shell prompt in output
 - Default timeout is 30 seconds
 
 ## File Locations
