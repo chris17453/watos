@@ -240,7 +240,9 @@ mkdir -p "$PROJECT_ROOT/uefi_test/apps/system"
 log "Building echo for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/echo"
 
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+# Build with linker script for proper load address (0x1000000 = 16MB, avoids kernel at 0x100000)
+ECHO_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/echo/src/linker.ld -C relocation-model=static"
+if RUSTFLAGS="$ECHO_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
     --bin echo 2>&1; then
@@ -265,7 +267,9 @@ cd "$PROJECT_ROOT"
 log "Building date for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/date"
 
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+# Build with linker script for proper load address (0x1000000 = 16MB, avoids kernel at 0x100000)
+DATE_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/date/src/linker.ld -C relocation-model=static"
+if RUSTFLAGS="$DATE_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
     --bin date 2>&1; then

@@ -278,8 +278,14 @@ impl Elf64 {
             let file_size = phdr.filesz as usize;
             let mem_size = phdr.memsz as usize;
 
-            // Calculate virtual address with relocation
-            let virt_addr = load_base + (phdr.vaddr - min_vaddr);
+            // Calculate virtual address:
+            // - For PIE: relocate relative to load_base
+            // - For non-PIE: use original vaddr (code has absolute addresses)
+            let virt_addr = if self.is_pie {
+                load_base + (phdr.vaddr - min_vaddr)
+            } else {
+                phdr.vaddr
+            };
 
             unsafe {
                 debug_serial(b"  segment: vaddr=0x");
@@ -400,6 +406,33 @@ impl Elf64 {
                                 debug_hex(*(dest as *const u64));
                                 debug_serial(b"\r\n");
                             }
+                        }
+                    }
+                }
+
+                // Zero BSS portion: memory beyond file_size up to mem_size
+                // This handles the case where memsz > filesz (.bss section)
+                if mem_size > file_size {
+                    // Calculate what BSS portion falls in this page
+                    let bss_start_in_seg = file_size as u64;
+                    let bss_end_in_seg = mem_size as u64;
+
+                    // This page covers segment offsets from page_offset to page_offset + PAGE_SIZE
+                    let page_end_offset = page_offset + (PAGE_SIZE - dest_in_page) as u64;
+
+                    // BSS in this page: overlap of [bss_start_in_seg, bss_end_in_seg) and [page_offset, page_end_offset)
+                    let bss_in_page_start = bss_start_in_seg.max(page_offset);
+                    let bss_in_page_end = bss_end_in_seg.min(page_end_offset);
+
+                    if bss_in_page_end > bss_in_page_start {
+                        let zero_offset_in_page = dest_in_page + (bss_in_page_start - page_offset) as usize;
+                        let zero_len = (bss_in_page_end - bss_in_page_start) as usize;
+                        unsafe {
+                            core::ptr::write_bytes(
+                                (phys_page as *mut u8).add(zero_offset_in_page),
+                                0,
+                                zero_len
+                            );
                         }
                     }
                 }

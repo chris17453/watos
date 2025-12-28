@@ -111,11 +111,11 @@ fn exit(code: i32) -> ! {
     loop {}
 }
 
-/// Execute a program by name
+/// Execute a program with the full command line
 /// Returns: 0 on success, 1 on exec error, 2 on not found
-fn exec_program(name: &str) -> u64 {
+fn exec_program(cmdline: &str) -> u64 {
     unsafe {
-        syscall2(syscall::SYS_EXEC, name.as_ptr() as u64, name.len() as u64)
+        syscall2(syscall::SYS_EXEC, cmdline.as_ptr() as u64, cmdline.len() as u64)
     }
 }
 
@@ -344,8 +344,10 @@ extern "C" fn _start() -> ! {
             }
         }
 
-        // Update cursor blink
-        console.tick();
+        // Update cursor blink and re-render if needed
+        if console.tick() {
+            console.render(&mut framebuffer);
+        }
     }
 }
 
@@ -399,12 +401,13 @@ fn process_command(console: &mut ConsoleManager, cmd: &str) {
         }
         "" => {}
         _ => {
-            // Try to execute as external program
+            // Try to execute as external program with full command line
             serial_write("[CONSOLE] Executing: ");
-            serial_write(program);
+            serial_write(cmd);
             serial_write("\r\n");
 
-            let result = exec_program(program);
+            // Pass full command line (program + args) to exec
+            let result = exec_program(cmd);
 
             // Debug: confirm we returned from exec
             serial_write("[CONSOLE] exec returned: ");

@@ -178,8 +178,8 @@ pub extern "C" fn _start() -> ! {
                     info.init_app_size as usize,
                 );
 
-                // Execute the app
-                match watos_process::exec("TERM.EXE", app_data) {
+                // Execute the app (no arguments for initial terminal)
+                match watos_process::exec("TERM.EXE", app_data, "TERM.EXE") {
                     Ok(pid) => {
                         watos_arch::serial_write(b"[KERNEL] TERM.EXE running as PID ");
                         watos_arch::serial_hex(pid as u64);
@@ -234,6 +234,7 @@ mod syscall {
 
     // Process execution
     pub const SYS_EXEC: u64 = 80;
+    pub const SYS_GETARGS: u64 = 83;
 
     // Date/Time
     pub const SYS_GETDATE: u64 = 90;
@@ -313,12 +314,11 @@ extern "C" fn handle_syscall_inner(num: u64, arg1: u64, arg2: u64, arg3: u64, re
 fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, return_rsp: u64) -> u64 {
     match num {
         syscall::SYS_EXIT => {
-            unsafe { watos_arch::serial_write(b"[SYSCALL] Exit\r\n"); }
             // Check if there's a parent process to return to
             if watos_process::has_parent_context() {
-                unsafe { watos_arch::serial_write(b"[SYSCALL] Returning to parent\r\n"); }
                 watos_process::resume_parent(); // Never returns
             }
+            // No parent - top-level process exiting, halt
             loop { watos_arch::halt(); }
         }
 
@@ -448,34 +448,26 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         }
 
         syscall::SYS_EXEC => {
-            // arg1 = pointer to program name string
-            // arg2 = length of program name
+            // arg1 = pointer to full command line string
+            // arg2 = length of command line
             // Returns: 0 on success, non-zero on error
-            let name_ptr = arg1 as *const u8;
-            let name_len = arg2 as usize;
+            let cmdline_ptr = arg1 as *const u8;
+            let cmdline_len = arg2 as usize;
 
-            if name_ptr.is_null() || name_len == 0 || name_len > 64 {
+            if cmdline_ptr.is_null() || cmdline_len == 0 || cmdline_len > 256 {
                 return u64::MAX; // Invalid args
             }
 
-            let name_slice = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+            let cmdline = unsafe { core::slice::from_raw_parts(cmdline_ptr, cmdline_len) };
 
-            unsafe {
-                watos_arch::serial_write(b"[KERNEL] SYS_EXEC: ");
-                watos_arch::serial_write(name_slice);
-                watos_arch::serial_write(b"\r\n");
-            }
+            // Extract program name (first word before space)
+            let program_name = {
+                let space_pos = cmdline.iter().position(|&c| c == b' ').unwrap_or(cmdline_len);
+                &cmdline[..space_pos]
+            };
 
             // Find the app in preloaded apps table
-            if let Some((addr, size)) = find_preloaded_app(name_slice) {
-                unsafe {
-                    watos_arch::serial_write(b"[KERNEL] Found app at 0x");
-                    watos_arch::serial_hex(addr);
-                    watos_arch::serial_write(b" size=");
-                    watos_arch::serial_hex(size);
-                    watos_arch::serial_write(b"\r\n");
-                }
-
+            if let Some((addr, size)) = find_preloaded_app(program_name) {
                 // Get the app data slice
                 let app_data = unsafe {
                     core::slice::from_raw_parts(addr as *const u8, size as usize)
@@ -484,25 +476,59 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 // Save parent context with actual return address so we can return after child exits
                 watos_process::save_parent_context_with_frame(return_rip, return_rsp);
 
-                // Execute the app (child will run, then SYS_EXIT will return here)
-                match watos_process::exec(
-                    core::str::from_utf8(name_slice).unwrap_or("app"),
-                    app_data,
-                ) {
+                // Execute the app with the full command line as args
+                let cmdline_str = core::str::from_utf8(cmdline).unwrap_or("");
+                let program_str = core::str::from_utf8(program_name).unwrap_or("app");
+
+                match watos_process::exec(program_str, app_data, cmdline_str) {
                     Ok(_pid) => 0, // Success
-                    Err(_) => {
-                        unsafe { watos_arch::serial_write(b"[KERNEL] exec failed\r\n"); }
+                    Err(e) => {
+                        unsafe {
+                            watos_arch::serial_write(b"[KERNEL] exec failed: ");
+                            watos_arch::serial_write(e.as_bytes());
+                            watos_arch::serial_write(b"\r\n");
+                        }
                         1 // Error
                     }
                 }
             } else {
                 unsafe {
                     watos_arch::serial_write(b"[KERNEL] App not found: ");
-                    watos_arch::serial_write(name_slice);
+                    watos_arch::serial_write(program_name);
                     watos_arch::serial_write(b"\r\n");
                 }
                 2 // Not found
             }
+        }
+
+        syscall::SYS_GETARGS => {
+            // arg1 = buffer pointer
+            // arg2 = buffer size
+            // Returns: number of bytes copied
+            unsafe {
+                watos_arch::serial_write(b"[KERNEL] SYS_GETARGS: buf=0x");
+                watos_arch::serial_hex(arg1);
+                watos_arch::serial_write(b" size=");
+                watos_arch::serial_hex(arg2);
+                watos_arch::serial_write(b"\r\n");
+            }
+
+            let buf_ptr = arg1 as *mut u8;
+            let buf_size = arg2 as usize;
+
+            if buf_ptr.is_null() || buf_size == 0 {
+                unsafe { watos_arch::serial_write(b"[KERNEL] SYS_GETARGS: invalid buffer\r\n"); }
+                return 0;
+            }
+
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_size) };
+            let copied = watos_process::get_current_args(buf);
+            unsafe {
+                watos_arch::serial_write(b"[KERNEL] SYS_GETARGS: copied ");
+                watos_arch::serial_hex(copied as u64);
+                watos_arch::serial_write(b" bytes\r\n");
+            }
+            copied as u64
         }
 
         syscall::SYS_GETDATE => {

@@ -269,9 +269,28 @@ impl ProcessPageTable {
         let pd_phys = pdp.get_entry(pdp_idx) & flags::ADDR_MASK;
         let pd = unsafe { &mut *(pd_phys as *mut PageTable) };
 
-        // Ensure PT exists - add USER flag if needed
+        // Ensure PT exists - handle huge pages specially
+        let pd_entry = pd.get_entry(pd_idx);
         if !pd.is_present(pd_idx) {
             let pt = self.allocate_table();
+            pd.set_entry(pd_idx, pt as u64 | hier_flags);
+        } else if (pd_entry & flags::HUGE_PAGE) != 0 {
+            // Split huge page (2MB) into 512 x 4KB pages
+            // Get the physical base address of the huge page
+            let huge_phys_base = pd_entry & flags::ADDR_MASK;
+            let old_flags = pd_entry & !flags::ADDR_MASK & !flags::HUGE_PAGE;
+
+            // Allocate a new page table
+            let pt = self.allocate_table();
+            let pt_ptr = unsafe { &mut *(pt as *mut PageTable) };
+
+            // Map all 512 4KB pages to match the original huge page
+            for i in 0..512 {
+                let page_phys = huge_phys_base + (i as u64 * PAGE_SIZE as u64);
+                pt_ptr.set_entry(i, page_phys | old_flags);
+            }
+
+            // Replace the huge page entry with the PT pointer
             pd.set_entry(pd_idx, pt as u64 | hier_flags);
         } else if is_user_page {
             let entry = pd.get_entry(pd_idx);

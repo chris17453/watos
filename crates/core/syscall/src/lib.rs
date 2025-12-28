@@ -75,6 +75,7 @@ pub mod numbers {
     pub const SYS_EXEC: u32 = 80;          // Execute program (replace current process)
     pub const SYS_SPAWN: u32 = 81;         // Spawn new process
     pub const SYS_WAIT: u32 = 82;          // Wait for child process
+    pub const SYS_GETARGS: u32 = 83;       // Get command line arguments (copies to buffer)
 
     // Date/Time
     pub const SYS_GETDATE: u32 = 90;       // Get current date (year, month, day)

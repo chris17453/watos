@@ -180,6 +180,7 @@ pub enum ProcessState {
 pub struct Process {
     pub id: u32,
     pub name: String,
+    pub args: String,  // Command line arguments
     pub state: ProcessState,
     pub entry_point: u64,
     pub stack_top: u64,
@@ -245,23 +246,21 @@ pub fn save_parent_context_with_frame(return_rip: u64, return_rsp: u64) {
             if let Some(proc) = PROCESSES.iter().find_map(|p| p.as_ref().filter(|p| p.id == pid)) {
                 let user_cs = watos_arch::gdt::selectors::USER_CODE as u64;
                 let user_ss = watos_arch::gdt::selectors::USER_DATA as u64;
+                let parent_pml4 = proc.page_table.pml4_phys_addr();
 
                 PARENT_CONTEXT = SavedContext {
                     valid: true,
                     parent_pid: pid,
-                    parent_pml4: proc.page_table.pml4_phys_addr(),
+                    parent_pml4,
                     rip: return_rip,
                     cs: user_cs,
                     rflags: 0x202, // IF set
                     rsp: return_rsp,
                     ss: user_ss,
                 };
+
                 debug_serial(b"[PROCESS] Saved parent context, PID=");
                 debug_hex(pid as u64);
-                debug_serial(b" RIP=0x");
-                debug_hex(return_rip);
-                debug_serial(b" RSP=0x");
-                debug_hex(return_rsp);
                 debug_serial(b"\r\n");
             }
         }
@@ -303,7 +302,7 @@ pub fn has_parent_context() -> bool {
 pub fn resume_parent() -> ! {
     unsafe {
         if !PARENT_CONTEXT.valid {
-            debug_serial(b"[PROCESS] No parent to resume, halting\r\n");
+            debug_serial(b"[PROCESS] ERROR: No parent to resume, halting\r\n");
             loop { core::arch::asm!("hlt"); }
         }
 
@@ -313,10 +312,6 @@ pub fn resume_parent() -> ! {
 
         debug_serial(b"[PROCESS] Resuming parent PID=");
         debug_hex(ctx.parent_pid as u64);
-        debug_serial(b" PML4=0x");
-        debug_hex(ctx.parent_pml4);
-        debug_serial(b" RIP=0x");
-        debug_hex(ctx.rip);
         debug_serial(b"\r\n");
 
         // Restore parent's kernel stack for interrupts
@@ -331,7 +326,6 @@ pub fn resume_parent() -> ! {
         let user_ds = watos_arch::gdt::selectors::USER_DATA as u64;
 
         // Return to parent with exec success (RAX = 0)
-        // Use the saved interrupt frame values
         core::arch::asm!(
             // Set up segments
             "mov ax, {ds:x}",
@@ -371,25 +365,23 @@ fn allocate_process_memory(pid: u32) -> (u64, u64, u64) {
 }
 
 /// Load and execute an ELF64 binary
-pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
+/// args is the full command line (program name + arguments)
+pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
+    // CRITICAL: Copy name and args BEFORE switching page tables!
+    // The strings may point to user space which becomes invalid after CR3 switch.
+    let name_copy = String::from(name);
+    let args_copy = String::from(args);
+
     // CRITICAL: Switch to kernel page table before loading
     // When called from user process, CR3 points to that process's page table
     // which only has limited mappings. Kernel's UEFI page table has full identity map.
     unsafe {
         if KERNEL_PML4 != 0 {
-            debug_serial(b"exec: switching to kernel page table for loading...\r\n");
             watos_mem::paging::load_cr3(KERNEL_PML4);
         }
-        debug_serial(b"exec: parsing ELF...\r\n");
     }
 
     let elf = elf::Elf64::parse(data)?;
-
-    unsafe {
-        debug_serial(b"exec: ELF parsed, entry=0x");
-        debug_hex(elf.entry);
-        debug_serial(b"\r\n");
-    }
 
     let pid = unsafe {
         let p = NEXT_PID;
@@ -399,92 +391,15 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
 
     let (load_base, stack_top, heap_base) = allocate_process_memory(pid);
 
-    unsafe {
-        debug_serial(b"exec: load_base=0x");
-        debug_hex(load_base);
-        debug_serial(b" stack=0x");
-        debug_hex(stack_top);
-        debug_serial(b"\r\n");
-    }
-
-    unsafe { debug_serial(b"exec: creating page table...\r\n"); }
     let mut page_table = ProcessPageTable::new();
-
-    unsafe { debug_serial(b"exec: loading segments...\r\n"); }
     elf.load_segments_protected(data, load_base, &mut page_table)?;
-    unsafe {
-        debug_serial(b"exec: segments loaded\r\n");
-        // Debug: walk page table to find physical address for virtual 0x102B050
-        // and verify the GOT content
-        let virt_got = 0x102B050_u64;
-        let pml4_idx = ((virt_got >> 39) & 0x1FF) as usize;
-        let pdp_idx = ((virt_got >> 30) & 0x1FF) as usize;
-        let pd_idx = ((virt_got >> 21) & 0x1FF) as usize;
-        let pt_idx = ((virt_got >> 12) & 0x1FF) as usize;
-
-        debug_serial(b"exec: GOT virt 0x102B050 -> indices: pml4=");
-        debug_hex(pml4_idx as u64);
-        debug_serial(b" pdp=");
-        debug_hex(pdp_idx as u64);
-        debug_serial(b" pd=");
-        debug_hex(pd_idx as u64);
-        debug_serial(b" pt=");
-        debug_hex(pt_idx as u64);
-        debug_serial(b"\r\n");
-
-        // Walk the page table
-        let pml4_phys = page_table.pml4_phys_addr();
-        let pml4_ptr = pml4_phys as *const u64;
-        let pml4_entry = *pml4_ptr.add(pml4_idx);
-        if pml4_entry & 1 != 0 {
-            let pdp_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
-            let pdp_ptr = pdp_phys as *const u64;
-            let pdp_entry = *pdp_ptr.add(pdp_idx);
-            if pdp_entry & 1 != 0 {
-                let pd_phys = pdp_entry & 0x000F_FFFF_FFFF_F000;
-                let pd_ptr = pd_phys as *const u64;
-                let pd_entry = *pd_ptr.add(pd_idx);
-                if pd_entry & 1 != 0 && (pd_entry & 0x80) == 0 {
-                    // Not a huge page, follow to PT
-                    let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
-                    let pt_ptr = pt_phys as *const u64;
-                    let pt_entry = *pt_ptr.add(pt_idx);
-                    debug_serial(b"exec: PT[43]=0x");
-                    debug_hex(pt_entry);
-                    if pt_entry & 1 != 0 {
-                        let page_phys = pt_entry & 0x000F_FFFF_FFFF_F000;
-                        let got_phys = page_phys + (virt_got & 0xFFF);
-                        debug_serial(b" -> phys=0x");
-                        debug_hex(got_phys);
-                        let got_val = *(got_phys as *const u64);
-                        debug_serial(b" val=0x");
-                        debug_hex(got_val);
-                    }
-                    debug_serial(b"\r\n");
-                }
-            }
-        }
-    }
 
     // Map stack with guard pages for overflow detection
     // Stack layout: [GUARD PAGE] [STACK PAGES...] [TOP]
     // Guard page is mapped but NOT present - accessing it causes page fault
-    unsafe { debug_serial(b"exec: mapping stack with guard...\r\n"); }
     let stack_pages = PROCESS_STACK_SIZE / PAGE_SIZE as u64;
     let stack_base = stack_top - PROCESS_STACK_SIZE;
     let guard_page = stack_base - PAGE_SIZE as u64;
-
-    // Store stack info for auto-growth (guard page address marks stack limit)
-    // We'll use this in the page fault handler
-    unsafe {
-        debug_serial(b"  stack: base=0x");
-        debug_hex(stack_base);
-        debug_serial(b" top=0x");
-        debug_hex(stack_top);
-        debug_serial(b" guard=0x");
-        debug_hex(guard_page);
-        debug_serial(b"\r\n");
-    }
 
     for i in 0..stack_pages {
         let virt_addr = stack_top - (i as u64 + 1) * PAGE_SIZE as u64;
@@ -496,18 +411,14 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
     }
 
     // Map guard page as NOT PRESENT - will trigger page fault on stack overflow
-    // This gives us a clear error instead of silent corruption
-    page_table.map_user_page(guard_page, 0, 0)?; // No flags = not present
+    page_table.map_user_page(guard_page, 0, 0)?;
 
-    unsafe { debug_serial(b"exec: mapping heap...\r\n"); }
     // Allocate a reasonable initial heap (256KB)
-    let heap_pages = 64u64; // 64 pages * 4KB = 256KB initial heap
+    let heap_pages = 64u64;
     for i in 0..heap_pages {
         let virt_addr = heap_base + i * PAGE_SIZE as u64;
-        // Allocate fresh physical page for heap
         let phys_addr = watos_mem::phys::alloc_page()
             .ok_or("Out of physical memory for heap")? as u64;
-        // Zero the heap page
         unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
         page_table.map_user_page(virt_addr, phys_addr,
             page_flags::PRESENT | page_flags::WRITABLE)?;
@@ -518,10 +429,16 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
         .map(|p| p.vaddr)
         .min()
         .unwrap_or(0);
-    let entry = load_base + (elf.entry - min_vaddr);
+
+    // For non-PIE: use ELF entry directly (absolute address)
+    // For PIE: relocate entry relative to load_base
+    let entry = if elf.is_pie {
+        load_base + (elf.entry - min_vaddr)
+    } else {
+        elf.entry
+    };
 
     // Map framebuffer for user access (from boot info at 0x80000)
-    // The framebuffer is typically at ~2GB (0x80000000) with size ~4MB
     unsafe {
         let boot_info = &*(0x80000 as *const BootInfo);
         if boot_info.magic == 0x5741544F && boot_info.framebuffer_addr != 0 {
@@ -529,27 +446,18 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
             let fb_size = (boot_info.framebuffer_pitch * boot_info.framebuffer_height) as u64;
             let fb_pages = (fb_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
 
-            debug_serial(b"exec: mapping framebuffer at 0x");
-            debug_hex(fb_addr);
-            debug_serial(b" (");
-            debug_hex(fb_pages);
-            debug_serial(b" pages)\r\n");
-
-            // Map in chunks to reduce debugging output
             for i in 0..fb_pages {
                 let addr = fb_addr + i * PAGE_SIZE as u64;
-                // Map framebuffer with USER + WRITABLE flags
-                // Use map_4k_page directly since map_user_page rejects addresses > USER_SPACE_MAX
                 page_table.map_4k_page(addr, addr,
                     page_flags::PRESENT | page_flags::WRITABLE | page_flags::USER);
             }
-            debug_serial(b"exec: framebuffer mapped OK\r\n");
         }
     }
 
     let process = Process {
         id: pid,
-        name: String::from(name),
+        name: name_copy,
+        args: args_copy.clone(),
         state: ProcessState::Ready,
         entry_point: entry,
         stack_top,
@@ -558,6 +466,15 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
         page_table,
         handle_table: HandleTable::new(),
     };
+
+    // Debug: show what args are being stored
+    unsafe {
+        debug_serial(b"[PROCESS] exec: storing args='");
+        debug_serial(args_copy.as_bytes());
+        debug_serial(b"' len=");
+        debug_hex(args_copy.len() as u64);
+        debug_serial(b"\r\n");
+    }
 
     unsafe {
         for slot in PROCESSES.iter_mut() {
@@ -903,6 +820,37 @@ pub fn current_handle_table() -> Option<&'static mut HandleTable> {
             }
         }
         None
+    }
+}
+
+/// Get the arguments for the current process
+/// Returns the number of bytes copied into the buffer
+pub fn get_current_args(buf: &mut [u8]) -> usize {
+    unsafe {
+        debug_serial(b"[PROCESS] get_current_args: CURRENT_PROCESS=");
+        if let Some(pid) = CURRENT_PROCESS {
+            debug_hex(pid as u64);
+            debug_serial(b"\r\n");
+            for slot in PROCESSES.iter() {
+                if let Some(ref p) = slot {
+                    if p.id == pid {
+                        let args = p.args.as_bytes();
+                        debug_serial(b"[PROCESS] Found process args='");
+                        debug_serial(args);
+                        debug_serial(b"' len=");
+                        debug_hex(args.len() as u64);
+                        debug_serial(b"\r\n");
+                        let copy_len = args.len().min(buf.len());
+                        buf[..copy_len].copy_from_slice(&args[..copy_len]);
+                        return copy_len;
+                    }
+                }
+            }
+            debug_serial(b"[PROCESS] Process not found in table!\r\n");
+        } else {
+            debug_serial(b"None\r\n");
+        }
+        0
     }
 }
 

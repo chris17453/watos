@@ -161,9 +161,9 @@ impl ConsoleManager {
         }
     }
 
-    /// Update cursor blink
-    pub fn tick(&mut self) {
-        self.renderer.tick_cursor();
+    /// Update cursor blink, returns true if visibility changed
+    pub fn tick(&mut self) -> bool {
+        self.renderer.tick_cursor()
     }
 
     /// Resize all consoles
