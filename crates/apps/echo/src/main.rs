@@ -80,27 +80,12 @@ fn exit(code: i32) -> ! {
 /// Entry point for WATOS applications
 #[no_mangle]
 extern "C" fn _start() -> ! {
-    // Debug: show we started
-    write_str("[ECHO] Starting\r\n");
-
-    // Buffer for command line args - use static to avoid stack issues
+    // Buffer for command line args
     static mut ARGS_BUF: [u8; 256] = [0u8; 256];
 
-    write_str("[ECHO] Getting args\r\n");
     let args_len = unsafe { get_args(&mut ARGS_BUF) };
 
-    write_str("[ECHO] Got args, len=");
-    // Print length as single digit for simplicity
-    if args_len < 10 {
-        let digit = b'0' + args_len as u8;
-        write_bytes(&[digit]);
-    } else {
-        write_str("10+");
-    }
-    write_str("\r\n");
-
     if args_len > 0 {
-        // Find the arguments after the program name
         let args = unsafe { &ARGS_BUF[..args_len] };
 
         // Skip the program name (first word) and the space after it
@@ -119,10 +104,7 @@ extern "C" fn _start() -> ! {
         }
     }
 
-    // Print newline
     write_str("\r\n");
-
-    write_str("[ECHO] Exiting\r\n");
     exit(0);
 }
 

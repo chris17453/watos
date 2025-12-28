@@ -290,6 +290,106 @@ else
 fi
 cd "$PROJECT_ROOT"
 
+# Build clear application
+log "Building clear for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/clear"
+
+CLEAR_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$CLEAR_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin clear 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        CLEAR_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/clear"
+    else
+        CLEAR_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/clear"
+    fi
+
+    if [ -f "$CLEAR_BIN" ]; then
+        cp "$CLEAR_BIN" "$PROJECT_ROOT/rootfs/apps/system/clear"
+        cp "$CLEAR_BIN" "$PROJECT_ROOT/uefi_test/apps/system/clear"
+        success "clear built -> /apps/system/clear ($(du -h "$CLEAR_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} clear build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build uname application
+log "Building uname for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/uname"
+
+UNAME_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$UNAME_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin uname 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        UNAME_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/uname"
+    else
+        UNAME_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/uname"
+    fi
+
+    if [ -f "$UNAME_BIN" ]; then
+        cp "$UNAME_BIN" "$PROJECT_ROOT/rootfs/apps/system/uname"
+        cp "$UNAME_BIN" "$PROJECT_ROOT/uefi_test/apps/system/uname"
+        success "uname built -> /apps/system/uname ($(du -h "$UNAME_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} uname build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build uptime application
+log "Building uptime for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/uptime"
+
+UPTIME_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$UPTIME_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin uptime 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        UPTIME_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/uptime"
+    else
+        UPTIME_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/uptime"
+    fi
+
+    if [ -f "$UPTIME_BIN" ]; then
+        cp "$UPTIME_BIN" "$PROJECT_ROOT/rootfs/apps/system/uptime"
+        cp "$UPTIME_BIN" "$PROJECT_ROOT/uefi_test/apps/system/uptime"
+        success "uptime built -> /apps/system/uptime ($(du -h "$UPTIME_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} uptime build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build ps application
+log "Building ps for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/ps"
+
+PS_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$PS_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin ps 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        PS_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/ps"
+    else
+        PS_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/ps"
+    fi
+
+    if [ -f "$PS_BIN" ]; then
+        cp "$PS_BIN" "$PROJECT_ROOT/rootfs/apps/system/ps"
+        cp "$PS_BIN" "$PROJECT_ROOT/uefi_test/apps/system/ps"
+        success "ps built -> /apps/system/ps ($(du -h "$PS_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} ps build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
 # Build console/terminal application (TERM.EXE)
 log "Building console (TERM.EXE) for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/console"

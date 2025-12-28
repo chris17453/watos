@@ -166,6 +166,15 @@ impl ConsoleManager {
         self.renderer.tick_cursor()
     }
 
+    /// Redraw just the cursor cell (for efficient cursor blinking)
+    pub fn render_cursor<F: Framebuffer>(&mut self, fb: &mut F) {
+        if let Some(term) = &self.terminals[self.active] {
+            let (col, row) = term.cursor();
+            let grid = &term.grid;
+            self.renderer.render_cursor_cell(fb, col, row, grid);
+        }
+    }
+
     /// Resize all consoles
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.cols = cols;

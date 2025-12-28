@@ -18,10 +18,12 @@ pub const FONT_HEIGHT: u32 = 16;
 pub struct Renderer {
     /// Cursor blink state
     cursor_visible: bool,
-    /// Cursor blink counter
+    /// Cursor blink counter (unused, kept for ABI compatibility)
     cursor_blink_count: u32,
-    /// Frames per cursor blink toggle
+    /// Frames per cursor blink toggle (unused, kept for ABI compatibility)
     cursor_blink_rate: u32,
+    /// Last rendered cursor position (col, row) - for clearing old cursor
+    last_cursor_pos: Option<(usize, usize)>,
 }
 
 impl Renderer {
@@ -30,7 +32,8 @@ impl Renderer {
         Self {
             cursor_visible: true,
             cursor_blink_count: 0,
-            cursor_blink_rate: 30, // Toggle every 30 frames (~0.5s at 60fps)
+            cursor_blink_rate: 30,
+            last_cursor_pos: None,
         }
     }
 
@@ -54,14 +57,28 @@ impl Renderer {
                 self.render_cursor(fb, cx, cy, grid);
             }
         }
+
+        // Track cursor position
+        self.last_cursor_pos = cursor;
     }
 
     /// Render only dirty rows
     pub fn render_dirty<F: Framebuffer>(&mut self, fb: &mut F, grid: &mut Grid, cursor: Option<(usize, usize)>) {
         if grid.needs_full_redraw() {
             self.render_full(fb, grid, cursor);
+            self.last_cursor_pos = cursor;
             grid.mark_all_clean();
             return;
+        }
+
+        // Clear old cursor position if it changed
+        if let Some((old_col, old_row)) = self.last_cursor_pos {
+            if cursor != self.last_cursor_pos {
+                // Redraw the old cursor cell without cursor
+                if let Some(cell) = grid.get(old_col, old_row) {
+                    self.render_cell(fb, old_col, old_row, cell);
+                }
+            }
         }
 
         // Render dirty rows
@@ -76,12 +93,15 @@ impl Renderer {
             }
         }
 
-        // Render cursor
+        // Render cursor at new position
         if let Some((cx, cy)) = cursor {
             if self.cursor_visible {
                 self.render_cursor(fb, cx, cy, grid);
             }
         }
+
+        // Update last cursor position
+        self.last_cursor_pos = cursor;
     }
 
     /// Render a single cell
@@ -153,16 +173,33 @@ impl Renderer {
         fb.fill_rect(x, y + FONT_HEIGHT - 2, FONT_WIDTH, 2, fg);
     }
 
-    /// Update cursor blink state, returns true if cursor visibility changed
+    /// Toggle cursor visibility (call this at blink interval)
     pub fn tick_cursor(&mut self) -> bool {
-        self.cursor_blink_count += 1;
-        if self.cursor_blink_count >= self.cursor_blink_rate {
-            self.cursor_blink_count = 0;
-            self.cursor_visible = !self.cursor_visible;
-            true
-        } else {
-            false
+        self.cursor_visible = !self.cursor_visible;
+        true // Always returns true since we always toggle
+    }
+
+    /// Redraw just the cursor cell (for efficient cursor blinking)
+    pub fn render_cursor_cell<F: Framebuffer>(&mut self, fb: &mut F, col: usize, row: usize, grid: &Grid) {
+        // Clear old cursor position if different
+        if let Some((old_col, old_row)) = self.last_cursor_pos {
+            if old_col != col || old_row != row {
+                if let Some(cell) = grid.get(old_col, old_row) {
+                    self.render_cell(fb, old_col, old_row, cell);
+                }
+            }
         }
+
+        // Redraw the cell content first
+        if let Some(cell) = grid.get(col, row) {
+            self.render_cell(fb, col, row, cell);
+        }
+        // Then draw cursor on top if visible
+        if self.cursor_visible {
+            self.render_cursor(fb, col, row, grid);
+        }
+
+        self.last_cursor_pos = Some((col, row));
     }
 
     /// Force cursor visible

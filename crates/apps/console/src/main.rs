@@ -98,6 +98,10 @@ fn read_scancode() -> u8 {
     unsafe { syscall0(syscall::SYS_READ_SCANCODE) as u8 }
 }
 
+fn get_ticks() -> u64 {
+    unsafe { syscall0(syscall::SYS_GETTICKS) }
+}
+
 fn serial_write(s: &str) {
     unsafe {
         syscall3(syscall::SYS_WRITE, 0, s.as_ptr() as u64, s.len() as u64);
@@ -241,8 +245,21 @@ extern "C" fn _start() -> ! {
     // Buffer for reading kernel console output
     let mut console_buf = [0u8; 256];
 
+    // Cursor blink timer (PIT runs at ~18.2 Hz, so ~9 ticks = ~500ms)
+    let mut last_blink_tick = get_ticks();
+    const BLINK_INTERVAL: u64 = 9; // ~500ms at 18.2 Hz
+
     // Main loop
     loop {
+        // Check if it's time to blink cursor
+        let current_tick = get_ticks();
+        if current_tick.wrapping_sub(last_blink_tick) >= BLINK_INTERVAL {
+            last_blink_tick = current_tick;
+            if console.tick() {
+                // Only redraw the cursor cell, not the whole screen
+                console.render_cursor(&mut framebuffer);
+            }
+        }
         // Poll for any output from kernel console buffer (from child processes)
         let bytes_read = read_console_output(&mut console_buf);
         if bytes_read > 0 {
@@ -292,6 +309,20 @@ extern "C" fn _start() -> ! {
                                     serial_write("\r\n");
                                     process_command(&mut console, cmd);
                                     cmd_len = 0;
+
+                                    // Drain any pending output from the command before showing prompt
+                                    loop {
+                                        let bytes = read_console_output(&mut console_buf);
+                                        if bytes == 0 {
+                                            break;
+                                        }
+                                        if let Ok(s) = core::str::from_utf8(&console_buf[..bytes]) {
+                                            console.write_str(s);
+                                        } else {
+                                            console.write(&console_buf[..bytes]);
+                                        }
+                                    }
+                                    console.render(&mut framebuffer);
                                 }
 
                                 console.write_str("> ");
@@ -342,11 +373,6 @@ extern "C" fn _start() -> ! {
                 // Render after input
                 console.render(&mut framebuffer);
             }
-        }
-
-        // Update cursor blink and re-render if needed
-        if console.tick() {
-            console.render(&mut framebuffer);
         }
     }
 }

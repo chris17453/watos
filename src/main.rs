@@ -130,6 +130,9 @@ pub extern "C" fn _start() -> ! {
     let kernel_stack = HEAP_START as u64 + HEAP_SIZE as u64;
     watos_arch::init(kernel_stack);
 
+    // Enable timer interrupt (IRQ0) for tick counter
+    watos_arch::pic::enable_timer();
+
     unsafe { watos_arch::serial_write(b"WATOS kernel started\r\n"); }
 
     // 3. Copy boot info
@@ -231,6 +234,9 @@ mod syscall {
 
     // Raw keyboard
     pub const SYS_READ_SCANCODE: u64 = 60;
+
+    // Process management
+    pub const SYS_GETPID: u64 = 12;
 
     // Process execution
     pub const SYS_EXEC: u64 = 80;
@@ -529,6 +535,11 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 watos_arch::serial_write(b" bytes\r\n");
             }
             copied as u64
+        }
+
+        syscall::SYS_GETPID => {
+            // Returns current process ID
+            watos_process::current_pid().unwrap_or(0) as u64
         }
 
         syscall::SYS_GETDATE => {

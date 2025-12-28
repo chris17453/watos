@@ -60,6 +60,10 @@ members = [
     "crates/apps/echo",
     "crates/apps/console",
     "crates/apps/date",
+    "crates/apps/clear",
+    "crates/apps/uname",
+    "crates/apps/uptime",
+    "crates/apps/ps",
 ]
 exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
 

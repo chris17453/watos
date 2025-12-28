@@ -251,6 +251,13 @@ impl Grid {
         self.full_redraw = true;
     }
 
+    /// Mark a specific row as dirty
+    pub fn mark_row_dirty(&mut self, row: usize) {
+        if row < self.rows {
+            self.dirty[row] = true;
+        }
+    }
+
     /// Set default colors for new cells
     pub fn set_default_colors(&mut self, fg: Color, bg: Color) {
         self.default_fg = fg;
