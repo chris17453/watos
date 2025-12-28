@@ -70,6 +70,9 @@ pub mod numbers {
     pub const SYS_RENAME: u32 = 75;        // Rename file/directory
     pub const SYS_GETCWD: u32 = 76;        // Get current working directory
     pub const SYS_CHDIR: u32 = 77;         // Change current directory
+    pub const SYS_MOUNT: u32 = 78;         // Mount drive (drive_name, device_id, fs_type)
+    pub const SYS_UNMOUNT: u32 = 79;       // Unmount drive (drive_name)
+    pub const SYS_LISTDRIVES: u32 = 85;    // List mounted drives
 
     // Process execution
     pub const SYS_EXEC: u32 = 80;          // Execute program (replace current process)
@@ -340,6 +343,98 @@ pub mod syscalls {
     pub fn exec(name: &str) -> u64 {
         unsafe {
             raw_syscall2(SYS_EXEC, name.as_ptr() as u64, name.len() as u64)
+        }
+    }
+
+    /// Mount a drive with a given name
+    /// name: Drive name (e.g., "C", "D", "MYDATA")
+    /// mount_path: Null-terminated mount path (e.g., "/mnt/c\0")
+    /// Returns 0 on success, error code on failure
+    pub fn mount(name: &str, mount_path: &[u8]) -> u64 {
+        unsafe {
+            raw_syscall3(
+                SYS_MOUNT,
+                name.as_ptr() as u64,
+                name.len() as u64,
+                mount_path.as_ptr() as u64,
+            )
+        }
+    }
+
+    /// Unmount a drive by name
+    /// Returns 0 on success, error code on failure
+    pub fn unmount(name: &str) -> u64 {
+        unsafe {
+            raw_syscall2(SYS_UNMOUNT, name.as_ptr() as u64, name.len() as u64)
+        }
+    }
+
+    /// List mounted drives
+    /// Format: "NAME:PATH:FSTYPE\n" for each drive, * marks current drive
+    /// Returns bytes written to buffer
+    pub fn list_drives(buf: &mut [u8]) -> usize {
+        unsafe {
+            raw_syscall2(SYS_LISTDRIVES, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
+        }
+    }
+
+    /// Change current drive/directory
+    /// If path ends with ':', changes drive (e.g., "D:")
+    /// Otherwise changes directory (not yet implemented)
+    /// Returns 0 on success
+    pub fn chdir(path: &str) -> u64 {
+        unsafe {
+            raw_syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64)
+        }
+    }
+
+    /// Get current working directory
+    /// Returns bytes written (e.g., "C:\path")
+    pub fn getcwd(buf: &mut [u8]) -> usize {
+        unsafe {
+            raw_syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
+        }
+    }
+
+    /// Read directory entries
+    /// path: directory path (empty for current directory)
+    /// buf: output buffer for entries (format: "TYPE NAME SIZE\n" per entry)
+    /// Returns bytes written
+    pub fn readdir(path: &str, buf: &mut [u8]) -> usize {
+        unsafe {
+            raw_syscall3(
+                SYS_READDIR,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                buf.as_mut_ptr() as u64,
+            ) as usize
+        }
+    }
+
+    /// Create a directory
+    /// Returns 0 on success
+    pub fn mkdir(path: &str) -> u64 {
+        unsafe {
+            raw_syscall2(SYS_MKDIR, path.as_ptr() as u64, path.len() as u64)
+        }
+    }
+
+    /// Get file/directory status
+    /// Returns (type, size) where type: 0=file, 1=directory
+    pub fn stat(path: &str) -> Option<(u64, u64)> {
+        let mut stat_buf: [u64; 2] = [0; 2];
+        let result = unsafe {
+            raw_syscall3(
+                SYS_STAT,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+            )
+        };
+        if result == 0 {
+            Some((stat_buf[0], stat_buf[1]))
+        } else {
+            None
         }
     }
 }

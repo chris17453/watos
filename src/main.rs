@@ -14,6 +14,13 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
+use spin::Mutex;
+
+// Disk and filesystem support
+use watos_driver_traits::{Driver, DriverState};
+use watos_driver_traits::block::{BlockDevice, BlockDeviceExt};
+use watos_driver_ahci::AhciDriver;
+use wfs_common::{Superblock, FileEntry, WFS_MAGIC, BLOCK_SIZE, ENTRIES_PER_BLOCK, FLAG_DIR};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -56,6 +63,569 @@ const BOOT_MAGIC: u32 = 0x5741544F; // "WATO"
 
 /// Global boot info (copied from bootloader)
 static mut BOOT_INFO: Option<BootInfo> = None;
+
+// ============================================================================
+// Drive Manager - Maps drive names (like "C", "D", "MYDATA") to mount points
+// ============================================================================
+
+/// Maximum drive name length
+const MAX_DRIVE_NAME: usize = 32;
+
+/// Maximum number of mounted drives
+const MAX_DRIVES: usize = 26;
+
+/// A mounted drive entry
+#[derive(Clone)]
+struct DriveEntry {
+    /// Drive name (e.g., "C", "D", "MYDATA")
+    name: [u8; MAX_DRIVE_NAME],
+    name_len: usize,
+    /// Mount path in VFS (e.g., "/mnt/c")
+    mount_path: [u8; 64],
+    mount_path_len: usize,
+    /// Filesystem type string
+    fs_type: [u8; 16],
+    fs_type_len: usize,
+    /// Is this entry in use?
+    in_use: bool,
+}
+
+impl DriveEntry {
+    const fn empty() -> Self {
+        DriveEntry {
+            name: [0; MAX_DRIVE_NAME],
+            name_len: 0,
+            mount_path: [0; 64],
+            mount_path_len: 0,
+            fs_type: [0; 16],
+            fs_type_len: 0,
+            in_use: false,
+        }
+    }
+}
+
+/// Global drive table
+static mut DRIVE_TABLE: [DriveEntry; MAX_DRIVES] = [const { DriveEntry::empty() }; MAX_DRIVES];
+static mut CURRENT_DRIVE: usize = 0; // Index into DRIVE_TABLE
+
+/// Current working directory (relative to current drive)
+const MAX_PATH_LEN: usize = 256;
+static mut CURRENT_DIR: [u8; MAX_PATH_LEN] = [0; MAX_PATH_LEN];
+static mut CURRENT_DIR_LEN: usize = 1; // Starts as "\"
+
+/// Initialize current directory to root
+fn init_cwd() {
+    unsafe {
+        CURRENT_DIR[0] = b'\\';
+        CURRENT_DIR_LEN = 1;
+    }
+}
+
+/// Mount a drive with a given name
+/// Returns 0 on success, error code on failure
+fn drive_mount(name: &[u8], mount_path: &[u8], fs_type: &[u8]) -> u64 {
+    if name.is_empty() || name.len() > MAX_DRIVE_NAME {
+        return 1; // Invalid name
+    }
+    if mount_path.is_empty() || mount_path.len() > 64 {
+        return 2; // Invalid path
+    }
+
+    unsafe {
+        // Check if already mounted
+        for entry in &DRIVE_TABLE {
+            if entry.in_use && entry.name_len == name.len() {
+                let matches = entry.name[..entry.name_len].iter()
+                    .zip(name.iter())
+                    .all(|(a, b)| {
+                        let a_upper = if *a >= b'a' && *a <= b'z' { *a - 32 } else { *a };
+                        let b_upper = if *b >= b'a' && *b <= b'z' { *b - 32 } else { *b };
+                        a_upper == b_upper
+                    });
+                if matches {
+                    return 3; // Already mounted
+                }
+            }
+        }
+
+        // Find free slot
+        for entry in &mut DRIVE_TABLE {
+            if !entry.in_use {
+                entry.name[..name.len()].copy_from_slice(name);
+                entry.name_len = name.len();
+                entry.mount_path[..mount_path.len()].copy_from_slice(mount_path);
+                entry.mount_path_len = mount_path.len();
+                if !fs_type.is_empty() && fs_type.len() <= 16 {
+                    entry.fs_type[..fs_type.len()].copy_from_slice(fs_type);
+                    entry.fs_type_len = fs_type.len();
+                }
+                entry.in_use = true;
+                return 0; // Success
+            }
+        }
+
+        4 // No free slots
+    }
+}
+
+/// Unmount a drive by name
+/// Returns 0 on success, error code on failure
+fn drive_unmount(name: &[u8]) -> u64 {
+    if name.is_empty() {
+        return 1;
+    }
+
+    unsafe {
+        for (i, entry) in DRIVE_TABLE.iter_mut().enumerate() {
+            if entry.in_use && entry.name_len == name.len() {
+                let matches = entry.name[..entry.name_len].iter()
+                    .zip(name.iter())
+                    .all(|(a, b)| {
+                        let a_upper = if *a >= b'a' && *a <= b'z' { *a - 32 } else { *a };
+                        let b_upper = if *b >= b'a' && *b <= b'z' { *b - 32 } else { *b };
+                        a_upper == b_upper
+                    });
+                if matches {
+                    // Can't unmount current drive
+                    if i == CURRENT_DRIVE {
+                        return 2; // Drive in use
+                    }
+                    *entry = DriveEntry::empty();
+                    return 0;
+                }
+            }
+        }
+        3 // Not found
+    }
+}
+
+/// List drives - copies drive info to buffer
+/// Format: "NAME:PATH:FSTYPE\n" for each drive
+/// Returns bytes written
+fn drive_list(buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+
+    unsafe {
+        for (i, entry) in DRIVE_TABLE.iter().enumerate() {
+            if entry.in_use {
+                // Copy name
+                let name = &entry.name[..entry.name_len];
+                if pos + name.len() >= buf.len() { break; }
+                buf[pos..pos + name.len()].copy_from_slice(name);
+                pos += name.len();
+
+                // Colon
+                if pos >= buf.len() { break; }
+                buf[pos] = b':';
+                pos += 1;
+
+                // Copy path
+                let path = &entry.mount_path[..entry.mount_path_len];
+                if pos + path.len() >= buf.len() { break; }
+                buf[pos..pos + path.len()].copy_from_slice(path);
+                pos += path.len();
+
+                // Colon
+                if pos >= buf.len() { break; }
+                buf[pos] = b':';
+                pos += 1;
+
+                // Copy fs type
+                let fs = &entry.fs_type[..entry.fs_type_len];
+                if pos + fs.len() >= buf.len() { break; }
+                buf[pos..pos + fs.len()].copy_from_slice(fs);
+                pos += fs.len();
+
+                // Mark current drive with *
+                if i == CURRENT_DRIVE {
+                    if pos >= buf.len() { break; }
+                    buf[pos] = b'*';
+                    pos += 1;
+                }
+
+                // Newline
+                if pos >= buf.len() { break; }
+                buf[pos] = b'\n';
+                pos += 1;
+            }
+        }
+    }
+
+    pos
+}
+
+/// Change current drive by name
+/// Returns 0 on success, error code on failure
+fn drive_change(name: &[u8]) -> u64 {
+    if name.is_empty() {
+        return 1;
+    }
+
+    unsafe {
+        for (i, entry) in DRIVE_TABLE.iter().enumerate() {
+            if entry.in_use && entry.name_len == name.len() {
+                let matches = entry.name[..entry.name_len].iter()
+                    .zip(name.iter())
+                    .all(|(a, b)| {
+                        let a_upper = if *a >= b'a' && *a <= b'z' { *a - 32 } else { *a };
+                        let b_upper = if *b >= b'a' && *b <= b'z' { *b - 32 } else { *b };
+                        a_upper == b_upper
+                    });
+                if matches {
+                    CURRENT_DRIVE = i;
+                    return 0;
+                }
+            }
+        }
+        2 // Not found
+    }
+}
+
+/// Get current drive name into buffer
+/// Returns bytes written
+fn drive_get_current(buf: &mut [u8]) -> usize {
+    unsafe {
+        let entry = &DRIVE_TABLE[CURRENT_DRIVE];
+        if entry.in_use && buf.len() >= entry.name_len {
+            buf[..entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);
+            entry.name_len
+        } else {
+            0
+        }
+    }
+}
+
+/// Get full current working directory (DRIVE:\path)
+/// Returns bytes written
+fn get_cwd(buf: &mut [u8]) -> usize {
+    unsafe {
+        let entry = &DRIVE_TABLE[CURRENT_DRIVE];
+        if !entry.in_use {
+            return 0;
+        }
+
+        let mut pos = 0;
+
+        // Drive name
+        if pos + entry.name_len >= buf.len() { return 0; }
+        buf[pos..pos + entry.name_len].copy_from_slice(&entry.name[..entry.name_len]);
+        pos += entry.name_len;
+
+        // Colon
+        if pos >= buf.len() { return 0; }
+        buf[pos] = b':';
+        pos += 1;
+
+        // Current directory
+        if pos + CURRENT_DIR_LEN > buf.len() { return pos; }
+        buf[pos..pos + CURRENT_DIR_LEN].copy_from_slice(&CURRENT_DIR[..CURRENT_DIR_LEN]);
+        pos += CURRENT_DIR_LEN;
+
+        pos
+    }
+}
+
+/// Change current directory
+/// path can be:
+///   - "DRIVE:" to switch drive (resets to root of that drive)
+///   - "\" or "/" to go to root
+///   - ".." to go up one level
+///   - "dirname" to enter subdirectory
+///   - "\path" or "/path" for absolute path
+/// Returns 0 on success, error code on failure
+fn change_dir(path: &[u8]) -> u64 {
+    if path.is_empty() {
+        return 1;
+    }
+
+    unsafe {
+        // Check if it's a drive change (ends with :)
+        if path.len() > 1 && path[path.len() - 1] == b':' {
+            let drive_name = &path[..path.len() - 1];
+            let result = drive_change(drive_name);
+            if result == 0 {
+                // Reset to root when changing drives
+                CURRENT_DIR[0] = b'\\';
+                CURRENT_DIR_LEN = 1;
+            }
+            return result;
+        }
+
+        // Check for root
+        if path.len() == 1 && (path[0] == b'\\' || path[0] == b'/') {
+            CURRENT_DIR[0] = b'\\';
+            CURRENT_DIR_LEN = 1;
+            return 0;
+        }
+
+        // Check for ".."
+        if path.len() == 2 && path[0] == b'.' && path[1] == b'.' {
+            // Go up one level
+            if CURRENT_DIR_LEN <= 1 {
+                // Already at root
+                return 0;
+            }
+            // Find last backslash
+            let mut last_slash = 0;
+            for i in 0..CURRENT_DIR_LEN {
+                if CURRENT_DIR[i] == b'\\' || CURRENT_DIR[i] == b'/' {
+                    last_slash = i;
+                }
+            }
+            if last_slash == 0 {
+                // Go to root
+                CURRENT_DIR[0] = b'\\';
+                CURRENT_DIR_LEN = 1;
+            } else {
+                CURRENT_DIR_LEN = last_slash;
+            }
+            return 0;
+        }
+
+        // Absolute path (starts with \ or /)
+        if path[0] == b'\\' || path[0] == b'/' {
+            if path.len() >= MAX_PATH_LEN {
+                return 2; // Path too long
+            }
+            // Normalize slashes to backslash
+            for i in 0..path.len() {
+                CURRENT_DIR[i] = if path[i] == b'/' { b'\\' } else { path[i] };
+            }
+            CURRENT_DIR_LEN = path.len();
+            return 0;
+        }
+
+        // Relative path - append to current directory
+        let needed = if CURRENT_DIR_LEN > 1 {
+            CURRENT_DIR_LEN + 1 + path.len() // existing + \ + new
+        } else {
+            1 + path.len() // \ + new
+        };
+
+        if needed >= MAX_PATH_LEN {
+            return 2; // Path too long
+        }
+
+        // Add separator if not at root
+        if CURRENT_DIR_LEN > 1 {
+            CURRENT_DIR[CURRENT_DIR_LEN] = b'\\';
+            CURRENT_DIR_LEN += 1;
+        }
+
+        // Append new path component
+        for i in 0..path.len() {
+            CURRENT_DIR[CURRENT_DIR_LEN + i] = if path[i] == b'/' { b'\\' } else { path[i] };
+        }
+        CURRENT_DIR_LEN += path.len();
+
+        0
+    }
+}
+
+// ============================================================================
+// Disk and Filesystem Subsystem
+// ============================================================================
+
+/// Global AHCI driver (wrapped in Mutex for thread-safety)
+static DISK_DRIVER: Mutex<Option<AhciDriver>> = Mutex::new(None);
+
+/// WFS Superblock (cached after initialization)
+static mut WFS_SUPERBLOCK: Option<Superblock> = None;
+
+/// Initialize disk and filesystem
+/// Probes AHCI ports looking for WFS data disk (port 1 typically)
+fn init_disk() -> bool {
+    unsafe { watos_arch::serial_write(b"[KERNEL] Initializing disk subsystem...\r\n"); }
+
+    // Try probing each AHCI port looking for WFS
+    // Port 0 is typically the FAT boot disk, Port 1+ may have WFS
+    for port in 0..4 {
+        unsafe {
+            watos_arch::serial_write(b"[KERNEL] Probing AHCI port ");
+            watos_arch::serial_hex(port as u64);
+            watos_arch::serial_write(b"...\r\n");
+        }
+
+        let driver = match AhciDriver::probe_port(port) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        unsafe {
+            watos_arch::serial_write(b"[KERNEL] Found disk on port ");
+            watos_arch::serial_hex(port as u64);
+            watos_arch::serial_write(b"\r\n");
+        }
+
+        // Initialize and start the driver
+        let mut driver = driver;
+        if driver.init().is_err() {
+            unsafe { watos_arch::serial_write(b"[KERNEL] AHCI init failed\r\n"); }
+            continue;
+        }
+        if driver.start().is_err() {
+            unsafe { watos_arch::serial_write(b"[KERNEL] AHCI start failed\r\n"); }
+            continue;
+        }
+
+        // Try to read WFS superblock
+        let mut buf = [0u8; 512];
+        if driver.read_sectors(0, &mut buf).is_ok() {
+            // Check for WFS magic
+            let sb = unsafe { &*(buf.as_ptr() as *const Superblock) };
+            if sb.magic == WFS_MAGIC {
+                unsafe {
+                    watos_arch::serial_write(b"[KERNEL] WFS filesystem detected on port ");
+                    watos_arch::serial_hex(port as u64);
+                    watos_arch::serial_write(b"\r\n");
+                    WFS_SUPERBLOCK = Some(*sb);
+                }
+                *DISK_DRIVER.lock() = Some(driver);
+                return true;
+            }
+        }
+
+        unsafe {
+            watos_arch::serial_write(b"[KERNEL] Port ");
+            watos_arch::serial_hex(port as u64);
+            watos_arch::serial_write(b" is not WFS\r\n");
+        }
+    }
+
+    unsafe { watos_arch::serial_write(b"[KERNEL] No WFS disk found\r\n"); }
+    false
+}
+
+/// Read WFS directory entries into buffer
+/// Returns bytes written in format: "TYPE NAME SIZE\n" per entry
+fn wfs_readdir(_path: &[u8], buf: &mut [u8]) -> usize {
+    // TEMPORARY: Skip WFS disk reads to debug crash
+    // Just return basic entries without disk I/O
+    unsafe { watos_arch::serial_write(b"[WFS] wfs_readdir called (stub mode)\r\n"); }
+
+    let mut pos = 0;
+
+    // Add "." and ".." entries
+    let dot = b"D . 0\n";
+    if pos + dot.len() < buf.len() {
+        buf[pos..pos + dot.len()].copy_from_slice(dot);
+        pos += dot.len();
+    }
+
+    let dotdot = b"D .. 0\n";
+    if pos + dotdot.len() < buf.len() {
+        buf[pos..pos + dotdot.len()].copy_from_slice(dotdot);
+        pos += dotdot.len();
+    }
+
+    // Add a test entry without disk I/O
+    let test = b"F TEST.TXT 100\n";
+    if pos + test.len() < buf.len() {
+        buf[pos..pos + test.len()].copy_from_slice(test);
+        pos += test.len();
+    }
+
+    unsafe { watos_arch::serial_write(b"[WFS] wfs_readdir returning\r\n"); }
+    pos
+}
+
+/// Create a directory in WFS
+/// Returns true on success
+fn wfs_mkdir(path: &[u8]) -> bool {
+    let sb = unsafe {
+        match WFS_SUPERBLOCK.as_ref() {
+            Some(s) => s,
+            None => return false,
+        }
+    };
+
+    let mut driver_guard = DISK_DRIVER.lock();
+    let driver = match driver_guard.as_mut() {
+        Some(d) => d,
+        None => return false,
+    };
+
+    // Extract the directory name from path (last component)
+    let name = if let Some(pos) = path.iter().rposition(|&c| c == b'\\' || c == b'/') {
+        &path[pos + 1..]
+    } else {
+        path
+    };
+
+    if name.is_empty() || name.len() > 55 {
+        return false;
+    }
+
+    // Find a free entry in the file table
+    let mut sector_buf = [0u8; 4096]; // One block
+
+    for block_idx in 0..sb.filetable_blocks {
+        let block_num = sb.filetable_block + block_idx as u64;
+
+        // Read the block
+        if driver.read_sectors(block_num * 8, &mut sector_buf).is_err() {
+            continue;
+        }
+
+        // Look for a free entry (name[0] == 0)
+        for i in 0..ENTRIES_PER_BLOCK {
+            let entry_ptr = sector_buf.as_mut_ptr().wrapping_add(i * 128);
+            let entry = unsafe { &mut *(entry_ptr as *mut FileEntry) };
+
+            if entry.name[0] == 0 {
+                // Found a free entry - set it up as a directory
+                entry.name[..name.len()].copy_from_slice(name);
+                entry.name[name.len()] = 0;
+                entry.flags = FLAG_DIR;
+                entry.size = 0;
+                entry.start_block = 0;
+                entry.blocks = 0;
+
+                unsafe {
+                    watos_arch::serial_write(b"[WFS] Creating directory: ");
+                    watos_arch::serial_write(name);
+                    watos_arch::serial_write(b"\r\n");
+                }
+
+                // Write the block back
+                if driver.write_sectors(block_num * 8, &sector_buf).is_ok() {
+                    // Update superblock root_files count
+                    unsafe {
+                        if let Some(ref mut sb) = WFS_SUPERBLOCK {
+                            sb.root_files += 1;
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    false
+}
+
+/// Format a number as a decimal string
+/// Returns a static buffer with the result
+fn format_num(mut n: u64) -> &'static str {
+    static mut NUM_BUF: [u8; 20] = [0; 20];
+
+    unsafe {
+        if n == 0 {
+            NUM_BUF[0] = b'0';
+            return core::str::from_utf8_unchecked(&NUM_BUF[..1]);
+        }
+
+        let mut i = 20;
+        while n > 0 && i > 0 {
+            i -= 1;
+            NUM_BUF[i] = (n % 10) as u8 + b'0';
+            n /= 10;
+        }
+
+        core::str::from_utf8_unchecked(&NUM_BUF[i..])
+    }
+}
 
 /// Kernel Console Subsystem - ring buffer for process output
 /// All SYS_WRITE calls go here, console app reads from here
@@ -165,6 +735,21 @@ pub extern "C" fn _start() -> ! {
     watos_process::init();
     unsafe { watos_arch::serial_write(b"[KERNEL] Process subsystem initialized\r\n"); }
 
+    // 5.5 Initialize disk subsystem and mount default drive
+    init_cwd();
+    let wfs_found = init_disk();
+
+    // Mount drive C:
+    let fs_type = if wfs_found { b"WFS" } else { b"FAT" };
+    let result = drive_mount(b"C", b"/", fs_type);
+    if result == 0 {
+        unsafe {
+            watos_arch::serial_write(b"[KERNEL] Mounted C: as root (");
+            watos_arch::serial_write(fs_type);
+            watos_arch::serial_write(b")\r\n");
+        }
+    }
+
     // 6. Execute init app (TERM.EXE) if loaded by bootloader
     unsafe {
         if let Some(info) = BOOT_INFO {
@@ -246,6 +831,18 @@ mod syscall {
     pub const SYS_GETDATE: u64 = 90;
     pub const SYS_GETTIME: u64 = 91;
     pub const SYS_GETTICKS: u64 = 92;
+
+    // Drive/Mount operations
+    pub const SYS_MOUNT: u64 = 78;
+    pub const SYS_UNMOUNT: u64 = 79;
+    pub const SYS_CHDIR: u64 = 77;
+    pub const SYS_GETCWD: u64 = 76;
+    pub const SYS_LISTDRIVES: u64 = 85;
+
+    // Filesystem operations
+    pub const SYS_READDIR: u64 = 71;
+    pub const SYS_MKDIR: u64 = 72;
+    pub const SYS_STAT: u64 = 70;
 }
 
 /// Syscall handler - naked function called from IDT
@@ -555,6 +1152,317 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_GETTICKS => {
             // Returns timer ticks since boot
             watos_arch::idt::get_ticks()
+        }
+
+        syscall::SYS_MOUNT => {
+            // arg1 = pointer to drive name
+            // arg2 = length of drive name
+            // arg3 = pointer to struct { mount_path_ptr, mount_path_len, fs_type_ptr, fs_type_len }
+            // For simplicity, use packed args: arg3 = mount_path_ptr, we'll use fixed format
+            // New format: arg1 = name_ptr, arg2 = name_len, arg3 = mount_path_ptr (null-term)
+            let name_ptr = arg1 as *const u8;
+            let name_len = arg2 as usize;
+            let mount_ptr = arg3 as *const u8;
+
+            if name_ptr.is_null() || name_len == 0 || name_len > MAX_DRIVE_NAME {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let name = core::slice::from_raw_parts(name_ptr, name_len);
+
+                // Find null-terminated mount path length
+                let mut mount_len = 0usize;
+                if !mount_ptr.is_null() {
+                    while mount_len < 64 && *mount_ptr.add(mount_len) != 0 {
+                        mount_len += 1;
+                    }
+                }
+                let mount_path = if mount_len > 0 {
+                    core::slice::from_raw_parts(mount_ptr, mount_len)
+                } else {
+                    b"/"
+                };
+
+                watos_arch::serial_write(b"[KERNEL] SYS_MOUNT: ");
+                watos_arch::serial_write(name);
+                watos_arch::serial_write(b" -> ");
+                watos_arch::serial_write(mount_path);
+                watos_arch::serial_write(b"\r\n");
+
+                drive_mount(name, mount_path, b"WFS")
+            }
+        }
+
+        syscall::SYS_UNMOUNT => {
+            // arg1 = pointer to drive name
+            // arg2 = length of drive name
+            let name_ptr = arg1 as *const u8;
+            let name_len = arg2 as usize;
+
+            if name_ptr.is_null() || name_len == 0 {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let name = core::slice::from_raw_parts(name_ptr, name_len);
+                watos_arch::serial_write(b"[KERNEL] SYS_UNMOUNT: ");
+                watos_arch::serial_write(name);
+                watos_arch::serial_write(b"\r\n");
+                drive_unmount(name)
+            }
+        }
+
+        syscall::SYS_LISTDRIVES => {
+            // arg1 = buffer pointer
+            // arg2 = buffer size
+            // Returns bytes written
+            let buf_ptr = arg1 as *mut u8;
+            let buf_size = arg2 as usize;
+
+            if buf_ptr.is_null() || buf_size == 0 {
+                return 0;
+            }
+
+            unsafe {
+                let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
+                drive_list(buf) as u64
+            }
+        }
+
+        syscall::SYS_CHDIR => {
+            // arg1 = pointer to path
+            // arg2 = length
+            // Handles: "DRIVE:", "\", "..", "dirname", "\path"
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+
+            if path_ptr.is_null() || path_len == 0 {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let path = core::slice::from_raw_parts(path_ptr, path_len);
+                watos_arch::serial_write(b"[KERNEL] SYS_CHDIR: ");
+                watos_arch::serial_write(path);
+                watos_arch::serial_write(b"\r\n");
+                change_dir(path)
+            }
+        }
+
+        syscall::SYS_READDIR => {
+            // arg1 = path pointer (null = current directory)
+            // arg2 = path length (0 = current directory)
+            // arg3 = buffer pointer for output
+            // Returns bytes written: entries as "TYPE NAME SIZE\n"
+            // TYPE: D=directory, F=file
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let buf_ptr = arg3 as *mut u8;
+
+            unsafe {
+                watos_arch::serial_write(b"[KERNEL] SYS_READDIR: path_ptr=0x");
+                watos_arch::serial_hex(arg1);
+                watos_arch::serial_write(b" path_len=");
+                watos_arch::serial_hex(arg2);
+                watos_arch::serial_write(b" buf_ptr=0x");
+                watos_arch::serial_hex(arg3);
+                watos_arch::serial_write(b"\r\n");
+            }
+
+            if buf_ptr.is_null() {
+                return 0;
+            }
+
+            unsafe {
+                let buf_size = 2048usize; // Buffer size for directory listing
+                watos_arch::serial_write(b"[KERNEL] Creating slice...\r\n");
+                let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
+                watos_arch::serial_write(b"[KERNEL] Slice created\r\n");
+
+                // Get path (use current directory if not specified)
+                let path = if path_ptr.is_null() || path_len == 0 {
+                    &CURRENT_DIR[..CURRENT_DIR_LEN]
+                } else {
+                    core::slice::from_raw_parts(path_ptr, path_len)
+                };
+
+                // Try WFS filesystem first
+                if WFS_SUPERBLOCK.is_some() {
+                    let bytes = wfs_readdir(path, buf);
+                    if bytes > 0 {
+                        return bytes as u64;
+                    }
+                }
+
+                // Fallback: list preloaded apps from bootloader
+                let mut pos = 0;
+
+                // Add "." entry
+                let dot = b"D . 0\n";
+                if pos + dot.len() < buf_size {
+                    buf[pos..pos + dot.len()].copy_from_slice(dot);
+                    pos += dot.len();
+                }
+
+                // Add ".." entry
+                let dotdot = b"D .. 0\n";
+                if pos + dotdot.len() < buf_size {
+                    buf[pos..pos + dotdot.len()].copy_from_slice(dotdot);
+                    pos += dotdot.len();
+                }
+
+                // Add SYSTEM directory
+                let sys = b"D SYSTEM 0\n";
+                if pos + sys.len() < buf_size {
+                    buf[pos..pos + sys.len()].copy_from_slice(sys);
+                    pos += sys.len();
+                }
+
+                // Add apps directory
+                let apps = b"D apps 0\n";
+                if pos + apps.len() < buf_size {
+                    buf[pos..pos + apps.len()].copy_from_slice(apps);
+                    pos += apps.len();
+                }
+
+                // List preloaded apps as files
+                if let Some(info) = BOOT_INFO.as_ref() {
+                    for i in 0..(info.app_count as usize) {
+                        let app = &info.apps[i];
+                        let name_len = app.name.iter().position(|&c| c == 0).unwrap_or(32);
+                        let name = &app.name[..name_len];
+
+                        // Format: "F NAME SIZE\n"
+                        if pos + 3 + name_len + 15 < buf_size {
+                            buf[pos] = b'F';
+                            buf[pos + 1] = b' ';
+                            pos += 2;
+
+                            buf[pos..pos + name_len].copy_from_slice(name);
+                            pos += name_len;
+
+                            buf[pos] = b' ';
+                            pos += 1;
+
+                            // Write size as decimal
+                            let size = app.size;
+                            let size_str = format_num(size);
+                            let size_bytes = size_str.as_bytes();
+                            buf[pos..pos + size_bytes.len()].copy_from_slice(size_bytes);
+                            pos += size_bytes.len();
+
+                            buf[pos] = b'\n';
+                            pos += 1;
+                        }
+                    }
+                }
+
+                pos as u64
+            }
+        }
+
+        syscall::SYS_MKDIR => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // Returns 0 on success, error code on failure
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+
+            if path_ptr.is_null() || path_len == 0 {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let path = core::slice::from_raw_parts(path_ptr, path_len);
+                watos_arch::serial_write(b"[KERNEL] SYS_MKDIR: ");
+                watos_arch::serial_write(path);
+                watos_arch::serial_write(b"\r\n");
+
+                // Try WFS first
+                if WFS_SUPERBLOCK.is_some() {
+                    if wfs_mkdir(path) {
+                        return 0;
+                    }
+                    watos_arch::serial_write(b"[KERNEL] WFS mkdir failed\r\n");
+                    return 1; // Error
+                }
+
+                // No WFS - fail
+                watos_arch::serial_write(b"[KERNEL] No persistent storage available\r\n");
+            }
+            1 // Error - no filesystem
+        }
+
+        syscall::SYS_STAT => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = stat buffer pointer (returns: type, size)
+            // Returns 0 on success, error on not found
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let stat_ptr = arg3 as *mut u64;
+
+            if path_ptr.is_null() || path_len == 0 || stat_ptr.is_null() {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let path = core::slice::from_raw_parts(path_ptr, path_len);
+
+                // Check for directories
+                if path == b"." || path == b".." || path == b"\\" || path == b"/" ||
+                   path == b"SYSTEM" || path == b"apps" {
+                    // Directory: type=1, size=0
+                    *stat_ptr = 1; // type: directory
+                    *stat_ptr.add(1) = 0; // size
+                    return 0;
+                }
+
+                // Check preloaded apps
+                if let Some(info) = BOOT_INFO.as_ref() {
+                    for i in 0..(info.app_count as usize) {
+                        let app = &info.apps[i];
+                        let name_len = app.name.iter().position(|&c| c == 0).unwrap_or(32);
+                        let name = &app.name[..name_len];
+
+                        // Case-insensitive compare
+                        if path.len() == name.len() {
+                            let matches = path.iter().zip(name.iter()).all(|(a, b)| {
+                                let a_upper = if *a >= b'a' && *a <= b'z' { *a - 32 } else { *a };
+                                let b_upper = if *b >= b'a' && *b <= b'z' { *b - 32 } else { *b };
+                                a_upper == b_upper
+                            });
+                            if matches {
+                                // File: type=0, size=app.size
+                                *stat_ptr = 0; // type: file
+                                *stat_ptr.add(1) = app.size;
+                                return 0;
+                            }
+                        }
+                    }
+                }
+
+                // Not found
+                1
+            }
+        }
+
+        syscall::SYS_GETCWD => {
+            // arg1 = buffer pointer
+            // arg2 = buffer size
+            // Returns the current drive name + path (e.g., "C:\path")
+            let buf_ptr = arg1 as *mut u8;
+            let buf_size = arg2 as usize;
+
+            if buf_ptr.is_null() || buf_size == 0 {
+                return 0;
+            }
+
+            unsafe {
+                let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
+                get_cwd(buf) as u64
+            }
         }
 
         _ => {

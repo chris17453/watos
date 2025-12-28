@@ -8,10 +8,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::arch::asm;
-use watos_driver_traits::{
-    Driver, DriverError, DriverInfo, DriverState,
-    bus::{PciAddress, PciBar, PciDeviceId, PciDeviceInfo, PciBus, pci_class},
-};
+use watos_driver_traits::{Driver, DriverError, DriverInfo, DriverState};
+use watos_driver_traits::bus::{PciAddress, PciBar, PciDeviceId, PciDeviceInfo, PciBus, pci_class};
 
 // PCI configuration ports
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
@@ -82,6 +80,7 @@ impl PciDriver {
             class: ((reg2 >> 24) & 0xFF) as u8,
             subclass: ((reg2 >> 16) & 0xFF) as u8,
             prog_if: ((reg2 >> 8) & 0xFF) as u8,
+            revision: (reg2 & 0xFF) as u8,
         };
 
         // Read BARs
@@ -99,7 +98,7 @@ impl PciDriver {
             if bar & 1 == 1 {
                 // I/O BAR
                 bars[i] = PciBar::Io {
-                    port: (bar & 0xFFFC) as u16,
+                    port: bar & 0xFFFFFFFC,
                     size: 0, // TODO: probe size
                 };
             } else {
@@ -196,7 +195,7 @@ impl Driver for PciDriver {
 }
 
 impl PciBus for PciDriver {
-    fn enumerate(&self) -> Vec<PciDeviceInfo> {
+    fn enumerate(&mut self) -> Vec<PciDeviceInfo> {
         self.devices.clone()
     }
 

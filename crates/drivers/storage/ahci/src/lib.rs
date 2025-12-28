@@ -6,7 +6,7 @@
 //!
 //! ```rust,ignore
 //! use watos_driver_ahci::AhciDriver;
-//! use watos_driver_framework::block::BlockDevice;
+//! use watos_driver_traits::block::BlockDevice;
 //!
 //! let mut driver = AhciDriver::probe().expect("No AHCI controller found");
 //! driver.init().expect("Failed to initialize");
@@ -19,9 +19,9 @@
 #![no_std]
 
 use core::ptr::{read_volatile, write_volatile};
-use watos_driver_framework::{Driver, DriverInfo, DriverState, DriverError};
-use watos_driver_framework::block::{BlockDevice, BlockGeometry};
-use watos_driver_framework::bus::PciAddress;
+use watos_driver_traits::{Driver, DriverInfo, DriverState, DriverError};
+use watos_driver_traits::block::{BlockDevice, BlockGeometry};
+use watos_driver_traits::bus::PciAddress;
 use watos_driver_pci::PciDriver;
 
 // AHCI HBA Memory Registers
@@ -145,7 +145,7 @@ impl AhciDriver {
 
     /// Probe for AHCI controller on specific port using provided PCI driver
     pub fn probe_with_pci(pci: &PciDriver, target_port: u8) -> Option<Self> {
-        use watos_driver_framework::bus::{PciBus, PciBar, pci_class};
+        use watos_driver_traits::bus::{PciBus, PciBar, pci_class};
 
         // Find AHCI controller (SATA with AHCI prog_if)
         let devices = pci.find_by_class(pci_class::MASS_STORAGE, pci_class::SATA);
@@ -196,7 +196,7 @@ impl AhciDriver {
 
     /// Probe for AHCI controller on specific port (initializes its own PCI driver)
     pub fn probe_port(target_port: u8) -> Option<Self> {
-        use watos_driver_framework::Driver;
+        use watos_driver_traits::Driver;
 
         let mut pci = PciDriver::new();
         pci.init().ok()?;

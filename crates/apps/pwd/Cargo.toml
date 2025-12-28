@@ -1,0 +1,11 @@
+[package]
+name = "pwd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+watos-syscall = { path = "../../core/syscall", features = ["no-std"] }
+
+[[bin]]
+name = "pwd"
+path = "src/main.rs"

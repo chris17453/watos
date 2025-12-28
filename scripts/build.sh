@@ -390,6 +390,131 @@ else
 fi
 cd "$PROJECT_ROOT"
 
+# Build drives application
+log "Building drives for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/drives"
+
+DRIVES_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$DRIVES_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin drives 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        DRIVES_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/drives"
+    else
+        DRIVES_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/drives"
+    fi
+
+    if [ -f "$DRIVES_BIN" ]; then
+        cp "$DRIVES_BIN" "$PROJECT_ROOT/rootfs/apps/system/drives"
+        cp "$DRIVES_BIN" "$PROJECT_ROOT/uefi_test/apps/system/drives"
+        success "drives built -> /apps/system/drives ($(du -h "$DRIVES_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} drives build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build ls application
+log "Building ls for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/ls"
+
+LS_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$LS_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin ls 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        LS_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/ls"
+    else
+        LS_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/ls"
+    fi
+
+    if [ -f "$LS_BIN" ]; then
+        cp "$LS_BIN" "$PROJECT_ROOT/rootfs/apps/system/ls"
+        cp "$LS_BIN" "$PROJECT_ROOT/uefi_test/apps/system/ls"
+        success "ls built -> /apps/system/ls ($(du -h "$LS_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} ls build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build pwd application
+log "Building pwd for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/pwd"
+
+PWD_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$PWD_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin pwd 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        PWD_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/pwd"
+    else
+        PWD_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/pwd"
+    fi
+
+    if [ -f "$PWD_BIN" ]; then
+        cp "$PWD_BIN" "$PROJECT_ROOT/rootfs/apps/system/pwd"
+        cp "$PWD_BIN" "$PROJECT_ROOT/uefi_test/apps/system/pwd"
+        success "pwd built -> /apps/system/pwd ($(du -h "$PWD_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} pwd build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build cd application
+log "Building cd for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/cd"
+
+CD_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$CD_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin cd 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        CD_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/cd"
+    else
+        CD_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/cd"
+    fi
+
+    if [ -f "$CD_BIN" ]; then
+        cp "$CD_BIN" "$PROJECT_ROOT/rootfs/apps/system/cd"
+        cp "$CD_BIN" "$PROJECT_ROOT/uefi_test/apps/system/cd"
+        success "cd built -> /apps/system/cd ($(du -h "$CD_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} cd build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
+# Build mkdir application
+log "Building mkdir for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/mkdir"
+
+MKDIR_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$MKDIR_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin mkdir 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        MKDIR_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/mkdir"
+    else
+        MKDIR_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/mkdir"
+    fi
+
+    if [ -f "$MKDIR_BIN" ]; then
+        cp "$MKDIR_BIN" "$PROJECT_ROOT/rootfs/apps/system/mkdir"
+        cp "$MKDIR_BIN" "$PROJECT_ROOT/uefi_test/apps/system/mkdir"
+        success "mkdir built -> /apps/system/mkdir ($(du -h "$MKDIR_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} mkdir build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
 # Build console/terminal application (TERM.EXE)
 log "Building console (TERM.EXE) for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/console"

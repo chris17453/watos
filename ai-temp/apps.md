@@ -1,6 +1,8 @@
 shell
 help
 exit
+shutdown
+reboot
 
 run
 which

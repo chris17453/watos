@@ -22,13 +22,17 @@
 
 #![no_std]
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 // Re-export all trait modules
-mod block;
-mod nic;
-mod input;
-mod video;
-mod audio;
+pub mod block;
+pub mod nic;
+pub mod input;
+pub mod video;
+pub mod audio;
 mod debug;
+pub mod bus;
 
 pub use block::*;
 pub use nic::*;
@@ -46,6 +50,8 @@ pub enum DriverError {
     Timeout,
     /// Invalid parameter
     InvalidParameter,
+    /// Invalid state for this operation
+    InvalidState,
     /// Device busy
     Busy,
     /// I/O error
@@ -59,3 +65,45 @@ pub enum DriverError {
 }
 
 pub type DriverResult<T> = Result<T, DriverError>;
+
+/// Driver lifecycle state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverState {
+    /// Driver is loaded but not initialized
+    Loaded,
+    /// Driver is initialized and ready to start
+    Ready,
+    /// Driver is active and operational
+    Active,
+    /// Driver is stopped
+    Stopped,
+    /// Driver encountered an error
+    Error,
+}
+
+/// Static driver information
+#[derive(Debug, Clone, Copy)]
+pub struct DriverInfo {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub author: &'static str,
+    pub description: &'static str,
+}
+
+/// Base trait for all drivers
+pub trait Driver {
+    /// Get driver information
+    fn info(&self) -> DriverInfo;
+
+    /// Get current driver state
+    fn state(&self) -> DriverState;
+
+    /// Initialize the driver
+    fn init(&mut self) -> Result<(), DriverError>;
+
+    /// Start the driver (after init)
+    fn start(&mut self) -> Result<(), DriverError>;
+
+    /// Stop the driver
+    fn stop(&mut self) -> Result<(), DriverError>;
+}
