@@ -330,6 +330,30 @@ fn get_cwd(buf: &mut [u8]) -> usize {
     }
 }
 
+/// Helper to validate a path exists and is a directory via VFS
+fn validate_directory(full_path: &str) -> bool {
+    unsafe {
+        // Switch to kernel CR3 for VFS access
+        let user_cr3 = watos_mem::paging::get_cr3();
+        let kernel_pml4 = watos_process::get_kernel_pml4();
+        if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+            watos_mem::paging::load_cr3(kernel_pml4);
+        }
+
+        let result = watos_vfs::stat(full_path);
+
+        // Switch back to user CR3
+        if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+            watos_mem::paging::load_cr3(user_cr3);
+        }
+
+        match result {
+            Ok(stat) => stat.file_type == watos_vfs::FileType::Directory,
+            Err(_) => false,
+        }
+    }
+}
+
 /// Change current directory
 /// path can be:
 ///   - "DRIVE:" to switch drive (resets to root of that drive)
@@ -387,41 +411,80 @@ fn change_dir(path: &[u8]) -> u64 {
             return 0;
         }
 
+        // Build the full path to validate
+        static mut NEW_PATH_BUF: [u8; 260] = [0u8; 260];
+        let mut new_path_len: usize = 0;
+
         // Absolute path (starts with \ or /)
         if path[0] == b'\\' || path[0] == b'/' {
             if path.len() >= MAX_PATH_LEN {
                 return 2; // Path too long
             }
-            // Normalize slashes to backslash
+            // Copy and normalize slashes
             for i in 0..path.len() {
-                CURRENT_DIR[i] = if path[i] == b'/' { b'\\' } else { path[i] };
+                NEW_PATH_BUF[i] = if path[i] == b'/' { b'\\' } else { path[i] };
             }
-            CURRENT_DIR_LEN = path.len();
-            return 0;
+            new_path_len = path.len();
+        } else {
+            // Relative path - append to current directory
+            let needed = if CURRENT_DIR_LEN > 1 {
+                CURRENT_DIR_LEN + 1 + path.len() // existing + \ + new
+            } else {
+                1 + path.len() // \ + new
+            };
+
+            if needed >= MAX_PATH_LEN {
+                return 2; // Path too long
+            }
+
+            // Copy current directory
+            NEW_PATH_BUF[..CURRENT_DIR_LEN].copy_from_slice(&CURRENT_DIR[..CURRENT_DIR_LEN]);
+            new_path_len = CURRENT_DIR_LEN;
+
+            // Add separator if not at root
+            if new_path_len > 1 {
+                NEW_PATH_BUF[new_path_len] = b'\\';
+                new_path_len += 1;
+            }
+
+            // Append new path component
+            for i in 0..path.len() {
+                NEW_PATH_BUF[new_path_len + i] = if path[i] == b'/' { b'\\' } else { path[i] };
+            }
+            new_path_len += path.len();
         }
 
-        // Relative path - append to current directory
-        let needed = if CURRENT_DIR_LEN > 1 {
-            CURRENT_DIR_LEN + 1 + path.len() // existing + \ + new
-        } else {
-            1 + path.len() // \ + new
+        // Build full VFS path with drive letter: "X:\path"
+        static mut FULL_PATH_BUF: [u8; 264] = [0u8; 264];
+        let drive = &DRIVE_TABLE[CURRENT_DRIVE];
+        let name_len = drive.name_len.min(MAX_DRIVE_NAME);
+        let mut pos = 0;
+        FULL_PATH_BUF[pos..pos + name_len].copy_from_slice(&drive.name[..name_len]);
+        pos += name_len;
+        FULL_PATH_BUF[pos] = b':';
+        pos += 1;
+        FULL_PATH_BUF[pos..pos + new_path_len].copy_from_slice(&NEW_PATH_BUF[..new_path_len]);
+        pos += new_path_len;
+
+        // Convert to str for VFS
+        let full_path_str = match core::str::from_utf8(&FULL_PATH_BUF[..pos]) {
+            Ok(s) => s,
+            Err(_) => return 1, // Invalid path
         };
 
-        if needed >= MAX_PATH_LEN {
-            return 2; // Path too long
+        watos_arch::serial_write(b"[KERNEL] cd validate: ");
+        watos_arch::serial_write(&FULL_PATH_BUF[..pos]);
+        watos_arch::serial_write(b"\r\n");
+
+        // Validate directory exists (root always exists)
+        if new_path_len > 1 && !validate_directory(full_path_str) {
+            watos_arch::serial_write(b"[KERNEL] cd: directory not found\r\n");
+            return 3; // No such directory
         }
 
-        // Add separator if not at root
-        if CURRENT_DIR_LEN > 1 {
-            CURRENT_DIR[CURRENT_DIR_LEN] = b'\\';
-            CURRENT_DIR_LEN += 1;
-        }
-
-        // Append new path component
-        for i in 0..path.len() {
-            CURRENT_DIR[CURRENT_DIR_LEN + i] = if path[i] == b'/' { b'\\' } else { path[i] };
-        }
-        CURRENT_DIR_LEN += path.len();
+        // Update current directory
+        CURRENT_DIR[..new_path_len].copy_from_slice(&NEW_PATH_BUF[..new_path_len]);
+        CURRENT_DIR_LEN = new_path_len;
 
         0
     }
@@ -438,7 +501,7 @@ static DISK_DRIVER: Mutex<Option<AhciDriver>> = Mutex::new(None);
 static mut WFS_SUPERBLOCK: Option<Superblock> = None;
 
 /// Initialize disk and filesystem
-/// Probes AHCI ports looking for WFS data disk (port 1 typically)
+/// Probes AHCI ports looking for WFS data disk and mounts it in VFS as D:
 fn init_disk() -> bool {
     unsafe { watos_arch::serial_write(b"[KERNEL] Initializing disk subsystem...\r\n"); }
 
@@ -473,27 +536,33 @@ fn init_disk() -> bool {
             continue;
         }
 
-        // Try to read WFS superblock
-        let mut buf = [0u8; 512];
-        if driver.read_sectors(0, &mut buf).is_ok() {
-            // Check for WFS magic
-            let sb = unsafe { &*(buf.as_ptr() as *const Superblock) };
-            if sb.magic == WFS_MAGIC {
+        // Try to create WFS filesystem and mount in VFS
+        match wfs_common::WfsFilesystem::new(driver) {
+            Ok(wfs_fs) => {
                 unsafe {
                     watos_arch::serial_write(b"[KERNEL] WFS filesystem detected on port ");
                     watos_arch::serial_hex(port as u64);
                     watos_arch::serial_write(b"\r\n");
-                    WFS_SUPERBLOCK = Some(*sb);
                 }
-                *DISK_DRIVER.lock() = Some(driver);
-                return true;
-            }
-        }
 
-        unsafe {
-            watos_arch::serial_write(b"[KERNEL] Port ");
-            watos_arch::serial_hex(port as u64);
-            watos_arch::serial_write(b" is not WFS\r\n");
+                // Mount as drive D: in VFS
+                match watos_vfs::mount_drive('D', alloc::boxed::Box::new(wfs_fs)) {
+                    Ok(()) => {
+                        unsafe { watos_arch::serial_write(b"[KERNEL] Mounted WFS as D:\r\n"); }
+                        return true;
+                    }
+                    Err(_) => {
+                        unsafe { watos_arch::serial_write(b"[KERNEL] Failed to mount WFS in VFS\r\n"); }
+                    }
+                }
+            }
+            Err(_) => {
+                unsafe {
+                    watos_arch::serial_write(b"[KERNEL] Port ");
+                    watos_arch::serial_hex(port as u64);
+                    watos_arch::serial_write(b" is not WFS\r\n");
+                }
+            }
         }
     }
 
@@ -555,8 +624,19 @@ fn init_vfs() -> bool {
                     }
                 }
             }
-            Err(_) => {
-                // Not a valid FAT filesystem, try next port
+            Err(e) => {
+                // Log the specific error
+                unsafe {
+                    watos_arch::serial_write(b"[KERNEL] FAT probe failed on port ");
+                    watos_arch::serial_hex(port as u64);
+                    let err_msg: &[u8] = match e {
+                        VfsError::IoError => b" IoError\r\n",
+                        VfsError::InvalidArgument => b" InvalidArgument\r\n",
+                        VfsError::NotFound => b" NotFound\r\n",
+                        _ => b" other\r\n",
+                    };
+                    watos_arch::serial_write(err_msg);
+                }
                 continue;
             }
         }
@@ -890,14 +970,11 @@ pub extern "C" fn _start() -> ! {
         unsafe { watos_arch::serial_write(b"[KERNEL] WARNING: VFS init failed\r\n"); }
     }
 
-    // Also check for WFS data disk on other ports (legacy support)
+    // Also check for WFS data disk on other ports
     let wfs_found = init_disk();
     if wfs_found {
-        // Mount WFS as D: using legacy drive table
-        let result = drive_mount(b"D", b"/wfs", b"WFS");
-        if result == 0 {
-            unsafe { watos_arch::serial_write(b"[KERNEL] Mounted D: as WFS data disk\r\n"); }
-        }
+        // Also add to legacy drive table for CURRENT_DRIVE tracking
+        drive_mount(b"D", b"/", b"WFS");
     }
 
     // 6. Execute init app (TERM.EXE) if loaded by bootloader
@@ -1414,8 +1491,15 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 // Save parent context with actual return address so we can return after child exits
                 watos_process::save_parent_context_with_frame(return_rip, return_rsp);
 
+                unsafe {
+                    watos_arch::serial_write(b"[SYSCALL] after save_parent_context\r\n");
+                }
+
                 // Execute the app with the full command line as args
                 let cmdline_str = core::str::from_utf8(cmdline).unwrap_or("");
+                unsafe {
+                    watos_arch::serial_write(b"[SYSCALL] calling exec\r\n");
+                }
                 let program_str = core::str::from_utf8(program_name).unwrap_or("app");
 
                 match watos_process::exec(program_str, app_data, cmdline_str) {
@@ -1859,9 +1943,32 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
     unsafe {
         watos_arch::serial_write(b"\r\n!!! KERNEL PANIC !!!\r\n");
+        if let Some(location) = info.location() {
+            watos_arch::serial_write(b"  at ");
+            watos_arch::serial_write(location.file().as_bytes());
+            watos_arch::serial_write(b":");
+            // Print line number
+            let mut line = location.line();
+            let mut buf = [0u8; 10];
+            let mut i = 0;
+            if line == 0 {
+                buf[0] = b'0';
+                i = 1;
+            } else {
+                while line > 0 {
+                    buf[i] = b'0' + (line % 10) as u8;
+                    line /= 10;
+                    i += 1;
+                }
+            }
+            for j in (0..i).rev() {
+                watos_arch::serial_write(&buf[j..j+1]);
+            }
+            watos_arch::serial_write(b"\r\n");
+        }
     }
     loop {
         watos_arch::halt();

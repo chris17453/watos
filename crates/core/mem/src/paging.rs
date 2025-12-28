@@ -118,6 +118,9 @@ pub struct ProcessPageTable {
     pml4: PageTable,
     /// Allocated sub-tables (for cleanup)
     allocated_tables: Vec<*mut PageTable>,
+    /// Physical pages allocated for this process (stack, heap, segments)
+    /// These are freed when the process exits
+    allocated_phys_pages: Vec<u64>,
 }
 
 impl ProcessPageTable {
@@ -128,6 +131,7 @@ impl ProcessPageTable {
         let mut ppt = ProcessPageTable {
             pml4: PageTable::new(),
             allocated_tables: Vec::new(),
+            allocated_phys_pages: Vec::new(),
         };
 
         // Map kernel space (required for interrupts/syscalls)
@@ -403,6 +407,12 @@ impl ProcessPageTable {
         table
     }
 
+    /// Track a physical page allocated for this process
+    /// The page will be freed when the ProcessPageTable is dropped
+    pub fn track_phys_page(&mut self, phys_addr: u64) {
+        self.allocated_phys_pages.push(phys_addr);
+    }
+
     /// Get physical address of PML4 (for loading into CR3)
     pub fn pml4_phys_addr(&self) -> u64 {
         self.pml4.physical_addr()
@@ -428,6 +438,11 @@ impl Default for ProcessPageTable {
 
 impl Drop for ProcessPageTable {
     fn drop(&mut self) {
+        // Free all physical pages allocated for this process (stack, heap, segments)
+        for &phys_addr in &self.allocated_phys_pages {
+            crate::phys::free_page(phys_addr);
+        }
+
         // Free all allocated sub-tables
         for &table_ptr in &self.allocated_tables {
             unsafe {

@@ -82,6 +82,13 @@ use prelude::*;
 // WFS v3 - Copy-on-Write filesystem
 pub mod v3;
 
+// VFS adapter (optional, enabled with "vfs" feature)
+#[cfg(feature = "vfs")]
+pub mod vfs;
+
+#[cfg(feature = "vfs")]
+pub use vfs::WfsFilesystem;
+
 // ============================================================================
 // VERSION AND MAGIC
 // ============================================================================

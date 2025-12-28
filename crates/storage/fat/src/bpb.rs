@@ -161,17 +161,20 @@ impl BiosParameterBlock {
         })
     }
 
-    /// Determine FAT type based on cluster count
+    /// Determine FAT type based on BPB fields and cluster count
     pub fn fat_type(&self) -> FatType {
+        // FAT32 is definitively indicated by fat_size_16 == 0
+        // This is more reliable than cluster count alone
+        if self.fat_size_16 == 0 {
+            return FatType::Fat32;
+        }
+
+        // For FAT12/16, use cluster count to distinguish
         let root_dir_sectors = ((self.root_entry_count as u32 * 32)
             + (self.bytes_per_sector as u32 - 1))
             / self.bytes_per_sector as u32;
 
-        let fat_size = if self.fat_size_16 != 0 {
-            self.fat_size_16 as u32
-        } else {
-            self.fat_size_32
-        };
+        let fat_size = self.fat_size_16 as u32;
 
         let total_sectors = if self.total_sectors_16 != 0 {
             self.total_sectors_16 as u32
@@ -188,10 +191,8 @@ impl BiosParameterBlock {
 
         if cluster_count < 4085 {
             FatType::Fat12
-        } else if cluster_count < 65525 {
-            FatType::Fat16
         } else {
-            FatType::Fat32
+            FatType::Fat16
         }
     }
 

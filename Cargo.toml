@@ -20,7 +20,7 @@ watos-driver-pci = { path = "crates/drivers/bus/pci" }
 watos-driver-ahci = { path = "crates/drivers/storage/ahci" }
 
 # Filesystem
-wfs-common = { path = "crates/storage/wfs" }
+wfs-common = { path = "crates/storage/wfs", features = ["vfs"] }
 watos-vfs = { path = "crates/storage/vfs" }
 watos-fat = { path = "crates/storage/fat" }
 

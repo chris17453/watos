@@ -163,6 +163,43 @@ impl WfsImage {
         self.write_block(block, bytes)
     }
 
+    fn add_directory(&mut self, name: &str, verbose: bool) -> std::io::Result<()> {
+        if self.file_count >= self.layout.max_files {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Too many files"));
+        }
+
+        // Create directory entry (no data blocks needed)
+        let mut entry = FileEntry::default();
+        entry.set_name(name);
+        entry.size = 0;
+        entry.start_block = 0;
+        entry.blocks = 0;
+        entry.flags = FLAG_DIR;  // Mark as directory
+        entry.data_crc32 = 0;
+        entry.crc32 = file_entry_crc(&entry);
+
+        // Calculate offset into in-memory file table
+        let (table_block, byte_offset) = self.layout.file_entry_offset(self.file_count as usize);
+        let block_in_table = (table_block - self.layout.filetable_block) as usize;
+        let absolute_offset = block_in_table * BLOCK_SIZE as usize + byte_offset;
+
+        // Insert entry into in-memory file table
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &entry as *const _ as *const u8,
+                self.file_table.as_mut_ptr().add(absolute_offset),
+                FILEENTRY_SIZE
+            );
+        }
+
+        if verbose {
+            println!("  {:20} <DIR>", name);
+        }
+
+        self.file_count += 1;
+        Ok(())
+    }
+
     fn add_file(&mut self, name: &str, data: &[u8], flags: u16, verbose: bool) -> std::io::Result<()> {
         if self.file_count >= self.layout.max_files {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "Too many files"));
@@ -377,31 +414,48 @@ fn is_executable(name: &str) -> bool {
     lower.ends_with(".sys")
 }
 
-/// Recursively collect all files from a directory
-/// Returns (relative_path, full_path) pairs where relative_path uses / as separator
+/// Recursively collect all files and directories from a directory
+/// Returns (relative_path, full_path, is_dir) tuples where relative_path uses / as separator
+/// Directories are collected before their contents to ensure proper order
 fn collect_files_recursive(
     base_dir: &PathBuf,
     current_dir: &PathBuf,
-    files: &mut Vec<(String, PathBuf)>,
+    entries: &mut Vec<(String, PathBuf, bool)>,
 ) -> std::io::Result<()> {
+    // First pass: collect files and subdirs separately
+    let mut files_in_dir: Vec<(String, PathBuf)> = Vec::new();
+    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
+
     for entry in fs::read_dir(current_dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
 
-        if file_type.is_file() {
-            // Calculate relative path from base_dir
-            let relative = path.strip_prefix(base_dir)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Path error"))?;
+        // Calculate relative path from base_dir
+        let relative = path.strip_prefix(base_dir)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Path error"))?;
 
-            // Convert to string with forward slashes
-            let relative_str = relative.to_string_lossy().replace('\\', "/");
-            files.push((relative_str, path));
+        // Convert to string with forward slashes
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+
+        if file_type.is_file() {
+            files_in_dir.push((relative_str, path));
         } else if file_type.is_dir() {
-            // Recurse into subdirectory
-            collect_files_recursive(base_dir, &path, files)?;
+            subdirs.push((relative_str, path));
         }
     }
+
+    // Add files in this directory first
+    for (name, path) in files_in_dir {
+        entries.push((name, path, false));
+    }
+
+    // Then add subdirectories (directory entry first, then recurse)
+    for (name, path) in subdirs {
+        entries.push((name.clone(), path.clone(), true));  // Directory entry
+        collect_files_recursive(base_dir, &path, entries)?;  // Contents
+    }
+
     Ok(())
 }
 
@@ -669,19 +723,25 @@ fn main() -> std::io::Result<()> {
     if let Some(dir) = &args.dir {
         println!("\nAdding files from: {}", dir.display());
 
-        // Collect all files recursively
-        let mut files_to_add: Vec<(String, PathBuf)> = Vec::new();
-        collect_files_recursive(dir, dir, &mut files_to_add)?;
+        // Collect all files and directories recursively
+        let mut entries_to_add: Vec<(String, PathBuf, bool)> = Vec::new();
+        collect_files_recursive(dir, dir, &mut entries_to_add)?;
 
-        for (relative_path, full_path) in files_to_add {
-            let data = fs::read(&full_path)?;
+        for (relative_path, full_path, is_dir) in entries_to_add {
+            if is_dir {
+                // Add directory entry
+                img.add_directory(&relative_path, args.verbose)?;
+            } else {
+                // Add file entry
+                let data = fs::read(&full_path)?;
 
-            let mut flags = 0u16;
-            if is_executable(&relative_path) {
-                flags |= FLAG_EXEC;
+                let mut flags = 0u16;
+                if is_executable(&relative_path) {
+                    flags |= FLAG_EXEC;
+                }
+
+                img.add_file(&relative_path, &data, flags, args.verbose)?;
             }
-
-            img.add_file(&relative_path, &data, flags, args.verbose)?;
         }
     }
 

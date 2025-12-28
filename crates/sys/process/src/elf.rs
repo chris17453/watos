@@ -341,6 +341,9 @@ impl Elf64 {
                 let phys_page = watos_mem::phys::alloc_page()
                     .ok_or("Out of physical memory")?;
 
+                // Track the physical page for cleanup when process exits
+                page_table.track_phys_page(phys_page);
+
                 if i == 0 {
                     unsafe {
                         debug_serial(b"  phys page[0]=0x");

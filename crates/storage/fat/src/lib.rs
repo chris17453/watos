@@ -144,9 +144,9 @@ impl<D: BlockDevice> FatInner<D> {
         let mut sector_buf = [0u8; 512];
 
         for i in 0..root_dir_sectors {
-            self.device
-                .read_sectors(root_start + i as u64, &mut sector_buf)
-                .map_err(|_| VfsError::IoError)?;
+            if self.device.read_sectors(root_start + i as u64, &mut sector_buf).is_err() {
+                return Err(VfsError::IoError);
+            }
 
             for entry in DirEntryIterator::new(&sector_buf) {
                 if entry.matches_name(name) {

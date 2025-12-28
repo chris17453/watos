@@ -379,20 +379,39 @@ fn allocate_process_memory(pid: u32) -> (u64, u64, u64) {
 /// Load and execute an ELF64 binary
 /// args is the full command line (program name + arguments)
 pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
+    unsafe {
+        debug_serial(b"[EXEC] start, heap used=");
+        let stats = watos_mem::heap::stats();
+        debug_hex(stats.used as u64);
+        debug_serial(b" free=");
+        debug_hex(stats.free as u64);
+        debug_serial(b"\r\n");
+    }
+
     // CRITICAL: Copy name and args BEFORE switching page tables!
     // The strings may point to user space which becomes invalid after CR3 switch.
+    unsafe { debug_serial(b"[EXEC] copying name\r\n"); }
     let name_copy = String::from(name);
+    unsafe { debug_serial(b"[EXEC] copying args\r\n"); }
     let args_copy = String::from(args);
 
     // CRITICAL: Switch to kernel page table before loading
     // When called from user process, CR3 points to that process's page table
     // which only has limited mappings. Kernel's UEFI page table has full identity map.
     unsafe {
-        if KERNEL_PML4 != 0 {
+        debug_serial(b"[EXEC] switching CR3, KERNEL_PML4=0x");
+        debug_hex(KERNEL_PML4);
+        debug_serial(b"\r\n");
+        if KERNEL_PML4 != 0 && KERNEL_PML4 < 0x10000000 {
             watos_mem::paging::load_cr3(KERNEL_PML4);
+        } else {
+            debug_serial(b"[EXEC] ERROR: Invalid KERNEL_PML4!\r\n");
+            return Err("Invalid kernel page table");
         }
+        debug_serial(b"[EXEC] CR3 switched\r\n");
     }
 
+    unsafe { debug_serial(b"[EXEC] parsing ELF\r\n"); }
     let elf = elf::Elf64::parse(data)?;
 
     let pid = unsafe {
@@ -418,6 +437,7 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         let phys_addr = watos_mem::phys::alloc_page()
             .ok_or("Out of physical memory for stack")? as u64;
         unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
+        page_table.track_phys_page(phys_addr);
         page_table.map_user_page(virt_addr, phys_addr,
             page_flags::PRESENT | page_flags::WRITABLE)?;
     }
@@ -432,6 +452,7 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         let phys_addr = watos_mem::phys::alloc_page()
             .ok_or("Out of physical memory for heap")? as u64;
         unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
+        page_table.track_phys_page(phys_addr);
         page_table.map_user_page(virt_addr, phys_addr,
             page_flags::PRESENT | page_flags::WRITABLE)?;
     }

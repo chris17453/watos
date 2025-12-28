@@ -6,5 +6,9 @@ edition = "2021"
 [features]
 default = []
 std = []
+vfs = ["watos-vfs", "watos-driver-traits", "spin"]
 
 [dependencies]
+watos-vfs = { path = "../vfs", optional = true }
+watos-driver-traits = { path = "../../drivers/traits", optional = true }
+spin = { version = "0.5.2", optional = true }

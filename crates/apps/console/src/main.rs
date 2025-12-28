@@ -650,15 +650,10 @@ fn is_drive_letter(cmd: &str) -> bool {
 
 /// Process a command
 fn process_command(console: &mut ConsoleManager, cmd: &str) {
-    serial_write("!!!PROC_CMD_START!!!\r\n");
     let cmd = cmd.trim();
 
     // Check for drive letter change (DOS-style: just type "C:" to change drive)
     if is_drive_letter(cmd) {
-        serial_write("[CONSOLE] Drive change: ");
-        serial_write(cmd);
-        serial_write("\r\n");
-
         let result = chdir(cmd.as_bytes());
         if result != 0 {
             console.write_str("Invalid drive: ");
@@ -670,9 +665,6 @@ fn process_command(console: &mut ConsoleManager, cmd: &str) {
 
     // Parse redirections
     let redir = parse_redirections(cmd);
-    serial_write("!!!REDIR:");
-    serial_write(if redir.output_file.is_some() { "YES" } else { "NO" });
-    serial_write("!!!\r\n");
     let cmd = redir.cmd;
 
     // Parse command and arguments
@@ -745,83 +737,64 @@ fn process_command(console: &mut ConsoleManager, cmd: &str) {
         "" => {}
         _ => {
             // Try to execute as external program with full command line
-            serial_write("[CONSOLE] Executing: ");
-            serial_write(cmd);
-            serial_write("\r\n");
 
-            // Open output file if redirection requested
-            let output_fd: Option<i64> = if let Some(file) = redir.output_file {
-                let fd = open_file_write(file, redir.append);
-                if fd < 0 {
-                    console.write_str("Error: Cannot open '");
-                    console.write_str(file);
-                    console.write_str("' for writing\r\n");
-                    return;
+            // Store redirection info in static to survive across exec
+            // (local variables can get corrupted during exec context switch)
+            static mut HAS_OUTPUT_REDIR: bool = false;
+            static mut OUTPUT_APPEND: bool = false;
+            static mut OUTPUT_FILE_BUF: [u8; 64] = [0u8; 64];
+            static mut OUTPUT_FILE_LEN: usize = 0;
+
+            unsafe {
+                HAS_OUTPUT_REDIR = redir.output_file.is_some();
+                OUTPUT_APPEND = redir.append;
+                if let Some(file) = redir.output_file {
+                    let bytes = file.as_bytes();
+                    OUTPUT_FILE_LEN = bytes.len().min(64);
+                    OUTPUT_FILE_BUF[..OUTPUT_FILE_LEN].copy_from_slice(&bytes[..OUTPUT_FILE_LEN]);
                 }
-                Some(fd)
-            } else {
-                None
-            };
-
-            // Pass full command line (program + args) to exec
-            serial_write("!!!BEFORE_EXEC!!!\r\n");
-            let result = exec_program(cmd);
-            serial_write("!!!AFTER_EXEC!!!\r\n");
-
-            // Debug: confirm we returned from exec
-            serial_write("[CONSOLE] exec returned: ");
-            if result == 0 {
-                serial_write("success\r\n");
-            } else if result == 1 {
-                serial_write("error\r\n");
-            } else if result == 2 {
-                serial_write("not found\r\n");
-            } else {
-                serial_write("unknown\r\n");
             }
 
+            // Pass full command line (program + args) to exec
+            let result = exec_program(cmd);
+
             // Reset keyboard state after child process returns
-            // This prevents corruption from key events that occurred during child execution
             console.keyboard_mut().reset();
 
             // Drain any stale scancodes from the buffer
             while read_scancode() != 0 {}
-            serial_write("[CONSOLE] Keyboard state reset\r\n");
 
             // Handle output - either redirect to file or display on console
-            serial_write("!!!CHECK_OUTPUT_FD=");
-            serial_write(if output_fd.is_some() { "SOME" } else { "NONE" });
-            serial_write("!!!\r\n");
+            // Re-read the static variables AFTER exec to avoid stack corruption
             let mut output_buf = [0u8; 256];
-            if let Some(fd) = output_fd {
-                serial_write("!!!TAKING_SOME_BRANCH!!!\r\n");
+            let has_redir = unsafe { HAS_OUTPUT_REDIR };
+
+            if has_redir {
                 // Redirect output to file
-                loop {
-                    let bytes = read_console_output(&mut output_buf);
-                    if bytes == 0 {
-                        break;
+                let file_path = unsafe {
+                    core::str::from_utf8(&OUTPUT_FILE_BUF[..OUTPUT_FILE_LEN]).unwrap_or("")
+                };
+                let append = unsafe { OUTPUT_APPEND };
+                let output_fd = open_file_write(file_path, append);
+
+                if output_fd < 0 {
+                    console.write_str("Error: Cannot open '");
+                    console.write_str(file_path);
+                    console.write_str("' for writing\r\n");
+                } else {
+                    loop {
+                        let bytes = read_console_output(&mut output_buf);
+                        if bytes == 0 {
+                            break;
+                        }
+                        write_fd(output_fd, &output_buf[..bytes]);
                     }
-                    // Write to file instead of console
-                    write_fd(fd, &output_buf[..bytes]);
+                    close_fd(output_fd);
                 }
-                close_fd(fd);
             } else {
                 // No redirection - display output on console
-                serial_write("None\r\n");
-                serial_write("[CONSOLE] Draining output buffer...\r\n");
                 loop {
                     let bytes = read_console_output(&mut output_buf);
-                    serial_write("[CONSOLE] drain got ");
-                    // Print bytes count
-                    if bytes < 10 {
-                        let digit = b'0' + bytes as u8;
-                        unsafe {
-                            syscall3(syscall::SYS_WRITE, 0, &digit as *const u8 as u64, 1);
-                        }
-                    } else {
-                        serial_write("10+");
-                    }
-                    serial_write(" bytes\r\n");
                     if bytes == 0 {
                         break;
                     }
@@ -832,7 +805,6 @@ fn process_command(console: &mut ConsoleManager, cmd: &str) {
                         console.write(&output_buf[..bytes]);
                     }
                 }
-                serial_write("[CONSOLE] Done draining\r\n");
             }
 
             match result {
