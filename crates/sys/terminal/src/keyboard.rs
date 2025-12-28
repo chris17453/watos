@@ -80,6 +80,13 @@ impl Keyboard {
         }
     }
 
+    /// Reset keyboard state (clears modifiers and extended flag)
+    /// Call this after returning from a child process to prevent state corruption
+    pub fn reset(&mut self) {
+        self.modifiers = Modifiers::empty();
+        self.extended = false;
+    }
+
     /// Process a raw PS/2 scancode, returning a key event if applicable
     pub fn process_scancode(&mut self, scancode: u8) -> Option<KeyEvent> {
         // Handle extended prefix

@@ -180,6 +180,11 @@ impl ConsoleManager {
         &self.keyboard
     }
 
+    /// Get mutable keyboard handler reference (for resetting state after child process)
+    pub fn keyboard_mut(&mut self) -> &mut Keyboard {
+        &mut self.keyboard
+    }
+
     /// Get dimensions
     pub fn size(&self) -> (usize, usize) {
         (self.cols, self.rows)

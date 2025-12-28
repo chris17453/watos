@@ -190,13 +190,45 @@ pub unsafe extern "C" fn bound_range() {
 #[unsafe(naked)]
 pub unsafe extern "C" fn invalid_opcode() {
     naked_asm!(
-        "mov al, 0x55", // 'U'
         "mov dx, 0x3F8",
+        "mov al, 0x55", // 'U'
         "out dx, al",
         "mov al, 0x44", // 'D'
         "out dx, al",
         "mov al, 0x36", // '6'
         "out dx, al",
+        "mov al, 0x20", // ' '
+        "out dx, al",
+        "mov al, 0x52", // 'R'
+        "out dx, al",
+        "mov al, 0x49", // 'I'
+        "out dx, al",
+        "mov al, 0x50", // 'P'
+        "out dx, al",
+        "mov al, 0x3D", // '='
+        "out dx, al",
+
+        // Print RIP from stack [RSP] as 16 hex digits
+        "mov rax, [rsp]",    // Load RIP from interrupt frame
+        "mov r8, 15",        // Start from digit 15 (leftmost)
+        "3:",
+        "mov rbx, rax",
+        "mov rcx, r8",
+        "shl rcx, 2",        // Multiply by 4 to get shift amount
+        "shr rbx, cl",       // Shift right by (digit * 4)
+        "and rbx, 0xF",
+        "add bl, 0x30",
+        "cmp bl, 0x3A",
+        "jl 4f",
+        "add bl, 7",
+        "4:",
+        "push rax",
+        "mov al, bl",
+        "out dx, al",
+        "pop rax",
+        "dec r8",
+        "jns 3b",            // Loop while r8 >= 0
+
         "jmp {common}",
         common = sym exception_common,
         options()
@@ -397,29 +429,93 @@ pub unsafe extern "C" fn page_fault() {
         "mov al, 0x3D", // '='
         "out dx, al",
 
-        // Read CR2 (faulting address) and print as hex
+        // Read CR2 (faulting address) and print as 16 hex digits
+        // Use r8 for counter, rcx for shift amount
         "mov rax, cr2",
-        "mov rcx, 16",
+        "mov r8, 15",   // Start from digit 15 (leftmost)
         "3:",
-        "sub rcx, 1",
         "mov rbx, rax",
-        "mov cl, cl",  // Use cl as shift amount
-        "shl cl, 2",   // Multiply by 4
-        "shr rbx, cl",
-        "and rbx, 0xF",
-        "add bl, 0x30",
+        "mov rcx, r8",
+        "shl rcx, 2",   // Multiply by 4 to get shift amount
+        "shr rbx, cl",  // Shift right by (digit * 4)
+        "and rbx, 0xF", // Mask to get single hex digit
+        "add bl, 0x30", // Convert to ASCII
         "cmp bl, 0x3A",
         "jl 4f",
-        "add bl, 7",
+        "add bl, 7",    // Adjust for A-F
         "4:",
         "push rax",
         "mov al, bl",
         "out dx, al",
         "pop rax",
-        "mov cl, cl",
-        "add rcx, 1",
-        "cmp rcx, 16",
-        "jl 3b",
+        "dec r8",
+        "jns 3b",       // Loop while r8 >= 0
+
+        // Print " ERR="
+        "mov al, 0x20",
+        "out dx, al",
+        "mov al, 0x45", // 'E'
+        "out dx, al",
+        "mov al, 0x52", // 'R'
+        "out dx, al",
+        "mov al, 0x52", // 'R'
+        "out dx, al",
+        "mov al, 0x3D", // '='
+        "out dx, al",
+
+        // Error code is at [rsp], print as 4 hex digits
+        "mov rax, [rsp]",
+        "mov r8, 3",    // 4 digits (0-3)
+        "5:",
+        "mov rbx, rax",
+        "mov rcx, r8",
+        "shl rcx, 2",
+        "shr rbx, cl",
+        "and rbx, 0xF",
+        "add bl, 0x30",
+        "cmp bl, 0x3A",
+        "jl 6f",
+        "add bl, 7",
+        "6:",
+        "push rax",
+        "mov al, bl",
+        "out dx, al",
+        "pop rax",
+        "dec r8",
+        "jns 5b",
+
+        // Print " RIP="
+        "mov al, 0x20",
+        "out dx, al",
+        "mov al, 0x52", // 'R'
+        "out dx, al",
+        "mov al, 0x49", // 'I'
+        "out dx, al",
+        "mov al, 0x50", // 'P'
+        "out dx, al",
+        "mov al, 0x3D", // '='
+        "out dx, al",
+
+        // RIP is at [rsp+8], print as 16 hex digits
+        "mov rax, [rsp+8]",
+        "mov r8, 15",
+        "7:",
+        "mov rbx, rax",
+        "mov rcx, r8",
+        "shl rcx, 2",
+        "shr rbx, cl",
+        "and rbx, 0xF",
+        "add bl, 0x30",
+        "cmp bl, 0x3A",
+        "jl 8f",
+        "add bl, 7",
+        "8:",
+        "push rax",
+        "mov al, bl",
+        "out dx, al",
+        "pop rax",
+        "dec r8",
+        "jns 7b",
 
         // Pop error code
         "add rsp, 8",

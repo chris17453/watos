@@ -57,6 +57,42 @@ const BOOT_MAGIC: u32 = 0x5741544F; // "WATO"
 /// Global boot info (copied from bootloader)
 static mut BOOT_INFO: Option<BootInfo> = None;
 
+/// Kernel Console Subsystem - ring buffer for process output
+/// All SYS_WRITE calls go here, console app reads from here
+const CONSOLE_BUFFER_SIZE: usize = 4096;
+static mut CONSOLE_BUFFER: [u8; CONSOLE_BUFFER_SIZE] = [0; CONSOLE_BUFFER_SIZE];
+static mut CONSOLE_READ_POS: usize = 0;
+static mut CONSOLE_WRITE_POS: usize = 0;
+
+/// Write bytes to the console ring buffer
+fn console_write(data: &[u8]) {
+    unsafe {
+        for &byte in data {
+            let next_write = (CONSOLE_WRITE_POS + 1) % CONSOLE_BUFFER_SIZE;
+            // If buffer is full, drop oldest byte (advance read pos)
+            if next_write == CONSOLE_READ_POS {
+                CONSOLE_READ_POS = (CONSOLE_READ_POS + 1) % CONSOLE_BUFFER_SIZE;
+            }
+            CONSOLE_BUFFER[CONSOLE_WRITE_POS] = byte;
+            CONSOLE_WRITE_POS = next_write;
+        }
+    }
+}
+
+/// Read bytes from the console ring buffer (non-blocking)
+/// Returns number of bytes read
+fn console_read(buf: &mut [u8]) -> usize {
+    unsafe {
+        let mut count = 0;
+        while count < buf.len() && CONSOLE_READ_POS != CONSOLE_WRITE_POS {
+            buf[count] = CONSOLE_BUFFER[CONSOLE_READ_POS];
+            CONSOLE_READ_POS = (CONSOLE_READ_POS + 1) % CONSOLE_BUFFER_SIZE;
+            count += 1;
+        }
+        count
+    }
+}
+
 /// Find a preloaded app by name (case-insensitive)
 fn find_preloaded_app(name: &[u8]) -> Option<(u64, u64)> {
     unsafe {
@@ -115,6 +151,12 @@ pub extern "C" fn _start() -> ! {
     // 4. Install syscall handler
     watos_arch::idt::install_syscall_handler(syscall_handler);
     unsafe { watos_arch::serial_write(b"[KERNEL] Syscall handler installed\r\n"); }
+
+    // 4.5. Initialize physical page allocator
+    // Start at 16MB (0x1000000), give 128MB for process physical pages
+    // This memory is used for process code, stack, and heap pages
+    watos_mem::phys::init(0x1000000, 128 * 1024 * 1024);
+    unsafe { watos_arch::serial_write(b"[KERNEL] Physical allocator initialized (128MB @ 16MB)\r\n"); }
 
     // 5. Initialize process subsystem
     watos_process::init();
@@ -177,6 +219,10 @@ mod syscall {
     // System
     pub const SYS_MALLOC: u64 = 14;
     pub const SYS_FREE: u64 = 15;
+
+    // Console handle management
+    pub const SYS_CONSOLE_OUT: u64 = 21;   // Get stdout handle (returns 1)
+    pub const SYS_CONSOLE_ERR: u64 = 22;   // Get stderr handle (returns 2)
 
     // Framebuffer
     pub const SYS_FB_INFO: u64 = 50;
@@ -277,22 +323,63 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         }
 
         syscall::SYS_WRITE => {
-            // arg1 = fd (ignored for now, always serial)
+            // arg1 = fd (0=serial only, 1=stdout/console, 2=stderr/console)
             // arg2 = pointer to string
             // arg3 = length
+            let fd = arg1;
             let ptr = arg2 as *const u8;
             let len = arg3 as usize;
             unsafe {
                 let slice = core::slice::from_raw_parts(ptr, len);
+
+                // Always write to serial for debugging
                 watos_arch::serial_write(slice);
+
+                // If fd is stdout (1) or stderr (2), also write to console buffer
+                // The console app will read from this buffer and display it
+                if fd == 1 || fd == 2 {
+                    console_write(slice);
+                }
             }
             len as u64
         }
 
         syscall::SYS_READ => {
-            // arg1 = fd (ignored), arg2 = buffer, arg3 = max_len
-            // For now, just return 0 (no data)
-            0
+            // arg1 = fd, arg2 = buffer, arg3 = max_len
+            // fd=0: read from console buffer (what other processes wrote to stdout)
+            let fd = arg1;
+            let buf_ptr = arg2 as *mut u8;
+            let buf_size = arg3 as usize;
+
+            if buf_ptr.is_null() || buf_size == 0 {
+                return 0;
+            }
+
+            if fd == 0 {
+                // Read from console output buffer
+                let mut temp = [0u8; 256];
+                let read_size = buf_size.min(temp.len());
+                let count = console_read(&mut temp[..read_size]);
+                if count > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, count);
+                    }
+                }
+                count as u64
+            } else {
+                // Other fds not yet implemented
+                0
+            }
+        }
+
+        syscall::SYS_CONSOLE_OUT => {
+            // Return stdout file descriptor
+            1
+        }
+
+        syscall::SYS_CONSOLE_ERR => {
+            // Return stderr file descriptor
+            2
         }
 
         syscall::SYS_GETKEY => {

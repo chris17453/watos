@@ -119,6 +119,15 @@ fn exec_program(name: &str) -> u64 {
     }
 }
 
+/// Read pending output from kernel console buffer (fd=0)
+/// Returns the number of bytes read (0 if empty)
+fn read_console_output(buf: &mut [u8]) -> usize {
+    unsafe {
+        // SYS_READ with fd=0 reads from the console output buffer
+        syscall3(syscall::SYS_READ, 0, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
+    }
+}
+
 // ============================================================================
 // Global Allocator (via syscalls)
 // ============================================================================
@@ -151,14 +160,19 @@ extern "C" fn _start() -> ! {
     serial_write("[CONSOLE] Starting console app\r\n");
 
     // Get framebuffer info from kernel
+    serial_write("[CONSOLE] Getting FB addr...\r\n");
     let fb_address = fb_addr();
+    serial_write("[CONSOLE] FB addr done\r\n");
     if fb_address == 0 {
         serial_write("[CONSOLE] ERROR: No framebuffer\r\n");
         exit(1);
     }
 
+    serial_write("[CONSOLE] Getting dimensions...\r\n");
     let (width, height, pitch) = fb_dimensions();
+    serial_write("[CONSOLE] Dimensions done\r\n");
 
+    serial_write("[CONSOLE] Creating FB struct...\r\n");
     // Create framebuffer
     let fb_info = FramebufferInfo {
         width,
@@ -171,14 +185,43 @@ extern "C" fn _start() -> ! {
     let mut framebuffer = unsafe {
         SimpleFramebuffer::new(fb_address as *mut u32, fb_info)
     };
+    serial_write("[CONSOLE] FB struct done\r\n");
 
     // Calculate terminal size (8x16 font)
     let cols = (width / 8) as usize;
     let rows = (height / 16) as usize;
 
+    serial_write("[CONSOLE] About to create console manager\r\n");
+    serial_write("[CONSOLE] cols=");
+    // Print cols and rows as simple hex
+    unsafe {
+        let mut buf = [0u8; 8];
+        let mut n = cols;
+        for i in (0..8).rev() {
+            let digit = (n & 0xF) as u8;
+            buf[i] = if digit < 10 { b'0' + digit } else { b'A' + digit - 10 };
+            n >>= 4;
+        }
+        syscall3(syscall::SYS_WRITE, 0, buf.as_ptr() as u64, 8);
+    }
+    serial_write(" rows=");
+    unsafe {
+        let mut buf = [0u8; 8];
+        let mut n = rows;
+        for i in (0..8).rev() {
+            let digit = (n & 0xF) as u8;
+            buf[i] = if digit < 10 { b'0' + digit } else { b'A' + digit - 10 };
+            n >>= 4;
+        }
+        syscall3(syscall::SYS_WRITE, 0, buf.as_ptr() as u64, 8);
+    }
+    serial_write("\r\n");
+    serial_write("[CONSOLE] Calling ConsoleManager::new...\r\n");
     // Create console manager with one terminal
     let mut console = ConsoleManager::new(cols, rows);
+    serial_write("[CONSOLE] Console manager done\r\n");
     console.init_consoles(1);
+    serial_write("[CONSOLE] Consoles initialized\r\n");
 
     // Display welcome message
     console.write_str("\x1b[2J\x1b[H"); // Clear screen, home cursor
@@ -195,10 +238,23 @@ extern "C" fn _start() -> ! {
     let mut cmd_buffer = [0u8; 256];
     let mut cmd_len = 0usize;
 
+    // Buffer for reading kernel console output
+    let mut console_buf = [0u8; 256];
+
     // Main loop
-    let mut loop_count: u64 = 0;
     loop {
-        loop_count += 1;
+        // Poll for any output from kernel console buffer (from child processes)
+        let bytes_read = read_console_output(&mut console_buf);
+        if bytes_read > 0 {
+            // Process output through terminal emulator and render
+            if let Ok(s) = core::str::from_utf8(&console_buf[..bytes_read]) {
+                console.write_str(s);
+            } else {
+                console.write(&console_buf[..bytes_read]);
+            }
+            console.render(&mut framebuffer);
+        }
+
         // Read keyboard
         let scancode = read_scancode();
         if scancode != 0 {
@@ -361,6 +417,17 @@ fn process_command(console: &mut ConsoleManager, cmd: &str) {
             } else {
                 serial_write("unknown\r\n");
             }
+
+            // Reset keyboard state after child process returns
+            // This prevents corruption from key events that occurred during child execution
+            console.keyboard_mut().reset();
+
+            // Drain any stale scancodes from the buffer
+            while read_scancode() != 0 {}
+            serial_write("[CONSOLE] Keyboard state reset\r\n");
+
+            // Note: Child output is now handled via kernel console buffer
+            // The main loop polls console_read() and displays any pending output
 
             match result {
                 0 => {

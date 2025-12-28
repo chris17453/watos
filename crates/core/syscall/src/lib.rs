@@ -34,6 +34,7 @@ pub mod numbers {
     pub const SYS_CONSOLE_IN: u32 = 20;    // Get stdin handle
     pub const SYS_CONSOLE_OUT: u32 = 21;   // Get stdout handle
     pub const SYS_CONSOLE_ERR: u32 = 22;   // Get stderr handle
+    pub const SYS_CONSOLE_READ: u32 = 23;  // Read from kernel console buffer (for terminal app)
 
     // VGA Graphics
     pub const SYS_VGA_SET_MODE: u32 = 30;

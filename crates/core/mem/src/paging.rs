@@ -138,20 +138,23 @@ impl ProcessPageTable {
 
     /// Map kernel space into this page table
     ///
-    /// Maps only the kernel-used physical memory to:
-    /// 1. Identity mapping (virt = phys) for kernel code
+    /// Maps kernel memory regions to:
+    /// 1. Identity mapping (virt = phys) for kernel code/data access
     /// 2. High canonical addresses for proper kernel space
+    ///
+    /// Covers:
+    /// - First 8MB: kernel code, heap, bootloader data, kernel stacks
+    /// - 16MB-48MB: physical page allocator region (for kernel access during syscalls)
     ///
     /// NOTE: Currently includes USER flag for shared kernel/user memory (like heap).
     /// This allows user processes to use kernel-allocated memory (SYS_MALLOC).
-    /// TODO: Implement proper per-process heap for better isolation.
     fn map_kernel_space(&mut self) {
         // Include USER flag so user code can access kernel heap (for SYS_MALLOC)
         let kernel_flags = flags::PRESENT | flags::WRITABLE | flags::GLOBAL | flags::USER;
+        let kernel_only_flags = flags::PRESENT | flags::WRITABLE | flags::GLOBAL;
 
         // Map first 8MB (4 x 2MB pages) using huge pages
-        // This covers kernel code (0x100000), heap (0x200000-0x600000), and app data (0x600000)
-        // User processes will be mapped at 0x1000000+ (16MB) and higher
+        // This covers kernel code (0x100000), heap, app data, and kernel stacks (0x280000+)
         for i in 0..4 {
             let phys_addr = (i as u64) * LARGE_PAGE_SIZE as u64;
 
@@ -160,8 +163,12 @@ impl ProcessPageTable {
 
             // High canonical mapping for proper kernel space (kernel only)
             let high_virt = KERNEL_SPACE_START + phys_addr;
-            self.map_large_page(high_virt, phys_addr, flags::PRESENT | flags::WRITABLE | flags::GLOBAL);
+            self.map_large_page(high_virt, phys_addr, kernel_only_flags);
         }
+
+        // NOTE: Do NOT map 16MB+ here - that's where user processes are loaded.
+        // Kernel accesses to physical pages during syscalls use the KERNEL page table
+        // (we switch to it before exec/loading), not the user page table.
     }
 
     /// Map a 2MB large page
@@ -278,6 +285,49 @@ impl ProcessPageTable {
 
         // Set final page entry
         pt.set_entry(pt_idx, phys_addr | flags);
+    }
+
+    /// Look up the physical address for a virtual address
+    /// Returns None if the page is not mapped
+    pub fn lookup(&self, virt_addr: u64) -> Option<u64> {
+        let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+        let pdp_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+        let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+        let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+        if !self.pml4.is_present(pml4_idx) {
+            return None;
+        }
+
+        let pdp_phys = self.pml4.get_entry(pml4_idx) & flags::ADDR_MASK;
+        let pdp = unsafe { &*(pdp_phys as *const PageTable) };
+
+        if !pdp.is_present(pdp_idx) {
+            return None;
+        }
+
+        let pd_phys = pdp.get_entry(pdp_idx) & flags::ADDR_MASK;
+        let pd = unsafe { &*(pd_phys as *const PageTable) };
+
+        if !pd.is_present(pd_idx) {
+            return None;
+        }
+
+        // Check for huge page (2MB)
+        if (pd.get_entry(pd_idx) & flags::HUGE_PAGE) != 0 {
+            let huge_phys = pd.get_entry(pd_idx) & flags::ADDR_MASK;
+            return Some(huge_phys + (virt_addr & 0x1FFFFF)); // offset within 2MB page
+        }
+
+        let pt_phys = pd.get_entry(pd_idx) & flags::ADDR_MASK;
+        let pt = unsafe { &*(pt_phys as *const PageTable) };
+
+        let pt_entry = pt.get_entry(pt_idx);
+        if (pt_entry & flags::PRESENT) == 0 {
+            return None;
+        }
+
+        Some(pt_entry & flags::ADDR_MASK)
     }
 
     /// Unmap a 4KB page

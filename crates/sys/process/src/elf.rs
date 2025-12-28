@@ -243,11 +243,12 @@ impl Elf64 {
     }
 
     /// Load ELF segments with memory protection via page tables
+    ///
+    /// Allocates fresh physical pages for each segment to ensure process isolation.
     pub fn load_segments_protected(&self, data: &[u8], load_base: u64, page_table: &mut watos_mem::paging::ProcessPageTable) -> Result<(), &'static str> {
         use watos_mem::paging::{flags as page_flags, PAGE_SIZE};
         use super::{debug_serial, debug_hex};
 
-        // Debug: show phdrs slice info
         unsafe {
             debug_serial(b"load_segments: phdrs ptr=0x");
             debug_hex(self.phdrs.as_ptr() as u64);
@@ -277,92 +278,134 @@ impl Elf64 {
             let file_size = phdr.filesz as usize;
             let mem_size = phdr.memsz as usize;
 
-            // Calculate destination with relocation
-            let dest_addr = load_base + (phdr.vaddr - min_vaddr);
+            // Calculate virtual address with relocation
+            let virt_addr = load_base + (phdr.vaddr - min_vaddr);
 
             unsafe {
                 debug_serial(b"  segment: vaddr=0x");
                 debug_hex(phdr.vaddr);
                 debug_serial(b" dest=0x");
-                debug_hex(dest_addr);
+                debug_hex(virt_addr);
                 debug_serial(b" offset=0x");
-                debug_hex(src_offset as u64);
+                debug_hex(phdr.offset);
                 debug_serial(b" filesz=0x");
-                debug_hex(file_size as u64);
+                debug_hex(phdr.filesz);
                 debug_serial(b"\r\n");
             }
 
-            // Validate ranges
+            // Validate source
             if src_offset + file_size > data.len() {
                 return Err("Segment outside file");
             }
 
-            unsafe {
-                debug_serial(b"  copying from 0x");
-                debug_hex(data.as_ptr().add(src_offset) as u64);
-                debug_serial(b" to 0x");
-                debug_hex(dest_addr);
-                debug_serial(b"\r\n");
-            }
-
-            // First, map the destination pages in the kernel's current page table
-            // so we can write to them during the copy
-            let page_start = dest_addr & !(PAGE_SIZE as u64 - 1);
-            let page_end = (dest_addr + mem_size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+            // Calculate pages needed
+            let page_start = virt_addr & !(PAGE_SIZE as u64 - 1);
+            let page_end = (virt_addr + mem_size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
             let num_pages = ((page_end - page_start) / PAGE_SIZE as u64) as usize;
 
-            unsafe {
-                // Map pages identity-mapped so we can write to them
-                // Use 2MB pages if possible for efficiency
-                for i in 0..num_pages {
-                    let addr = page_start + (i as u64 * PAGE_SIZE as u64);
-                    // Map using 4KB pages into current page table (UEFI's)
-                    // We use inline assembly to directly modify the page tables
-                    // This is a temporary mapping for the copy
-                    core::arch::asm!(
-                        // Identity map addr as a 4KB page if not already mapped
-                        // For now, just try the write - if it faults, we have a problem
-                        // TODO: Properly map in UEFI's page table
-                        "",
-                        options(nomem, nostack)
-                    );
-                }
-            }
-
-            // Copy segment data first
-            unsafe {
-                let dest = dest_addr as *mut u8;
-                let src = data.as_ptr().add(src_offset);
-
-                debug_serial(b"  copying ");
-                debug_hex(file_size as u64);
-                debug_serial(b" bytes...\r\n");
-
-                core::ptr::copy_nonoverlapping(src, dest, file_size);
-
-                // Zero BSS section
-                if mem_size > file_size {
-                    core::ptr::write_bytes(dest.add(file_size), 0, mem_size - file_size);
-                }
-            }
-
-            // Map pages with appropriate permissions
-            let page_start = dest_addr & !(PAGE_SIZE as u64 - 1);
-            let page_end = (dest_addr + mem_size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
-            
             // Determine page flags from ELF flags
-            // Note: NO_EXECUTE (NX) requires EFER.NXE to be set, which we haven't done yet
             let mut flags = page_flags::PRESENT;
             if phdr.flags & PF_W != 0 {
                 flags |= page_flags::WRITABLE;
             }
-            // TODO: Enable NXE in EFER and then use NO_EXECUTE for non-executable pages
 
-            // Map each page
-            let mut current_page = page_start;
-            while current_page < page_end {
-                page_table.map_user_page(current_page, current_page, flags)?;
-                current_page += PAGE_SIZE as u64;
+            unsafe {
+                debug_serial(b"  copying from 0x");
+                debug_hex(data.as_ptr() as u64 + src_offset as u64);
+                debug_serial(b" to 0x");
+                debug_hex(virt_addr);
+                debug_serial(b"\r\n  copying ");
+                debug_hex(file_size as u64);
+                debug_serial(b" bytes...\r\n");
+            }
+
+            // For each page needed:
+            // 1. Check if page is already mapped (from previous segment)
+            // 2. Allocate a fresh physical page
+            // 3. Copy existing page contents if overlapping (preserve previous segment data)
+            // 4. Copy new segment data to it
+            // 5. Map virtual address to physical page
+            for i in 0..num_pages {
+                let page_virt = page_start + (i as u64 * PAGE_SIZE as u64);
+
+                // Check if this page is already mapped from a previous segment
+                let existing_phys = page_table.lookup(page_virt);
+
+                // Allocate physical page
+                let phys_page = watos_mem::phys::alloc_page()
+                    .ok_or("Out of physical memory")?;
+
+                if i == 0 {
+                    unsafe {
+                        debug_serial(b"  phys page[0]=0x");
+                        debug_hex(phys_page);
+                        debug_serial(b" -> virt=0x");
+                        debug_hex(page_virt);
+                        if existing_phys.is_some() {
+                            debug_serial(b" (overlap from 0x");
+                            debug_hex(existing_phys.unwrap());
+                            debug_serial(b")");
+                        }
+                        debug_serial(b"\r\n");
+                    }
+                }
+
+                // Calculate what part of the segment goes in this page
+                let page_offset = if page_virt < virt_addr { 0 } else { page_virt - virt_addr };
+                let dest_in_page = if page_virt < virt_addr { (virt_addr - page_virt) as usize } else { 0 };
+
+                // If this page was already mapped, copy existing contents first
+                // Otherwise, zero the page
+                unsafe {
+                    if let Some(old_phys) = existing_phys {
+                        // Copy existing page contents to preserve data from previous segment
+                        core::ptr::copy_nonoverlapping(
+                            old_phys as *const u8,
+                            phys_page as *mut u8,
+                            PAGE_SIZE
+                        );
+                    } else {
+                        // Zero the new page
+                        core::ptr::write_bytes(phys_page as *mut u8, 0, PAGE_SIZE);
+                    }
+                }
+
+                // Copy file data if this page contains any
+                if page_offset < file_size as u64 {
+                    let copy_start = page_offset as usize;
+                    let copy_end = ((page_offset as usize + PAGE_SIZE - dest_in_page).min(file_size)).min(copy_start + PAGE_SIZE - dest_in_page);
+                    let copy_len = copy_end.saturating_sub(copy_start);
+
+                    if copy_len > 0 {
+                        unsafe {
+                            let src = data.as_ptr().add(src_offset + copy_start);
+                            let dest = (phys_page as *mut u8).add(dest_in_page);
+
+                            // Debug: if this is the .got segment (small size), print source value
+                            if file_size < 0x20 && i == 0 {
+                                debug_serial(b"  GOT debug: src=0x");
+                                debug_hex(src as u64);
+                                debug_serial(b" val=0x");
+                                debug_hex(*(src as *const u64));
+                                debug_serial(b" dest=0x");
+                                debug_hex(dest as u64);
+                                debug_serial(b"\r\n");
+                            }
+
+                            core::ptr::copy_nonoverlapping(src, dest, copy_len);
+
+                            // Debug: verify the copy worked for .got segment
+                            if file_size < 0x20 && i == 0 {
+                                debug_serial(b"  GOT after: val=0x");
+                                debug_hex(*(dest as *const u64));
+                                debug_serial(b"\r\n");
+                            }
+                        }
+                    }
+                }
+
+                // Map virtual page to physical page in process's page table
+                page_table.map_user_page(page_virt, phys_page, flags)?;
             }
         }
 

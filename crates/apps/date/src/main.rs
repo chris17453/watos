@@ -54,7 +54,8 @@ unsafe fn syscall3(num: u32, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 
 fn write_str(s: &str) {
     unsafe {
-        syscall3(syscall::SYS_WRITE, 0, s.as_ptr() as u64, s.len() as u64);
+        // fd=1 is stdout, which goes to kernel console buffer
+        syscall3(syscall::SYS_WRITE, 1, s.as_ptr() as u64, s.len() as u64);
     }
 }
 

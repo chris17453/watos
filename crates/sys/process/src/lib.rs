@@ -205,7 +205,7 @@ static mut KERNEL_PML4: u64 = 0;
 // Total: 2MB per process, with 1.5MB gap before next process's code
 const PROCESS_MEM_BASE: u64 = 0x1000000;
 const PROCESS_MEM_SIZE: u64 = 0x400000;  // 4MB spacing between processes
-const PROCESS_STACK_SIZE: u64 = 0x10000; // 64KB stack
+const PROCESS_STACK_SIZE: u64 = 0x100000; // 1MB stack
 
 static mut KERNEL_RSP: u64 = 0;
 static mut KERNEL_RBP: u64 = 0;
@@ -412,29 +412,92 @@ pub fn exec(name: &str, data: &[u8]) -> Result<u32, &'static str> {
 
     unsafe { debug_serial(b"exec: loading segments...\r\n"); }
     elf.load_segments_protected(data, load_base, &mut page_table)?;
-    unsafe { debug_serial(b"exec: segments loaded\r\n"); }
+    unsafe {
+        debug_serial(b"exec: segments loaded\r\n");
+        // Debug: walk page table to find physical address for virtual 0x102B050
+        // and verify the GOT content
+        let virt_got = 0x102B050_u64;
+        let pml4_idx = ((virt_got >> 39) & 0x1FF) as usize;
+        let pdp_idx = ((virt_got >> 30) & 0x1FF) as usize;
+        let pd_idx = ((virt_got >> 21) & 0x1FF) as usize;
+        let pt_idx = ((virt_got >> 12) & 0x1FF) as usize;
 
-    unsafe { debug_serial(b"exec: mapping stack...\r\n"); }
-    let stack_pages = PROCESS_STACK_SIZE / PAGE_SIZE as u64;
-    for i in 0..stack_pages {
-        let virt_addr = stack_top - (i as u64 + 1) * PAGE_SIZE as u64;
-        // Allocate fresh physical page for stack
-        let phys_addr = watos_mem::phys::alloc_page()
-            .ok_or("Out of physical memory for stack")? as u64;
-        if i == 0 {
-            unsafe {
-                debug_serial(b"  stack virt=0x");
-                debug_hex(virt_addr);
-                debug_serial(b" phys=0x");
-                debug_hex(phys_addr);
-                debug_serial(b"\r\n");
+        debug_serial(b"exec: GOT virt 0x102B050 -> indices: pml4=");
+        debug_hex(pml4_idx as u64);
+        debug_serial(b" pdp=");
+        debug_hex(pdp_idx as u64);
+        debug_serial(b" pd=");
+        debug_hex(pd_idx as u64);
+        debug_serial(b" pt=");
+        debug_hex(pt_idx as u64);
+        debug_serial(b"\r\n");
+
+        // Walk the page table
+        let pml4_phys = page_table.pml4_phys_addr();
+        let pml4_ptr = pml4_phys as *const u64;
+        let pml4_entry = *pml4_ptr.add(pml4_idx);
+        if pml4_entry & 1 != 0 {
+            let pdp_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+            let pdp_ptr = pdp_phys as *const u64;
+            let pdp_entry = *pdp_ptr.add(pdp_idx);
+            if pdp_entry & 1 != 0 {
+                let pd_phys = pdp_entry & 0x000F_FFFF_FFFF_F000;
+                let pd_ptr = pd_phys as *const u64;
+                let pd_entry = *pd_ptr.add(pd_idx);
+                if pd_entry & 1 != 0 && (pd_entry & 0x80) == 0 {
+                    // Not a huge page, follow to PT
+                    let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+                    let pt_ptr = pt_phys as *const u64;
+                    let pt_entry = *pt_ptr.add(pt_idx);
+                    debug_serial(b"exec: PT[43]=0x");
+                    debug_hex(pt_entry);
+                    if pt_entry & 1 != 0 {
+                        let page_phys = pt_entry & 0x000F_FFFF_FFFF_F000;
+                        let got_phys = page_phys + (virt_got & 0xFFF);
+                        debug_serial(b" -> phys=0x");
+                        debug_hex(got_phys);
+                        let got_val = *(got_phys as *const u64);
+                        debug_serial(b" val=0x");
+                        debug_hex(got_val);
+                    }
+                    debug_serial(b"\r\n");
+                }
             }
         }
-        // Zero the stack page
+    }
+
+    // Map stack with guard pages for overflow detection
+    // Stack layout: [GUARD PAGE] [STACK PAGES...] [TOP]
+    // Guard page is mapped but NOT present - accessing it causes page fault
+    unsafe { debug_serial(b"exec: mapping stack with guard...\r\n"); }
+    let stack_pages = PROCESS_STACK_SIZE / PAGE_SIZE as u64;
+    let stack_base = stack_top - PROCESS_STACK_SIZE;
+    let guard_page = stack_base - PAGE_SIZE as u64;
+
+    // Store stack info for auto-growth (guard page address marks stack limit)
+    // We'll use this in the page fault handler
+    unsafe {
+        debug_serial(b"  stack: base=0x");
+        debug_hex(stack_base);
+        debug_serial(b" top=0x");
+        debug_hex(stack_top);
+        debug_serial(b" guard=0x");
+        debug_hex(guard_page);
+        debug_serial(b"\r\n");
+    }
+
+    for i in 0..stack_pages {
+        let virt_addr = stack_top - (i as u64 + 1) * PAGE_SIZE as u64;
+        let phys_addr = watos_mem::phys::alloc_page()
+            .ok_or("Out of physical memory for stack")? as u64;
         unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
         page_table.map_user_page(virt_addr, phys_addr,
             page_flags::PRESENT | page_flags::WRITABLE)?;
     }
+
+    // Map guard page as NOT PRESENT - will trigger page fault on stack overflow
+    // This gives us a clear error instead of silent corruption
+    page_table.map_user_page(guard_page, 0, 0)?; // No flags = not present
 
     unsafe { debug_serial(b"exec: mapping heap...\r\n"); }
     // Allocate a reasonable initial heap (256KB)
@@ -599,6 +662,10 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
                     let pt_0 = *pt_ptr;
                     debug_serial(b" -> PT[0]=0x");
                     debug_hex(pt_0);
+                    // PT[43] is for virtual 0x102B000 (GOT page)
+                    let pt_43 = *pt_ptr.add(43);
+                    debug_serial(b" PT[43]=0x");
+                    debug_hex(pt_43);
                 }
                 debug_serial(b"\r\n");
 
@@ -620,10 +687,10 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
 
         debug_serial(b"[PROCESS] Switching to user page table...\r\n");
 
-        // CRITICAL: Switch to a kernel stack within our mapped region (0-8MB)
-        // The UEFI stack at ~267MB won't be mapped after CR3 switch!
-        // Use a stack area at 0x5FF000 (just below 6MB, page-aligned, in our mapped range)
-        let mapped_kernel_stack: u64 = 0x5FF000;
+        // Switch to a kernel stack within the mapped 8MB region
+        // This is necessary because CR3 switch will make our current stack inaccessible
+        let mapped_kernel_stack: u64 = 0x5FF000;  // Within first 8MB, mapped in process page table
+        debug_serial(b"[DEBUG] Switching to mapped kernel stack at 0x5FF000\r\n");
         core::arch::asm!(
             "mov rsp, {stack}",
             "mov rbp, {stack}",
@@ -631,6 +698,8 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
             options(nostack)
         );
 
+        // Switch to user page table before IRETQ
+        debug_serial(b"[DEBUG] Switching to user page table (CR3)\r\n");
         watos_mem::paging::load_cr3(pml4_addr);
 
         // Print OK and RSP in pure asm - no Rust stack usage at all
@@ -677,41 +746,55 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
         core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") hex[(first_byte >> 4) as usize], options(nostack));
         core::arch::asm!("out dx, al", in("dx") 0x3F8_u16, in("al") hex[(first_byte & 0xF) as usize], options(nostack));
         debug_serial(b" OK\r\n");
+
+        // Skip stack test after CR3 switch - calling debug_hex uses the Rust stack
+        // which may cause issues after we switched stacks
+        debug_serial(b"[PROCESS] Skipping stack test after CR3 switch\r\n");
     }
 
     unsafe {
         debug_serial(b"[PROCESS] Transitioning to Ring 3...\r\n");
 
+        // Prepare IRETQ values - use constants to avoid stack-heavy operations
         let user_stack = stack_top - 8;
         let user_cs = watos_arch::gdt::selectors::USER_CODE as u64;
         let user_ds = watos_arch::gdt::selectors::USER_DATA as u64;
         let rflags: u64 = 0x202;
 
-        // Debug: print the values we'll use
-        debug_serial(b"  CS=0x");
-        debug_hex(user_cs);
-        debug_serial(b" DS=0x");
-        debug_hex(user_ds);
-        debug_serial(b"\r\n  Entry=0x");
-        debug_hex(entry);
-        debug_serial(b" Stack=0x");
-        debug_hex(user_stack);
-        debug_serial(b"\r\n");
+        debug_serial(b"[PROCESS] Executing IRETQ to Ring 3...\r\n");
 
+        // Build the IRETQ frame using PUSH instructions on current stack
+        // This is the traditional and most reliable approach
+        // Stack grows down, so push in reverse order: SS, RSP, RFLAGS, CS, RIP
         core::arch::asm!(
-            "mov ds, {0:x}",
-            "mov es, {0:x}",
-            "mov fs, {0:x}",
-            "mov gs, {0:x}",
-            in(reg) user_ds,
-        );
+            // Disable interrupts
+            "cli",
 
-        core::arch::asm!(
-            "push {user_ss}",
-            "push {user_rsp}",
-            "push {rflags}",
-            "push {user_cs}",
-            "push {entry}",
+            // Push IRETQ frame in reverse order (stack grows down)
+            "push {ss}",      // SS
+            "push {rsp_val}", // RSP
+            "push {rflags}",  // RFLAGS
+            "push {cs}",      // CS
+            "push {rip}",     // RIP
+
+            // Debug: Print the RSP value before IRETQ
+            "mov dx, 0x3F8",
+            "mov al, 0x49", // 'I'
+            "out dx, al",
+            "mov al, 0x52", // 'R'
+            "out dx, al",
+            "mov al, 0x45", // 'E'
+            "out dx, al",
+            "mov al, 0x54", // 'T'
+            "out dx, al",
+            "mov al, 0x51", // 'Q'
+            "out dx, al",
+            "mov al, 0x0D",
+            "out dx, al",
+            "mov al, 0x0A",
+            "out dx, al",
+
+            // Zero GPRs (except RSP which points to the frame)
             "xor rax, rax",
             "xor rbx, rbx",
             "xor rcx, rcx",
@@ -727,12 +810,14 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
             "xor r13, r13",
             "xor r14, r14",
             "xor r15, r15",
+
+            // IRETQ - reads frame from [RSP]
             "iretq",
-            user_ss = in(reg) user_ds,
-            user_rsp = in(reg) user_stack,
+            ss = in(reg) user_ds,
+            rsp_val = in(reg) user_stack,
             rflags = in(reg) rflags,
-            user_cs = in(reg) user_cs,
-            entry = in(reg) entry,
+            cs = in(reg) user_cs,
+            rip = in(reg) entry,
             options(noreturn)
         );
     }
