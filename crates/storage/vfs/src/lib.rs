@@ -36,11 +36,17 @@ pub mod path;
 pub mod file;
 pub mod mount;
 pub mod error;
+pub mod pipe;
+pub mod symlink;
+pub mod metadata;
 
 pub use error::{VfsError, VfsResult};
 pub use file::{FileHandle, FileMode, FileType, FileStat};
-pub use mount::{MountPoint, MountTable};
-pub use path::Path;
+pub use mount::{MountPoint, MountTable, DriveMount, MAX_DRIVES};
+pub use path::{Path, PathType, ParsedPath, parse as parse_path, is_drive_letter};
+pub use pipe::{create_pipe, create_pipe_with_capacity, NamedPipe, PIPE_BUF_SIZE};
+pub use symlink::{SymlinkFilesystem, SymlinkTarget, SymlinkResolver, ResolvedPath, ResolveOptions, MAX_SYMLINK_DEPTH};
+pub use metadata::{ExtendedMetadata, ExtendedMetadataFs, FileColor, FileIcon, icon_from_extension, color_from_file};
 
 /// Maximum path length
 pub const MAX_PATH: usize = 256;
@@ -196,6 +202,8 @@ impl Vfs {
         }
     }
 
+    // ========== Path Mounts ==========
+
     /// Mount a filesystem at a path
     pub fn mount(&mut self, path: &str, fs: Box<dyn Filesystem>) -> VfsResult<()> {
         self.mounts.mount(path, fs)
@@ -206,7 +214,42 @@ impl Vfs {
         self.mounts.unmount(path)
     }
 
+    // ========== Drive Mounts ==========
+
+    /// Mount a filesystem as a drive letter (e.g., 'C', 'D')
+    pub fn mount_drive(&mut self, letter: char, fs: Box<dyn Filesystem>) -> VfsResult<()> {
+        self.mounts.mount_drive(letter, fs)
+    }
+
+    /// Mount a filesystem as a drive letter with a label
+    pub fn mount_drive_labeled(&mut self, letter: char, fs: Box<dyn Filesystem>, label: &str) -> VfsResult<()> {
+        self.mounts.mount_drive_labeled(letter, fs, label)
+    }
+
+    /// Unmount a drive letter
+    pub fn unmount_drive(&mut self, letter: char) -> VfsResult<()> {
+        self.mounts.unmount_drive(letter)
+    }
+
+    /// Get drive mount info
+    pub fn get_drive(&self, letter: char) -> Option<&DriveMount> {
+        self.mounts.get_drive(letter)
+    }
+
+    /// List all mounted drives
+    pub fn list_drives(&self) -> impl Iterator<Item = &DriveMount> {
+        self.mounts.list_drives()
+    }
+
+    /// List all path mounts
+    pub fn list_mounts(&self) -> &[MountPoint] {
+        self.mounts.list()
+    }
+
+    // ========== Resolution ==========
+
     /// Resolve path to filesystem and relative path
+    /// Automatically handles both Unix paths and drive letter paths
     fn resolve(&self, path: &str) -> VfsResult<(&dyn Filesystem, String)> {
         self.mounts.resolve(path)
     }
@@ -283,6 +326,33 @@ pub fn mount(path: &str, fs: Box<dyn Filesystem>) -> VfsResult<()> {
     let mut vfs = VFS.lock();
     match vfs.as_mut() {
         Some(v) => v.mount(path, fs),
+        None => Err(VfsError::NotInitialized),
+    }
+}
+
+/// Mount a filesystem as a drive letter
+pub fn mount_drive(letter: char, fs: Box<dyn Filesystem>) -> VfsResult<()> {
+    let mut vfs = VFS.lock();
+    match vfs.as_mut() {
+        Some(v) => v.mount_drive(letter, fs),
+        None => Err(VfsError::NotInitialized),
+    }
+}
+
+/// Mount a filesystem as a drive letter with a label
+pub fn mount_drive_labeled(letter: char, fs: Box<dyn Filesystem>, label: &str) -> VfsResult<()> {
+    let mut vfs = VFS.lock();
+    match vfs.as_mut() {
+        Some(v) => v.mount_drive_labeled(letter, fs, label),
+        None => Err(VfsError::NotInitialized),
+    }
+}
+
+/// Unmount a drive letter
+pub fn unmount_drive(letter: char) -> VfsResult<()> {
+    let mut vfs = VFS.lock();
+    match vfs.as_mut() {
+        Some(v) => v.unmount_drive(letter),
         None => Err(VfsError::NotInitialized),
     }
 }

@@ -1,7 +1,7 @@
 //! FAT table operations
 
 use watos_vfs::{VfsError, VfsResult};
-use watos_driver_framework::block::BlockDevice;
+use watos_driver_traits::block::BlockDevice;
 
 use crate::bpb::{BiosParameterBlock, FatType};
 

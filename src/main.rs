@@ -22,6 +22,11 @@ use watos_driver_traits::block::{BlockDevice, BlockDeviceExt};
 use watos_driver_ahci::AhciDriver;
 use wfs_common::{Superblock, FileEntry, WFS_MAGIC, BLOCK_SIZE, ENTRIES_PER_BLOCK, FLAG_DIR};
 
+// VFS and FAT filesystem
+use alloc::boxed::Box;
+use watos_vfs::{FileMode, FileOperations, VfsError};
+use watos_fat::FatFilesystem;
+
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
@@ -438,8 +443,8 @@ fn init_disk() -> bool {
     unsafe { watos_arch::serial_write(b"[KERNEL] Initializing disk subsystem...\r\n"); }
 
     // Try probing each AHCI port looking for WFS
-    // Port 0 is typically the FAT boot disk, Port 1+ may have WFS
-    for port in 0..4 {
+    // Port 0 is handled by init_vfs() for FAT boot disk, so start from port 1
+    for port in 1..4 {
         unsafe {
             watos_arch::serial_write(b"[KERNEL] Probing AHCI port ");
             watos_arch::serial_hex(port as u64);
@@ -493,6 +498,71 @@ fn init_disk() -> bool {
     }
 
     unsafe { watos_arch::serial_write(b"[KERNEL] No WFS disk found\r\n"); }
+    false
+}
+
+/// Initialize VFS and mount boot disk (FAT) as drive C:
+fn init_vfs() -> bool {
+    unsafe { watos_arch::serial_write(b"[KERNEL] Initializing VFS...\r\n"); }
+
+    // Initialize the global VFS instance
+    watos_vfs::init();
+    unsafe { watos_arch::serial_write(b"[KERNEL] VFS initialized\r\n"); }
+
+    // Try all AHCI ports to find a valid FAT filesystem for C:
+    // Port 0 = QEMU virtual FAT (invalid BPB), Port 2 = real FAT disk image
+    for port in 0..4u8 {
+        unsafe {
+            watos_arch::serial_write(b"[KERNEL] Trying AHCI port ");
+            watos_arch::serial_hex(port as u64);
+            watos_arch::serial_write(b" for FAT...\r\n");
+        }
+
+        let driver = match AhciDriver::probe_port(port) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let mut driver = driver;
+        if driver.init().is_err() {
+            continue;
+        }
+        if driver.start().is_err() {
+            continue;
+        }
+
+        // Try to create FAT filesystem
+        match FatFilesystem::new(driver) {
+            Ok(fat_fs) => {
+                unsafe {
+                    watos_arch::serial_write(b"[KERNEL] FAT filesystem found on port ");
+                    watos_arch::serial_hex(port as u64);
+                    watos_arch::serial_write(b"\r\n");
+                }
+
+                // Mount as drive C:
+                match watos_vfs::mount_drive('C', Box::new(fat_fs)) {
+                    Ok(()) => {
+                        unsafe { watos_arch::serial_write(b"[KERNEL] Mounted FAT as C:\r\n"); }
+
+                        // Also add to legacy drive table so CURRENT_DRIVE works
+                        drive_mount(b"C", b"/", b"FAT");
+
+                        return true;
+                    }
+                    Err(_) => {
+                        unsafe { watos_arch::serial_write(b"[KERNEL] Failed to mount C:\r\n"); }
+                    }
+                }
+            }
+            Err(_) => {
+                // Not a valid FAT filesystem, try next port
+                continue;
+            }
+        }
+    }
+
+    unsafe { watos_arch::serial_write(b"[KERNEL] No valid FAT filesystem found for C:\r\n"); }
     false
 }
 
@@ -637,6 +707,9 @@ static mut CONSOLE_WRITE_POS: usize = 0;
 /// Write bytes to the console ring buffer
 fn console_write(data: &[u8]) {
     unsafe {
+        watos_arch::serial_write(b"[CBUF_W:");
+        watos_arch::serial_hex(data.len() as u64);
+        watos_arch::serial_write(b"]");
         for &byte in data {
             let next_write = (CONSOLE_WRITE_POS + 1) % CONSOLE_BUFFER_SIZE;
             // If buffer is full, drop oldest byte (advance read pos)
@@ -659,7 +732,82 @@ fn console_read(buf: &mut [u8]) -> usize {
             CONSOLE_READ_POS = (CONSOLE_READ_POS + 1) % CONSOLE_BUFFER_SIZE;
             count += 1;
         }
+        if count > 0 {
+            watos_arch::serial_write(b"[CBUF_R:");
+            watos_arch::serial_hex(count as u64);
+            watos_arch::serial_write(b"]");
+        }
         count
+    }
+}
+
+// ============================================================================
+// File Descriptor Table
+// ============================================================================
+
+/// Maximum number of open file descriptors
+const MAX_FDS: usize = 64;
+
+/// File descriptor entry
+struct FileDescriptor {
+    /// The open file operations object
+    file: Option<Box<dyn FileOperations>>,
+}
+
+impl FileDescriptor {
+    const fn empty() -> Self {
+        FileDescriptor { file: None }
+    }
+}
+
+/// Global file descriptor table
+/// fd 0 = console input buffer (special)
+/// fd 1 = stdout (console output)
+/// fd 2 = stderr (console output)
+/// fd 3+ = regular files
+static FD_TABLE: Mutex<[Option<Box<dyn FileOperations>>; MAX_FDS]> =
+    Mutex::new([const { None }; MAX_FDS]);
+
+/// Allocate a new file descriptor for an open file
+/// Returns the fd number, or -1 if table is full
+fn fd_alloc(file: Box<dyn FileOperations>) -> i64 {
+    let mut table = FD_TABLE.lock();
+    // Start from fd 3 (0=console, 1=stdout, 2=stderr are special)
+    for fd in 3..MAX_FDS {
+        if table[fd].is_none() {
+            table[fd] = Some(file);
+            return fd as i64;
+        }
+    }
+    -1 // No free fd
+}
+
+/// Close a file descriptor
+fn fd_close(fd: i64) -> i64 {
+    if fd < 3 || fd >= MAX_FDS as i64 {
+        return -1; // Invalid fd (can't close 0, 1, 2)
+    }
+    let mut table = FD_TABLE.lock();
+    if table[fd as usize].take().is_some() {
+        0
+    } else {
+        -1 // Was not open
+    }
+}
+
+/// Read from a file descriptor
+fn fd_read(fd: i64, buf: &mut [u8]) -> i64 {
+    if fd < 3 || fd >= MAX_FDS as i64 {
+        return -1;
+    }
+    let mut table = FD_TABLE.lock();
+    if let Some(ref mut file) = table[fd as usize] {
+        match file.read(buf) {
+            Ok(n) => n as i64,
+            Err(_) => -1,
+        }
+    } else {
+        -1 // Not open
     }
 }
 
@@ -735,18 +883,20 @@ pub extern "C" fn _start() -> ! {
     watos_process::init();
     unsafe { watos_arch::serial_write(b"[KERNEL] Process subsystem initialized\r\n"); }
 
-    // 5.5 Initialize disk subsystem and mount default drive
+    // 5.5 Initialize VFS and mount boot disk as C:
     init_cwd();
-    let wfs_found = init_disk();
+    let vfs_ok = init_vfs();
+    if !vfs_ok {
+        unsafe { watos_arch::serial_write(b"[KERNEL] WARNING: VFS init failed\r\n"); }
+    }
 
-    // Mount drive C:
-    let fs_type = if wfs_found { b"WFS" } else { b"FAT" };
-    let result = drive_mount(b"C", b"/", fs_type);
-    if result == 0 {
-        unsafe {
-            watos_arch::serial_write(b"[KERNEL] Mounted C: as root (");
-            watos_arch::serial_write(fs_type);
-            watos_arch::serial_write(b")\r\n");
+    // Also check for WFS data disk on other ports (legacy support)
+    let wfs_found = init_disk();
+    if wfs_found {
+        // Mount WFS as D: using legacy drive table
+        let result = drive_mount(b"D", b"/wfs", b"WFS");
+        if result == 0 {
+            unsafe { watos_arch::serial_write(b"[KERNEL] Mounted D: as WFS data disk\r\n"); }
         }
     }
 
@@ -801,6 +951,8 @@ mod syscall {
     // Console/IO
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_READ: u64 = 2;
+    pub const SYS_OPEN: u64 = 3;
+    pub const SYS_CLOSE: u64 = 4;
     pub const SYS_GETKEY: u64 = 5;
     pub const SYS_EXIT: u64 = 6;
 
@@ -907,11 +1059,169 @@ pub unsafe extern "C" fn syscall_handler() {
     );
 }
 
+/// Static buffer for copying user data before CR3 switch
+static mut SYSCALL_PATH_BUF: [u8; 256] = [0u8; 256];
+/// Static buffer for file read operations
+static mut SYSCALL_READ_BUF: [u8; 4096] = [0u8; 4096];
+
 /// Inner syscall handler - called from naked handler
 /// return_rip and return_rsp are from the interrupt frame for saving parent context
 #[inline(never)]
 extern "C" fn handle_syscall_inner(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, return_rsp: u64) -> u64 {
-    handle_syscall(num, arg1, arg2, arg3, return_rip, return_rsp)
+    // For file I/O syscalls that access disk, we need to switch to kernel page table
+    // to access AHCI MMIO. But we must copy user data first since user pointers
+    // become invalid after CR3 switch.
+
+    match num {
+        syscall::SYS_OPEN => {
+            // arg1 = path pointer, arg2 = path length, arg3 = mode
+            let path_ptr = arg1 as *const u8;
+            let path_len = (arg2 as usize).min(255);
+
+            if path_ptr.is_null() || path_len == 0 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory while still in user page table
+            let path_copy: &[u8] = unsafe {
+                let user_path = core::slice::from_raw_parts(path_ptr, path_len);
+                SYSCALL_PATH_BUF[..path_len].copy_from_slice(user_path);
+                &SYSCALL_PATH_BUF[..path_len]
+            };
+
+            // Now switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            // Call the open handler with kernel buffer
+            let result = handle_sys_open(path_copy, arg3);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            result
+        }
+
+        syscall::SYS_CLOSE => {
+            // SYS_CLOSE only needs fd number, no user pointers
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            let result = handle_syscall(num, arg1, arg2, arg3, return_rip, return_rsp);
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            result
+        }
+
+        syscall::SYS_READ if arg1 >= 3 => {
+            // File read needs special handling:
+            // 1. Switch to kernel CR3 to read from disk
+            // 2. Switch back to user CR3 to copy to user buffer
+            let fd = arg1 as i64;
+            let user_buf_ptr = arg2 as *mut u8;
+            let user_buf_len = (arg3 as usize).min(4096);
+
+            if user_buf_ptr.is_null() || user_buf_len == 0 {
+                return 0;
+            }
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            // Read into kernel buffer
+            let bytes_read = unsafe {
+                let kernel_buf = &mut SYSCALL_READ_BUF[..user_buf_len];
+                let result = fd_read(fd, kernel_buf);
+                if result < 0 { 0usize } else { result as usize }
+            };
+
+            // Switch back to user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            // Copy from kernel buffer to user buffer
+            if bytes_read > 0 {
+                unsafe {
+                    let user_buf = core::slice::from_raw_parts_mut(user_buf_ptr, bytes_read);
+                    user_buf.copy_from_slice(&SYSCALL_READ_BUF[..bytes_read]);
+                }
+            }
+
+            bytes_read as u64
+        }
+
+        _ => {
+            // All other syscalls run in user page table
+            handle_syscall(num, arg1, arg2, arg3, return_rip, return_rsp)
+        }
+    }
+}
+
+/// Handle SYS_OPEN with path already copied to kernel buffer
+fn handle_sys_open(path: &[u8], mode_flags: u64) -> u64 {
+    let path_str = match core::str::from_utf8(path) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    unsafe {
+        watos_arch::serial_write(b"[KERNEL] SYS_OPEN: ");
+        watos_arch::serial_write(path);
+        watos_arch::serial_write(b"\r\n");
+    }
+
+    // Build FileMode based on flags
+    let mode = if mode_flags == 0 {
+        FileMode::READ
+    } else if mode_flags == 1 {
+        FileMode::WRITE
+    } else {
+        FileMode::READ_WRITE
+    };
+
+    // Open via VFS
+    match watos_vfs::open(path_str, mode) {
+        Ok(file) => {
+            let fd = fd_alloc(file);
+            unsafe {
+                watos_arch::serial_write(b"[KERNEL] Opened fd=");
+                watos_arch::serial_hex(fd as u64);
+                watos_arch::serial_write(b"\r\n");
+            }
+            fd as u64
+        }
+        Err(e) => {
+            unsafe {
+                watos_arch::serial_write(b"[KERNEL] Open failed: ");
+                match e {
+                    VfsError::NotFound => watos_arch::serial_write(b"NotFound"),
+                    VfsError::IoError => watos_arch::serial_write(b"IoError"),
+                    _ => watos_arch::serial_write(b"Other"),
+                }
+                watos_arch::serial_write(b"\r\n");
+            }
+            u64::MAX
+        }
+    }
 }
 
 fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, return_rsp: u64) -> u64 {
@@ -950,7 +1260,8 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_READ => {
             // arg1 = fd, arg2 = buffer, arg3 = max_len
             // fd=0: read from console buffer (what other processes wrote to stdout)
-            let fd = arg1;
+            // fd>=3: read from open file
+            let fd = arg1 as i64;
             let buf_ptr = arg2 as *mut u8;
             let buf_size = arg3 as usize;
 
@@ -969,9 +1280,33 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                     }
                 }
                 count as u64
+            } else if fd >= 3 {
+                // Read from open file via VFS
+                unsafe {
+                    let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
+                    let result = fd_read(fd, buf);
+                    if result >= 0 {
+                        result as u64
+                    } else {
+                        0
+                    }
+                }
             } else {
-                // Other fds not yet implemented
+                // fd 1 or 2 - can't read from stdout/stderr
                 0
+            }
+        }
+
+        // SYS_OPEN is handled specially in handle_syscall_inner for CR3 switching
+
+        syscall::SYS_CLOSE => {
+            // arg1 = file descriptor
+            // Returns 0 on success, error on failure
+            let fd = arg1 as i64;
+            if fd_close(fd) == 0 {
+                0
+            } else {
+                u64::MAX
             }
         }
 
@@ -1265,8 +1600,6 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 watos_arch::serial_hex(arg1);
                 watos_arch::serial_write(b" path_len=");
                 watos_arch::serial_hex(arg2);
-                watos_arch::serial_write(b" buf_ptr=0x");
-                watos_arch::serial_hex(arg3);
                 watos_arch::serial_write(b"\r\n");
             }
 
@@ -1275,90 +1608,139 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             }
 
             unsafe {
-                let buf_size = 2048usize; // Buffer size for directory listing
-                watos_arch::serial_write(b"[KERNEL] Creating slice...\r\n");
+                let buf_size = 4096usize;
                 let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
-                watos_arch::serial_write(b"[KERNEL] Slice created\r\n");
 
-                // Get path (use current directory if not specified)
-                let path = if path_ptr.is_null() || path_len == 0 {
-                    &CURRENT_DIR[..CURRENT_DIR_LEN]
+                // Get path (construct full path with drive letter if not specified)
+                static mut FULL_PATH_BUF: [u8; 260] = [0u8; 260];
+                let path_bytes: &[u8] = if path_ptr.is_null() || path_len == 0 {
+                    // Construct full path: "X:\path"
+                    let drive = &DRIVE_TABLE[CURRENT_DRIVE];
+                    let name_len = drive.name_len.min(MAX_DRIVE_NAME);
+                    let mut pos = 0;
+
+                    // Drive letter (e.g., "C")
+                    FULL_PATH_BUF[pos..pos + name_len].copy_from_slice(&drive.name[..name_len]);
+                    pos += name_len;
+
+                    // Colon
+                    FULL_PATH_BUF[pos] = b':';
+                    pos += 1;
+
+                    // Current directory path
+                    FULL_PATH_BUF[pos..pos + CURRENT_DIR_LEN].copy_from_slice(&CURRENT_DIR[..CURRENT_DIR_LEN]);
+                    pos += CURRENT_DIR_LEN;
+
+                    &FULL_PATH_BUF[..pos]
                 } else {
                     core::slice::from_raw_parts(path_ptr, path_len)
                 };
 
-                // Try WFS filesystem first
-                if WFS_SUPERBLOCK.is_some() {
-                    let bytes = wfs_readdir(path, buf);
-                    if bytes > 0 {
-                        return bytes as u64;
-                    }
+                // Convert to string for VFS
+                let path_str = match core::str::from_utf8(path_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return 0,
+                };
+
+                watos_arch::serial_write(b"[KERNEL] SYS_READDIR path: ");
+                watos_arch::serial_write(path_bytes);
+                watos_arch::serial_write(b"\r\n");
+
+                // Switch to kernel page table for disk access
+                let user_cr3 = watos_mem::paging::get_cr3();
+                let kernel_pml4 = watos_process::get_kernel_pml4();
+
+                if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                    watos_mem::paging::load_cr3(kernel_pml4);
                 }
 
-                // Fallback: list preloaded apps from bootloader
-                let mut pos = 0;
+                // Use VFS to read directory (with kernel page table)
+                let vfs_result = watos_vfs::readdir(path_str);
 
-                // Add "." entry
-                let dot = b"D . 0\n";
-                if pos + dot.len() < buf_size {
-                    buf[pos..pos + dot.len()].copy_from_slice(dot);
-                    pos += dot.len();
+                // Restore user page table before writing to user buffer
+                if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                    watos_mem::paging::load_cr3(user_cr3);
                 }
 
-                // Add ".." entry
-                let dotdot = b"D .. 0\n";
-                if pos + dotdot.len() < buf_size {
-                    buf[pos..pos + dotdot.len()].copy_from_slice(dotdot);
-                    pos += dotdot.len();
-                }
+                match vfs_result {
+                    Ok(entries) => {
+                        watos_arch::serial_write(b"[KERNEL] VFS readdir returned ");
+                        watos_arch::serial_hex(entries.len() as u64);
+                        watos_arch::serial_write(b" entries\r\n");
 
-                // Add SYSTEM directory
-                let sys = b"D SYSTEM 0\n";
-                if pos + sys.len() < buf_size {
-                    buf[pos..pos + sys.len()].copy_from_slice(sys);
-                    pos += sys.len();
-                }
+                        let mut pos = 0;
+                        for entry in entries {
+                            // Format: "TYPE NAME SIZE\n"
+                            // TYPE: D=directory, F=file, L=symlink, etc.
+                            let type_char = match entry.file_type {
+                                watos_vfs::FileType::Directory => b'D',
+                                watos_vfs::FileType::Regular => b'F',
+                                watos_vfs::FileType::Symlink => b'L',
+                                watos_vfs::FileType::CharDevice => b'C',
+                                watos_vfs::FileType::BlockDevice => b'B',
+                                watos_vfs::FileType::Fifo => b'P',
+                                watos_vfs::FileType::Socket => b'S',
+                                watos_vfs::FileType::Unknown => b'?',
+                            };
 
-                // Add apps directory
-                let apps = b"D apps 0\n";
-                if pos + apps.len() < buf_size {
-                    buf[pos..pos + apps.len()].copy_from_slice(apps);
-                    pos += apps.len();
-                }
+                            let name_bytes = entry.name.as_bytes();
+                            let size_str = format_num(entry.size);
+                            let size_bytes = size_str.as_bytes();
 
-                // List preloaded apps as files
-                if let Some(info) = BOOT_INFO.as_ref() {
-                    for i in 0..(info.app_count as usize) {
-                        let app = &info.apps[i];
-                        let name_len = app.name.iter().position(|&c| c == 0).unwrap_or(32);
-                        let name = &app.name[..name_len];
+                            // Check buffer space
+                            let needed = 1 + 1 + name_bytes.len() + 1 + size_bytes.len() + 1;
+                            if pos + needed > buf_size {
+                                break;
+                            }
 
-                        // Format: "F NAME SIZE\n"
-                        if pos + 3 + name_len + 15 < buf_size {
-                            buf[pos] = b'F';
-                            buf[pos + 1] = b' ';
-                            pos += 2;
-
-                            buf[pos..pos + name_len].copy_from_slice(name);
-                            pos += name_len;
-
+                            buf[pos] = type_char;
+                            pos += 1;
                             buf[pos] = b' ';
                             pos += 1;
-
-                            // Write size as decimal
-                            let size = app.size;
-                            let size_str = format_num(size);
-                            let size_bytes = size_str.as_bytes();
+                            buf[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
+                            pos += name_bytes.len();
+                            buf[pos] = b' ';
+                            pos += 1;
                             buf[pos..pos + size_bytes.len()].copy_from_slice(size_bytes);
                             pos += size_bytes.len();
-
                             buf[pos] = b'\n';
                             pos += 1;
                         }
+                        pos as u64
+                    }
+                    Err(e) => {
+                        watos_arch::serial_write(b"[KERNEL] VFS readdir error: ");
+                        let err_msg: &[u8] = match e {
+                            VfsError::NotFound => b"NotFound",
+                            VfsError::PermissionDenied => b"PermissionDenied",
+                            VfsError::NotADirectory => b"NotADirectory",
+                            VfsError::NotAFile => b"NotAFile",
+                            VfsError::AlreadyExists => b"AlreadyExists",
+                            VfsError::DirectoryNotEmpty => b"DirectoryNotEmpty",
+                            VfsError::IoError => b"IoError",
+                            VfsError::InvalidPath => b"InvalidPath",
+                            VfsError::TooManyOpenFiles => b"TooManyOpenFiles",
+                            VfsError::NotInitialized => b"NotInitialized",
+                            VfsError::NotSupported => b"NotSupported",
+                            VfsError::NoSpace => b"NoSpace",
+                            VfsError::ReadOnly => b"ReadOnly",
+                            VfsError::IsADirectory => b"IsADirectory",
+                            VfsError::InvalidArgument => b"InvalidArgument",
+                            VfsError::CrossDevice => b"CrossDevice",
+                            VfsError::NameTooLong => b"NameTooLong",
+                            VfsError::PathTooLong => b"PathTooLong",
+                            VfsError::NotMounted => b"NotMounted",
+                            VfsError::AlreadyMounted => b"AlreadyMounted",
+                            VfsError::Busy => b"Busy",
+                            VfsError::InvalidName => b"InvalidName",
+                            VfsError::Corrupted => b"Corrupted",
+                            VfsError::FsError(_) => b"FsError",
+                        };
+                        watos_arch::serial_write(err_msg);
+                        watos_arch::serial_write(b"\r\n");
+                        0
                     }
                 }
-
-                pos as u64
             }
         }
 

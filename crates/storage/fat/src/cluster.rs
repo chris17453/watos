@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 use watos_vfs::VfsResult;
-use watos_driver_framework::block::BlockDevice;
+use watos_driver_traits::block::BlockDevice;
 
 use crate::bpb::{BiosParameterBlock, FatType};
 use crate::table;

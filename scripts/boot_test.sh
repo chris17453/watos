@@ -21,8 +21,8 @@ LOG_DIR="$PROJECT_ROOT/ai-temp/logs"
 SERIAL_LOG="$LOG_DIR/serial_$(date +%Y%m%d_%H%M%S).log"
 QEMU_PID=""
 
-# Success patterns - kernel boot indicators
-SUCCESS_PATTERNS=(
+# Success patterns - kernel boot indicators (default)
+DEFAULT_SUCCESS_PATTERNS=(
     "WATOS"
     "C:\\\\>"
     "kernel"
@@ -33,7 +33,7 @@ SUCCESS_PATTERNS=(
 FAILURE_PATTERNS=(
     "triple fault"
     "panic"
-    "exception"
+    "EXCEPTION:"
     "ASSERT"
 )
 
@@ -46,12 +46,22 @@ usage() {
     echo "  --timeout N    Timeout in seconds (default: 30)"
     echo "  --interactive  Run in interactive mode (no timeout)"
     echo "  --verbose      Show QEMU output in real-time"
+    echo "  --cmd 'CMD'    Execute command on startup and exit"
+    echo "  --expect 'STR' Expected output string (with --cmd)"
+    echo "  -i             Shortcut for --interactive"
     echo "  -h, --help     Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  $0 -i                    # Interactive mode"
+    echo "  $0 --cmd 'ls' --expect 'TEST.TXT'"
+    echo "  $0 --cmd 'echo hello' --expect 'hello'"
     exit 0
 }
 
 INTERACTIVE=false
 VERBOSE=false
+STARTUP_CMD=""
+EXPECT_OUTPUT=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -59,13 +69,21 @@ while [[ $# -gt 0 ]]; do
             TIMEOUT=$2
             shift 2
             ;;
-        --interactive)
+        --interactive|-i)
             INTERACTIVE=true
             shift
             ;;
         --verbose)
             VERBOSE=true
             shift
+            ;;
+        --cmd)
+            STARTUP_CMD="$2"
+            shift 2
+            ;;
+        --expect)
+            EXPECT_OUTPUT="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -139,6 +157,59 @@ cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
 
 success "Prerequisites satisfied"
 
+# Write startup command file if specified
+AUTOEXEC_FILE="$PROJECT_ROOT/uefi_test/AUTOEXEC.CMD"
+AUTOEXEC_IMG="$LOG_DIR/autoexec.img"
+
+if [ -n "$STARTUP_CMD" ]; then
+    log "Writing startup command: $STARTUP_CMD"
+    # Write command followed by shutdown
+    echo "$STARTUP_CMD" > "$AUTOEXEC_FILE"
+    echo "shutdown" >> "$AUTOEXEC_FILE"
+
+    # Create a proper FAT disk image with AUTOEXEC.CMD and essential files
+    # The virtual FAT doesn't have a proper boot sector, so we need a real disk
+    log "Creating FAT disk image for AUTOEXEC.CMD..."
+    rm -f "$AUTOEXEC_IMG"
+    # Create 32MB FAT16 image to hold apps
+    dd if=/dev/zero of="$AUTOEXEC_IMG" bs=1M count=32 2>/dev/null
+    mformat -i "$AUTOEXEC_IMG" -F :: 2>/dev/null || true
+
+    # Copy autoexec file
+    mcopy -i "$AUTOEXEC_IMG" "$AUTOEXEC_FILE" ::/AUTOEXEC.CMD 2>/dev/null || true
+
+    # Copy essential directories and files from uefi_test
+    # Create SYSTEM and apps directories
+    mmd -i "$AUTOEXEC_IMG" ::/SYSTEM 2>/dev/null || true
+    mmd -i "$AUTOEXEC_IMG" ::/apps 2>/dev/null || true
+    mmd -i "$AUTOEXEC_IMG" ::/apps/system 2>/dev/null || true
+
+    # Copy TERM.EXE
+    if [ -f "$PROJECT_ROOT/uefi_test/SYSTEM/TERM.EXE" ]; then
+        mcopy -i "$AUTOEXEC_IMG" "$PROJECT_ROOT/uefi_test/SYSTEM/TERM.EXE" ::/SYSTEM/TERM.EXE 2>/dev/null || true
+    fi
+
+    # Copy apps
+    for app in "$PROJECT_ROOT/uefi_test/apps/system"/*; do
+        if [ -f "$app" ]; then
+            app_name=$(basename "$app")
+            mcopy -i "$AUTOEXEC_IMG" "$app" ::/apps/system/"$app_name" 2>/dev/null || true
+        fi
+    done
+
+    # Copy other root files
+    for file in "$PROJECT_ROOT/uefi_test"/*.EXE "$PROJECT_ROOT/uefi_test"/kernel.bin; do
+        if [ -f "$file" ]; then
+            fname=$(basename "$file")
+            mcopy -i "$AUTOEXEC_IMG" "$file" ::/"$fname" 2>/dev/null || true
+        fi
+    done
+else
+    # Remove autoexec file if no command specified
+    rm -f "$AUTOEXEC_FILE"
+    rm -f "$AUTOEXEC_IMG"
+fi
+
 # Build QEMU command
 # Attach boot disk and WFS data disk to ICH9's IDE buses (SATA emulation)
 # Use KVM if available for proper CPU idle handling (hlt instruction)
@@ -167,11 +238,18 @@ if [ -f "$PROJECT_ROOT/output/watos.img" ]; then
     QEMU_CMD+=(-device ide-hd,drive=wfsdisk,bus=ide.1)
 fi
 
+# Add autoexec FAT disk if it exists (for testing commands)
+# This goes on port 2 so the kernel can mount it as C:
+if [ -f "$AUTOEXEC_IMG" ]; then
+    QEMU_CMD+=(-drive "file=$AUTOEXEC_IMG,format=raw,if=none,id=cmdisk")
+    QEMU_CMD+=(-device ide-hd,drive=cmdisk,bus=ide.2)
+fi
+
 # Add DOS 6.22 disk as FAT drive if the folder exists
 DOS_DIR="$PROJECT_ROOT/dos-6.22"
 if [ -d "$DOS_DIR" ]; then
     QEMU_CMD+=(-drive "file=fat:rw:$DOS_DIR,format=raw,if=none,id=dosdisk")
-    QEMU_CMD+=(-device ide-hd,drive=dosdisk,bus=ide.2)
+    QEMU_CMD+=(-device ide-hd,drive=dosdisk,bus=ide.3)
 fi
 
 if [ "$INTERACTIVE" = true ]; then
@@ -246,13 +324,25 @@ while true; do
 
     # Check log file for patterns
     if [ -f "$SERIAL_LOG" ]; then
-        # Check for success patterns
-        for pattern in "${SUCCESS_PATTERNS[@]}"; do
-            if grep -qi "$pattern" "$SERIAL_LOG" 2>/dev/null; then
-                RESULT="success"
-                break 2
+        # Use expect pattern if specified, otherwise use default success patterns
+        if [ -n "$EXPECT_OUTPUT" ]; then
+            # Check for expected output in SCREEN DUMP section (actual console output)
+            if grep -q "<<<SCREEN_DUMP_END>>>" "$SERIAL_LOG" 2>/dev/null; then
+                # Extract screen dump and check for expected output
+                if sed -n '/<<<SCREEN_DUMP_START>>>/,/<<<SCREEN_DUMP_END>>>/p' "$SERIAL_LOG" | grep -qF "$EXPECT_OUTPUT" 2>/dev/null; then
+                    RESULT="success"
+                    break
+                fi
             fi
-        done
+        else
+            # Check for default success patterns
+            for pattern in "${DEFAULT_SUCCESS_PATTERNS[@]}"; do
+                if grep -qi "$pattern" "$SERIAL_LOG" 2>/dev/null; then
+                    RESULT="success"
+                    break 2
+                fi
+            done
+        fi
 
         # Check for failure patterns
         for pattern in "${FAILURE_PATTERNS[@]}"; do

@@ -1,15 +1,22 @@
 //! Mount table management
+//!
+//! Supports two types of mounts:
+//! - **Path mounts**: Traditional Unix-style mounts at paths like `/mnt/disk`
+//! - **Drive mounts**: Windows-style drive letters like `C:`, `D:`
+//!
+//! Drive mounts are "jailed" - paths using drive letters cannot escape
+//! the mount root via `..`.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::{Filesystem, VfsError, VfsResult, MAX_MOUNTS};
-use crate::path::normalize;
+use crate::path::{normalize, parse, PathType};
 
 /// A mount point in the VFS
 pub struct MountPoint {
-    /// Mount path (normalized)
+    /// Mount path (normalized, for path mounts)
     pub path: String,
     /// Mounted filesystem
     pub filesystem: Box<dyn Filesystem>,
@@ -25,18 +32,69 @@ impl MountPoint {
     }
 }
 
+/// A drive letter mount (jailed)
+pub struct DriveMount {
+    /// Drive letter (uppercase A-Z)
+    pub letter: char,
+    /// Mounted filesystem
+    pub filesystem: Box<dyn Filesystem>,
+    /// Optional label for the drive
+    pub label: Option<String>,
+}
+
+impl DriveMount {
+    /// Create a new drive mount
+    pub fn new(letter: char, filesystem: Box<dyn Filesystem>) -> Self {
+        DriveMount {
+            letter: letter.to_ascii_uppercase(),
+            filesystem,
+            label: None,
+        }
+    }
+
+    /// Create a new drive mount with label
+    pub fn with_label(letter: char, filesystem: Box<dyn Filesystem>, label: &str) -> Self {
+        DriveMount {
+            letter: letter.to_ascii_uppercase(),
+            filesystem,
+            label: Some(String::from(label)),
+        }
+    }
+}
+
+/// Maximum number of drive letters (A-Z)
+pub const MAX_DRIVES: usize = 26;
+
 /// Mount table managing all mounted filesystems
 pub struct MountTable {
+    /// Path-based mounts (Unix style)
     mounts: Vec<MountPoint>,
+    /// Drive letter mounts (Windows style, jailed)
+    drives: [Option<DriveMount>; MAX_DRIVES],
+}
+
+/// Helper to convert drive letter to index (A=0, B=1, ..., Z=25)
+fn drive_index(letter: char) -> Option<usize> {
+    let upper = letter.to_ascii_uppercase();
+    if upper >= 'A' && upper <= 'Z' {
+        Some((upper as usize) - ('A' as usize))
+    } else {
+        None
+    }
 }
 
 impl MountTable {
     /// Create a new empty mount table
     pub fn new() -> Self {
+        // Initialize drives array with None
+        const NONE_DRIVE: Option<DriveMount> = None;
         MountTable {
             mounts: Vec::new(),
+            drives: [NONE_DRIVE; MAX_DRIVES],
         }
     }
+
+    // ========== Path Mount Operations ==========
 
     /// Mount a filesystem at the given path
     pub fn mount(&mut self, path: &str, filesystem: Box<dyn Filesystem>) -> VfsResult<()> {
@@ -74,10 +132,84 @@ impl MountTable {
         }
     }
 
-    /// Find the filesystem for a given path
+    // ========== Drive Mount Operations ==========
+
+    /// Mount a filesystem as a drive letter
+    pub fn mount_drive(&mut self, letter: char, filesystem: Box<dyn Filesystem>) -> VfsResult<()> {
+        let idx = drive_index(letter).ok_or(VfsError::InvalidArgument)?;
+
+        if self.drives[idx].is_some() {
+            return Err(VfsError::AlreadyMounted);
+        }
+
+        self.drives[idx] = Some(DriveMount::new(letter, filesystem));
+        Ok(())
+    }
+
+    /// Mount a filesystem as a drive letter with a label
+    pub fn mount_drive_labeled(&mut self, letter: char, filesystem: Box<dyn Filesystem>, label: &str) -> VfsResult<()> {
+        let idx = drive_index(letter).ok_or(VfsError::InvalidArgument)?;
+
+        if self.drives[idx].is_some() {
+            return Err(VfsError::AlreadyMounted);
+        }
+
+        self.drives[idx] = Some(DriveMount::with_label(letter, filesystem, label));
+        Ok(())
+    }
+
+    /// Unmount a drive letter
+    pub fn unmount_drive(&mut self, letter: char) -> VfsResult<()> {
+        let idx = drive_index(letter).ok_or(VfsError::InvalidArgument)?;
+
+        if self.drives[idx].is_none() {
+            return Err(VfsError::NotMounted);
+        }
+
+        self.drives[idx] = None;
+        Ok(())
+    }
+
+    /// Get a drive mount by letter
+    pub fn get_drive(&self, letter: char) -> Option<&DriveMount> {
+        let idx = drive_index(letter)?;
+        self.drives[idx].as_ref()
+    }
+
+    /// List all mounted drives
+    pub fn list_drives(&self) -> impl Iterator<Item = &DriveMount> {
+        self.drives.iter().filter_map(|d| d.as_ref())
+    }
+
+    // ========== Resolution ==========
+
+    /// Find the filesystem for a given path (auto-detects path type)
     ///
     /// Returns the filesystem and the path relative to the mount point
     pub fn resolve(&self, path: &str) -> VfsResult<(&dyn Filesystem, String)> {
+        let parsed = parse(path);
+
+        match parsed.path_type {
+            PathType::Drive(letter) => self.resolve_drive(letter, &parsed.path),
+            PathType::Unix => self.resolve_path(&parsed.path),
+        }
+    }
+
+    /// Resolve a drive letter path
+    fn resolve_drive(&self, letter: char, rel_path: &str) -> VfsResult<(&dyn Filesystem, String)> {
+        let idx = drive_index(letter).ok_or(VfsError::InvalidArgument)?;
+
+        match &self.drives[idx] {
+            Some(drive) => {
+                // Path is already jailed by the parse function
+                Ok((drive.filesystem.as_ref(), String::from(rel_path)))
+            }
+            None => Err(VfsError::NotMounted),
+        }
+    }
+
+    /// Resolve a Unix-style path
+    fn resolve_path(&self, path: &str) -> VfsResult<(&dyn Filesystem, String)> {
         let normalized = normalize(path);
 
         // Find the longest matching mount point
@@ -102,7 +234,9 @@ impl MountTable {
         Err(VfsError::NotMounted)
     }
 
-    /// Get list of all mount points
+    // ========== Query Operations ==========
+
+    /// Get list of all path mount points
     pub fn list(&self) -> &[MountPoint] {
         &self.mounts
     }

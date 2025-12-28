@@ -261,6 +261,12 @@ pub fn save_parent_context_with_frame(return_rip: u64, return_rsp: u64) {
 
                 debug_serial(b"[PROCESS] Saved parent context, PID=");
                 debug_hex(pid as u64);
+                debug_serial(b" RIP=");
+                debug_hex(return_rip);
+                debug_serial(b" RSP=");
+                debug_hex(return_rsp);
+                debug_serial(b" PML4=");
+                debug_hex(parent_pml4);
                 debug_serial(b"\r\n");
             }
         }
@@ -312,6 +318,12 @@ pub fn resume_parent() -> ! {
 
         debug_serial(b"[PROCESS] Resuming parent PID=");
         debug_hex(ctx.parent_pid as u64);
+        debug_serial(b" RIP=");
+        debug_hex(ctx.rip);
+        debug_serial(b" RSP=");
+        debug_hex(ctx.rsp);
+        debug_serial(b" PML4=");
+        debug_hex(ctx.parent_pml4);
         debug_serial(b"\r\n");
 
         // Restore parent's kernel stack for interrupts
@@ -868,6 +880,12 @@ unsafe fn restore_kernel_paging() {
         debug_serial(b"Restoring kernel page table...\r\n");
         watos_mem::paging::load_cr3(KERNEL_PML4);
     }
+}
+
+/// Get the kernel's PML4 address for CR3 switching during syscalls
+/// Returns 0 if not initialized
+pub fn get_kernel_pml4() -> u64 {
+    unsafe { KERNEL_PML4 }
 }
 
 pub fn cleanup() {

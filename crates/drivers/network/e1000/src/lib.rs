@@ -6,10 +6,9 @@
 #![no_std]
 
 use core::ptr::{read_volatile, write_volatile};
-use watos_driver_framework::{Driver, DriverInfo, DriverState, DriverError};
-use watos_driver_framework::net::{NetworkDevice, MacAddress, LinkStatus, LinkSpeed, NetCapabilities};
-use watos_driver_framework::bus::{PciBus, PciBar};
-use watos_driver_pci::PciDriver;
+use watos_driver_traits::{Driver, DriverInfo, DriverState, DriverError};
+use watos_driver_traits::net::{NetworkDevice, MacAddress, LinkStatus, LinkSpeed, NetCapabilities};
+use watos_driver_pci::{PciDriver, PciBar};
 
 // e1000 Register offsets
 const REG_CTRL: u32 = 0x0000;

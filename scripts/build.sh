@@ -515,6 +515,58 @@ else
 fi
 cd "$PROJECT_ROOT"
 
+# Build all remaining apps in crates/apps/ automatically
+log "Building additional WATOS applications..."
+BUILT_APPS="gwbasic echo date clear uname uptime ps drives ls pwd cd mkdir console"
+
+for app_dir in "$PROJECT_ROOT/crates/apps"/*; do
+    if [ -d "$app_dir" ] && [ -f "$app_dir/Cargo.toml" ]; then
+        app_name=$(basename "$app_dir")
+
+        # Skip already built apps and non-binary directories
+        skip=false
+        for built in $BUILT_APPS; do
+            if [ "$app_name" = "$built" ]; then
+                skip=true
+                break
+            fi
+        done
+
+        # Skip if it's the linker script
+        if [ "$app_name" = "watos-app.ld" ]; then
+            skip=true
+        fi
+
+        if [ "$skip" = true ]; then
+            continue
+        fi
+
+        log "Building $app_name for WATOS..."
+        cd "$app_dir"
+
+        APP_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+        if RUSTFLAGS="$APP_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+            --target x86_64-unknown-none \
+            --bin "$app_name" 2>&1; then
+
+            if [ "$BUILD_TYPE" = "release" ]; then
+                APP_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/$app_name"
+            else
+                APP_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/$app_name"
+            fi
+
+            if [ -f "$APP_BIN" ]; then
+                cp "$APP_BIN" "$PROJECT_ROOT/rootfs/apps/system/$app_name"
+                cp "$APP_BIN" "$PROJECT_ROOT/uefi_test/apps/system/$app_name"
+                success "$app_name built -> /apps/system/$app_name ($(du -h "$APP_BIN" | cut -f1))"
+            fi
+        else
+            echo -e "${YELLOW}[WARN]${NC} $app_name build failed (optional)"
+        fi
+        cd "$PROJECT_ROOT"
+    fi
+done
+
 # Build console/terminal application (TERM.EXE)
 log "Building console (TERM.EXE) for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/console"

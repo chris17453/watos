@@ -21,6 +21,8 @@ watos-driver-ahci = { path = "crates/drivers/storage/ahci" }
 
 # Filesystem
 wfs-common = { path = "crates/storage/wfs" }
+watos-vfs = { path = "crates/storage/vfs" }
+watos-fat = { path = "crates/storage/fat" }
 
 [workspace]
 members = [
@@ -51,6 +53,8 @@ members = [
     "crates/storage/vfs",
     "crates/storage/fat",
     "crates/storage/wfs",
+    "crates/storage/devfs",
+    "crates/storage/procfs",
 
     # Network subsystem
     "crates/network/stack",
@@ -78,6 +82,18 @@ members = [
     "crates/apps/pwd",
     "crates/apps/cd",
     "crates/apps/mkdir",
+    "crates/apps/ln",
+    "crates/apps/mkfifo",
+    "crates/apps/df",
+    "crates/apps/cat",
+    "crates/apps/rm",
+    "crates/apps/touch",
+    "crates/apps/cp",
+    "crates/apps/mv",
+    "crates/apps/shutdown",
+    "crates/apps/reboot",
+    "crates/apps/lsblk",
+    "crates/apps/mount",
 ]
 exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
 

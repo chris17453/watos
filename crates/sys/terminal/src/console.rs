@@ -3,6 +3,7 @@
 //! Manages multiple virtual terminals (like Linux tty1-tty12)
 //! with Alt+Fn switching.
 
+use crate::cell::Cell;
 use crate::framebuffer::Framebuffer;
 use crate::keyboard::{Keyboard, KeyEvent, KeyCode, Modifiers};
 use crate::renderer::Renderer;
@@ -197,6 +198,18 @@ impl ConsoleManager {
     /// Get dimensions
     pub fn size(&self) -> (usize, usize) {
         (self.cols, self.rows)
+    }
+
+    /// Get a row's content as chars for testing
+    /// Callback receives (row_index, &[Cell]) for each row
+    pub fn for_each_row<F: FnMut(usize, &[Cell])>(&self, mut f: F) {
+        if let Some(term) = self.active_terminal() {
+            for row in 0..self.rows {
+                if let Some(cells) = term.grid.row(row) {
+                    f(row, cells);
+                }
+            }
+        }
     }
 }
 

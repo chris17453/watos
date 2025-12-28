@@ -1,0 +1,12 @@
+[package]
+name = "watos-procfs"
+version = "0.1.0"
+edition = "2021"
+description = "Process filesystem (/proc) for WATOS"
+
+[dependencies]
+spin = "0.5.2"
+watos-vfs = { path = "../vfs" }
+
+[features]
+default = []

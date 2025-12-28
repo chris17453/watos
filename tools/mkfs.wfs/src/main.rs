@@ -377,6 +377,34 @@ fn is_executable(name: &str) -> bool {
     lower.ends_with(".sys")
 }
 
+/// Recursively collect all files from a directory
+/// Returns (relative_path, full_path) pairs where relative_path uses / as separator
+fn collect_files_recursive(
+    base_dir: &PathBuf,
+    current_dir: &PathBuf,
+    files: &mut Vec<(String, PathBuf)>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(current_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_file() {
+            // Calculate relative path from base_dir
+            let relative = path.strip_prefix(base_dir)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Path error"))?;
+
+            // Convert to string with forward slashes
+            let relative_str = relative.to_string_lossy().replace('\\', "/");
+            files.push((relative_str, path));
+        } else if file_type.is_dir() {
+            // Recurse into subdirectory
+            collect_files_recursive(base_dir, &path, files)?;
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // WFS V3 SUPPORT
 // ============================================================================
@@ -637,26 +665,23 @@ fn main() -> std::io::Result<()> {
 
     let mut img = WfsImage::create(&args.output, size, max_files)?;
 
-    // Add files from directory if specified
+    // Add files from directory if specified (recursively)
     if let Some(dir) = &args.dir {
         println!("\nAdding files from: {}", dir.display());
 
-        let entries: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-            .collect();
+        // Collect all files recursively
+        let mut files_to_add: Vec<(String, PathBuf)> = Vec::new();
+        collect_files_recursive(dir, dir, &mut files_to_add)?;
 
-        for entry in entries {
-            // Preserve original filename case and spaces
-            let name = entry.file_name().to_string_lossy().to_string();
-            let data = fs::read(entry.path())?;
+        for (relative_path, full_path) in files_to_add {
+            let data = fs::read(&full_path)?;
 
             let mut flags = 0u16;
-            if is_executable(&name) {
+            if is_executable(&relative_path) {
                 flags |= FLAG_EXEC;
             }
 
-            img.add_file(&name, &data, flags, args.verbose)?;
+            img.add_file(&relative_path, &data, flags, args.verbose)?;
         }
     }
 

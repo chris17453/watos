@@ -1,0 +1,12 @@
+[package]
+name = "watos-devfs"
+version = "0.1.0"
+edition = "2021"
+description = "Device filesystem (/dev) for WATOS"
+
+[dependencies]
+spin = "0.5.2"
+watos-vfs = { path = "../vfs" }
+
+[features]
+default = []

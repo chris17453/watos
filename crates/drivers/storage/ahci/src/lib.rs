@@ -133,10 +133,23 @@ pub struct AhciDriver {
 }
 
 impl AhciDriver {
-    /// Fixed memory addresses for AHCI structures
-    const CMD_LIST_ADDR: u64 = 0x400000;
-    const FIS_BASE_ADDR: u64 = 0x401000;
-    const CMD_TABLE_ADDR: u64 = 0x402000;
+    /// Base memory address for AHCI structures
+    /// Each port gets 16KB (0x4000) of space to avoid conflicts
+    const AHCI_MEM_BASE: u64 = 0x400000;
+    const PORT_MEM_SIZE: u64 = 0x4000;
+
+    /// Calculate per-port memory addresses
+    fn port_cmd_list(port: u8) -> u64 {
+        Self::AHCI_MEM_BASE + (port as u64 * Self::PORT_MEM_SIZE)
+    }
+
+    fn port_fis_base(port: u8) -> u64 {
+        Self::AHCI_MEM_BASE + (port as u64 * Self::PORT_MEM_SIZE) + 0x1000
+    }
+
+    fn port_cmd_table(port: u8) -> u64 {
+        Self::AHCI_MEM_BASE + (port as u64 * Self::PORT_MEM_SIZE) + 0x2000
+    }
 
     /// Probe for AHCI controller and create driver
     pub fn probe() -> Option<Self> {
@@ -174,13 +187,14 @@ impl AhciDriver {
 
                     if det == 3 && ipm == 1 {
                         if target_port == 0xFF || target_port == port {
+                            // Each port gets its own memory region to avoid conflicts
                             return Some(Self {
                                 state: DriverState::Loaded,
                                 mmio_base,
                                 port,
-                                cmd_list: Self::CMD_LIST_ADDR,
-                                cmd_table: Self::CMD_TABLE_ADDR,
-                                fis_base: Self::FIS_BASE_ADDR,
+                                cmd_list: Self::port_cmd_list(port),
+                                cmd_table: Self::port_cmd_table(port),
+                                fis_base: Self::port_fis_base(port),
                                 lba_offset: 0,
                                 sector_size: 512,
                                 total_sectors: 0,

@@ -73,6 +73,10 @@ pub mod numbers {
     pub const SYS_MOUNT: u32 = 78;         // Mount drive (drive_name, device_id, fs_type)
     pub const SYS_UNMOUNT: u32 = 79;       // Unmount drive (drive_name)
     pub const SYS_LISTDRIVES: u32 = 85;    // List mounted drives
+    pub const SYS_SYMLINK: u32 = 86;       // Create symbolic link (target, linkpath)
+    pub const SYS_READLINK: u32 = 87;      // Read symbolic link target
+    pub const SYS_MKFIFO: u32 = 88;        // Create named pipe (FIFO)
+    pub const SYS_STATFS: u32 = 89;        // Get filesystem statistics
 
     // Process execution
     pub const SYS_EXEC: u32 = 80;          // Execute program (replace current process)
@@ -84,6 +88,13 @@ pub mod numbers {
     pub const SYS_GETDATE: u32 = 90;       // Get current date (year, month, day)
     pub const SYS_GETTIME: u32 = 91;       // Get current time (hour, min, sec)
     pub const SYS_GETTICKS: u32 = 92;      // Get system ticks since boot
+
+    // Power management
+    pub const SYS_SHUTDOWN: u32 = 100;     // Shutdown the system
+    pub const SYS_REBOOT: u32 = 101;       // Reboot the system
+
+    // Block device operations
+    pub const SYS_LSBLK: u32 = 110;        // List block devices
 }
 
 /// Raw syscall interface - performs INT 0x80
@@ -436,6 +447,75 @@ pub mod syscalls {
         } else {
             None
         }
+    }
+
+    /// Create a symbolic link
+    /// Returns 0 on success, error code on failure
+    pub fn symlink(target: &str, linkpath: &str) -> u64 {
+        unsafe {
+            // Pack target and linkpath info
+            // arg1 = target ptr, arg2 = target len << 32 | linkpath len, arg3 = linkpath ptr
+            let packed = ((target.len() as u64) << 32) | (linkpath.len() as u64);
+            raw_syscall3(
+                SYS_SYMLINK,
+                target.as_ptr() as u64,
+                packed,
+                linkpath.as_ptr() as u64,
+            )
+        }
+    }
+
+    /// Read a symbolic link target
+    /// Returns bytes written to buffer, 0 on error
+    pub fn readlink(path: &str, buf: &mut [u8]) -> usize {
+        unsafe {
+            raw_syscall3(
+                SYS_READLINK,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                buf.as_mut_ptr() as u64,
+            ) as usize
+        }
+    }
+
+    /// Create a named pipe (FIFO)
+    /// Returns 0 on success, error code on failure
+    pub fn mkfifo(path: &str) -> u64 {
+        unsafe {
+            raw_syscall2(SYS_MKFIFO, path.as_ptr() as u64, path.len() as u64)
+        }
+    }
+
+    /// Get filesystem statistics
+    /// buf should be at least 48 bytes (6 x u64)
+    /// Returns: [total_blocks, free_blocks, block_size, total_inodes, free_inodes, max_name_len]
+    pub fn statfs(path: &str, buf: &mut [u64; 6]) -> u64 {
+        unsafe {
+            raw_syscall3(
+                SYS_STATFS,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                buf.as_mut_ptr() as u64,
+            )
+        }
+    }
+
+    /// Shutdown the system
+    /// This function does not return on success
+    pub fn shutdown() -> ! {
+        unsafe {
+            raw_syscall0(SYS_SHUTDOWN);
+        }
+        loop {}
+    }
+
+    /// Reboot the system
+    /// This function does not return on success
+    pub fn reboot() -> ! {
+        unsafe {
+            raw_syscall0(SYS_REBOOT);
+        }
+        loop {}
     }
 }
 
