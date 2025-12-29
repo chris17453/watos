@@ -963,6 +963,26 @@ pub extern "C" fn _start() -> ! {
     watos_process::init();
     unsafe { watos_arch::serial_write(b"[KERNEL] Process subsystem initialized\r\n"); }
 
+    // 5.4 Initialize video driver from boot info
+    unsafe {
+        if let Some(info) = BOOT_INFO {
+            if info.framebuffer_addr != 0 {
+                let is_bgr = info.pixel_format == 1;
+                watos_driver_video::init_from_boot_info(
+                    info.framebuffer_addr,
+                    info.framebuffer_width,
+                    info.framebuffer_height,
+                    info.framebuffer_pitch,
+                    info.framebuffer_bpp,
+                    is_bgr,
+                );
+                watos_arch::serial_write(b"[KERNEL] Video driver initialized\r\n");
+            } else {
+                watos_arch::serial_write(b"[KERNEL] WARNING: No framebuffer from bootloader\r\n");
+            }
+        }
+    }
+
     // 5.5 Initialize VFS and mount boot disk as C:
     init_cwd();
     let vfs_ok = init_vfs();
@@ -1048,6 +1068,20 @@ mod syscall {
 
     // Raw keyboard
     pub const SYS_READ_SCANCODE: u64 = 60;
+
+    // VGA Graphics
+    pub const SYS_VGA_SET_MODE: u64 = 30;
+    pub const SYS_VGA_SET_PIXEL: u64 = 31;
+    pub const SYS_VGA_GET_PIXEL: u64 = 32;
+    pub const SYS_VGA_BLIT: u64 = 33;
+    pub const SYS_VGA_CLEAR: u64 = 34;
+    pub const SYS_VGA_FLIP: u64 = 35;
+    pub const SYS_VGA_SET_PALETTE: u64 = 36;
+    pub const SYS_VGA_CREATE_SESSION: u64 = 37;
+    pub const SYS_VGA_DESTROY_SESSION: u64 = 38;
+    pub const SYS_VGA_SET_ACTIVE_SESSION: u64 = 39;
+    pub const SYS_VGA_GET_SESSION_INFO: u64 = 40;
+    pub const SYS_VGA_ENUMERATE_MODES: u64 = 41;
 
     // Process management
     pub const SYS_GETPID: u64 = 12;
@@ -1929,6 +1963,176 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
                 get_cwd(buf) as u64
             }
+        }
+
+        // VGA Graphics Syscalls
+        syscall::SYS_VGA_SET_MODE => {
+            // arg1 = mode number (not used directly, set via session or use default)
+            // For now, just return success
+            0
+        }
+
+        syscall::SYS_VGA_SET_PIXEL => {
+            // arg1 = x, arg2 = y, arg3 = color
+            let x = arg1 as u32;
+            let y = arg2 as u32;
+            let color = arg3 as u32;
+            watos_driver_video::set_pixel(x, y, color);
+            0
+        }
+
+        syscall::SYS_VGA_GET_PIXEL => {
+            // arg1 = x, arg2 = y
+            let x = arg1 as u32;
+            let y = arg2 as u32;
+            watos_driver_video::get_pixel(x, y) as u64
+        }
+
+        syscall::SYS_VGA_BLIT => {
+            // arg1 = buffer pointer, arg2 = width, arg3 = height, arg4 = stride
+            let buf_ptr = arg1 as *const u8;
+            let width = arg2 as usize;
+            let height = arg3 as usize;
+            let stride = arg3 as usize; // Note: should be r10 for 4th arg
+            
+            if buf_ptr.is_null() || width == 0 || height == 0 {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let data = core::slice::from_raw_parts(buf_ptr, stride * height);
+                // Blit to active session if exists, otherwise to physical framebuffer
+                if let Some(session_id) = watos_driver_video::get_active_session() {
+                    watos_driver_video::session_blit(session_id, data, width, height, stride);
+                } else {
+                    // Direct blit to physical framebuffer
+                    for y in 0..height {
+                        for x in 0..width {
+                            let offset = y * stride + x;
+                            if offset < data.len() {
+                                let color = data[offset] as u32;
+                                watos_driver_video::set_pixel(x as u32, y as u32, color);
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+
+        syscall::SYS_VGA_CLEAR => {
+            // arg1 = color (8-bit indexed or low byte of RGB)
+            let color = arg1 as u32;
+            watos_driver_video::clear(color);
+            0
+        }
+
+        syscall::SYS_VGA_FLIP => {
+            // Composite active session to display
+            if let Some(session_id) = watos_driver_video::get_active_session() {
+                watos_driver_video::session_flip(session_id);
+            }
+            0
+        }
+
+        syscall::SYS_VGA_SET_PALETTE => {
+            // arg1 = index, arg2 = r, arg3 = g, arg4 (r10) = b
+            let index = (arg1 & 0xFF) as u8;
+            let r = (arg2 & 0xFF) as u8;
+            let g = (arg3 & 0xFF) as u8;
+            // For now, assume b is in upper bits of arg3 or separate arg
+            let b = ((arg3 >> 8) & 0xFF) as u8;
+            
+            match watos_driver_video::set_palette(index, r, g, b) {
+                Ok(_) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+
+        // VGA Session Management Syscalls
+        syscall::SYS_VGA_CREATE_SESSION => {
+            // arg1 = width, arg2 = height, arg3 = bpp
+            let width = arg1 as u32;
+            let height = arg2 as u32;
+            let bpp = arg3 as u8;
+
+            // Find matching mode or use default
+            let mode = watos_driver_video::get_current_mode()
+                .unwrap_or(watos_driver_video::modes::SVGA_800X600X32);
+
+            match watos_driver_video::create_session(mode) {
+                Some(session_id) => session_id as u64,
+                None => u64::MAX,
+            }
+        }
+
+        syscall::SYS_VGA_DESTROY_SESSION => {
+            // arg1 = session_id
+            let session_id = arg1 as u32;
+            if watos_driver_video::destroy_session(session_id) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        syscall::SYS_VGA_SET_ACTIVE_SESSION => {
+            // arg1 = session_id
+            let session_id = arg1 as u32;
+            if watos_driver_video::set_active_session(session_id) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        syscall::SYS_VGA_GET_SESSION_INFO => {
+            // arg1 = session_id, arg2 = buffer pointer for VideoMode struct
+            let session_id = arg1 as u32;
+            let buf_ptr = arg2 as *mut u32;
+
+            if buf_ptr.is_null() {
+                return u64::MAX;
+            }
+
+            if let Some(mode) = watos_driver_video::get_session_info(session_id) {
+                unsafe {
+                    // Write VideoMode: width, height, bpp, format
+                    *buf_ptr = mode.width;
+                    *buf_ptr.add(1) = mode.height;
+                    *buf_ptr.add(2) = mode.bpp as u32;
+                    *buf_ptr.add(3) = mode.format as u32;
+                }
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        syscall::SYS_VGA_ENUMERATE_MODES => {
+            // arg1 = buffer pointer, arg2 = buffer size (in VideoMode structs)
+            // Returns number of modes written
+            let buf_ptr = arg1 as *mut u32;
+            let max_modes = arg2 as usize;
+
+            if buf_ptr.is_null() || max_modes == 0 {
+                return 0;
+            }
+
+            let modes = watos_driver_video::get_available_modes();
+            let count = modes.len().min(max_modes);
+
+            unsafe {
+                for (i, mode) in modes.iter().take(count).enumerate() {
+                    let offset = i * 4; // 4 u32s per VideoMode
+                    *buf_ptr.add(offset) = mode.width;
+                    *buf_ptr.add(offset + 1) = mode.height;
+                    *buf_ptr.add(offset + 2) = mode.bpp as u32;
+                    *buf_ptr.add(offset + 3) = mode.format as u32;
+                }
+            }
+
+            count as u64
         }
 
         _ => {

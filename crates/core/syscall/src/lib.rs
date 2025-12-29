@@ -45,6 +45,13 @@ pub mod numbers {
     pub const SYS_VGA_FLIP: u32 = 35;
     pub const SYS_VGA_SET_PALETTE: u32 = 36;
     
+    // VGA Multi-Session Support
+    pub const SYS_VGA_CREATE_SESSION: u32 = 37;
+    pub const SYS_VGA_DESTROY_SESSION: u32 = 38;
+    pub const SYS_VGA_SET_ACTIVE_SESSION: u32 = 39;
+    pub const SYS_VGA_GET_SESSION_INFO: u32 = 40;
+    pub const SYS_VGA_ENUMERATE_MODES: u32 = 41;
+    
     // Graphics extensions
     pub const SYS_GFX_PSET: u32 = 40;      // Set pixel
     pub const SYS_GFX_LINE: u32 = 41;      // Draw line
