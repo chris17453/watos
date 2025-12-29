@@ -198,9 +198,11 @@ pub extern "C" fn _start() -> ! {
             )
         };
 
-        // Clear password from memory for security
+        // Clear password from memory for security (volatile write to prevent optimization)
         for i in 0..password_buf.len() {
-            password_buf[i] = 0;
+            unsafe {
+                core::ptr::write_volatile(&mut password_buf[i], 0);
+            }
         }
 
         if uid != u64::MAX {

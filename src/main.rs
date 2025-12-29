@@ -2179,8 +2179,9 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_AUTHENTICATE => {
             // arg1 = username pointer
             // arg2 = username length
-            // arg3 = password pointer (length implicit from null-term or assume max 64)
+            // arg3 = password pointer
             // Returns UID on success, u64::MAX on failure
+            // Note: Password length is determined by null terminator (max 64 bytes)
             let username_ptr = arg1 as *const u8;
             let username_len = arg2 as usize;
             let password_ptr = arg3 as *const u8;
@@ -2192,11 +2193,21 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             unsafe {
                 let username = core::slice::from_raw_parts(username_ptr, username_len);
                 
-                // Find null terminator or assume max password length
+                // Safely find password length (null-terminated, max 64 bytes)
                 let mut password_len = 0usize;
-                while password_len < 64 && *password_ptr.add(password_len) != 0 {
+                for i in 0..64 {
+                    if *password_ptr.add(i) == 0 {
+                        break;
+                    }
                     password_len += 1;
                 }
+                
+                // Validate we found a null terminator
+                if password_len == 64 && *password_ptr.add(63) != 0 {
+                    watos_arch::serial_write(b"[KERNEL] Password too long or not null-terminated\r\n");
+                    return u64::MAX;
+                }
+                
                 let password = core::slice::from_raw_parts(password_ptr, password_len);
 
                 watos_arch::serial_write(b"[KERNEL] SYS_AUTHENTICATE: user=");
