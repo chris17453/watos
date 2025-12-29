@@ -27,8 +27,10 @@ extern crate alloc;
 pub mod heap;
 pub mod paging;
 pub mod phys;
+pub mod user_access;
 
 // Re-export commonly used items
 pub use heap::{init as init_heap, ALLOCATOR};
 pub use paging::{ProcessPageTable, PageTable, PAGE_SIZE};
 pub use paging::flags as page_flags;
+pub use user_access::{validate_user_ptr, read_user_string, copy_from_user, copy_to_user, UserAccessError};
