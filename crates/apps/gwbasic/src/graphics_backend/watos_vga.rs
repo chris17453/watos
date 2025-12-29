@@ -72,7 +72,7 @@ impl VideoMode {
 /// WATOS VGA/SVGA graphics backend
 pub struct WatosVgaBackend {
     mode: VideoMode,
-    framebuffer: Vec<u8>,    // Pixel data (8-bit color indices for now)
+    framebuffer: Vec<u8>,    // Pixel data - size depends on bpp (8-bit indexed or 32-bit RGBA)
     cursor_x: usize,
     cursor_y: usize,
     fg_color: u8,
@@ -170,7 +170,11 @@ mod syscall {
 impl WatosVgaBackend {
     /// Create a new VGA backend with the specified mode using SVGA sessions
     pub fn new(mode: VideoMode) -> Result<Self> {
-        let buffer_size = mode.width * mode.height;
+        // Calculate buffer size based on bits per pixel
+        // For 8-bit modes: 1 byte per pixel
+        // For 32-bit modes: 4 bytes per pixel (RGBA)
+        let bytes_per_pixel = if mode.bpp <= 8 { 1 } else { (mode.bpp as usize + 7) / 8 };
+        let buffer_size = mode.width * mode.height * bytes_per_pixel;
         let framebuffer = vec![0u8; buffer_size];
 
         // For text mode (mode 0), we don't create a graphics session
@@ -249,8 +253,33 @@ impl WatosVgaBackend {
     /// Set pixel in local buffer
     fn set_pixel_local(&mut self, x: usize, y: usize, color: u8) {
         if x < self.mode.width && y < self.mode.height {
-            let idx = y * self.mode.width + x;
-            self.framebuffer[idx] = color;
+            if self.mode.bpp <= 8 {
+                // 8-bit indexed color
+                let idx = y * self.mode.width + x;
+                self.framebuffer[idx] = color;
+            } else {
+                // 32-bit RGBA color - expand 8-bit color index to RGBA
+                let bytes_per_pixel = (self.mode.bpp as usize + 7) / 8;
+                let idx = (y * self.mode.width + x) * bytes_per_pixel;
+                
+                // Map 8-bit color to RGB (simple palette mapping)
+                // For now, use EGA-style 16-color palette
+                let rgb = if color < 16 {
+                    PALETTE_16[color as usize]
+                } else {
+                    // For higher indices, create a grayscale
+                    let gray = color;
+                    ((gray as u32) << 16) | ((gray as u32) << 8) | (gray as u32)
+                };
+                
+                // Write BGRA (assuming BGR pixel format)
+                self.framebuffer[idx] = (rgb & 0xFF) as u8;     // B
+                self.framebuffer[idx + 1] = ((rgb >> 8) & 0xFF) as u8;  // G
+                self.framebuffer[idx + 2] = ((rgb >> 16) & 0xFF) as u8; // R
+                if bytes_per_pixel == 4 {
+                    self.framebuffer[idx + 3] = 0xFF;           // A
+                }
+            }
             self.dirty = true;
         }
     }
@@ -258,8 +287,21 @@ impl WatosVgaBackend {
     /// Get pixel from local buffer
     fn get_pixel_local(&self, x: usize, y: usize) -> u8 {
         if x < self.mode.width && y < self.mode.height {
-            let idx = y * self.mode.width + x;
-            self.framebuffer[idx]
+            if self.mode.bpp <= 8 {
+                // 8-bit indexed color
+                let idx = y * self.mode.width + x;
+                self.framebuffer[idx]
+            } else {
+                // 32-bit RGBA - return approximation as 8-bit index
+                // For simplicity, just return a grayscale value
+                let bytes_per_pixel = (self.mode.bpp as usize + 7) / 8;
+                let idx = (y * self.mode.width + x) * bytes_per_pixel;
+                let r = self.framebuffer[idx + 2];
+                let g = self.framebuffer[idx + 1];
+                let b = self.framebuffer[idx];
+                // Simple grayscale conversion
+                ((r as u16 + g as u16 + b as u16) / 3) as u8
+            }
         } else {
             0
         }

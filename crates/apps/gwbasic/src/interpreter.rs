@@ -378,18 +378,19 @@ impl Interpreter {
             AstNode::Screen(mode) => {
                 // Screen mode change
                 let m = self.evaluate_expression(&mode)?.as_integer()?;
-                let (width, height) = match m {
-                    1 => (320, 200),  // SCREEN 1: 320x200 graphics mode (CGA)
-                    2 => (640, 200),  // SCREEN 2: 640x200 high-res monochrome
-                    3 => (640, 480),  // SCREEN 3: 640x480 VGA
-                    4 => (800, 600),  // SCREEN 4: 800x600 SVGA
-                    5 => (1024, 768), // SCREEN 5: 1024x768 SVGA
-                    _ => (80, 25),    // SCREEN 0 or others: 80x25 text mode
-                };
 
                 // Create screen with appropriate backend based on graphics_mode
                 #[cfg(feature = "host")]
                 {
+                    let (width, height) = match m {
+                        1 => (320, 200),  // SCREEN 1: 320x200 graphics mode (CGA)
+                        2 => (640, 200),  // SCREEN 2: 640x200 high-res monochrome
+                        3 => (640, 480),  // SCREEN 3: 640x480 VGA
+                        4 => (800, 600),  // SCREEN 4: 800x600 SVGA
+                        5 => (1024, 768), // SCREEN 5: 1024x768 SVGA
+                        _ => (80, 25),    // SCREEN 0 or others: 80x25 text mode
+                    };
+                    
                     self.screen = match self.graphics_mode {
                         GraphicsMode::Gui => {
                             match WindowBackend::new(width, height) {
@@ -418,16 +419,25 @@ impl Interpreter {
                                 }
                                 Err(_) => {
                                     // Fall back to ASCII mode if VGA initialization fails
-                                    self.screen = Screen::new(width, height);
+                                    // Width/height not used here, just for consistency
+                                    self.screen = Screen::new(80, 25);
                                 }
                             }
                         } else {
                             // Text mode - use ASCII backend
-                            self.screen = Screen::new(width, height);
+                            self.screen = Screen::new(80, 25);
                         }
                     }
                     #[cfg(feature = "std")]
                     {
+                        let (width, height) = match m {
+                            1 => (320, 200),
+                            2 => (640, 200),
+                            3 => (640, 480),
+                            4 => (800, 600),
+                            5 => (1024, 768),
+                            _ => (80, 25),
+                        };
                         self.screen = Screen::new(width, height);
                     }
                 }
