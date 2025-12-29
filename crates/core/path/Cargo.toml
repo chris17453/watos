@@ -1,0 +1,13 @@
+[package]
+name = "watos-path"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "watos_path"
+path = "src/lib.rs"
+
+[dependencies]
+
+[features]
+default = []

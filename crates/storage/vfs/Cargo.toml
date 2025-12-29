@@ -6,3 +6,4 @@ description = "WATOS Virtual File System layer"
 
 [dependencies]
 spin = "0.5.2"
+watos-path = { path = "../../core/path" }

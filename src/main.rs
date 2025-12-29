@@ -26,6 +26,7 @@ use wfs_common::{Superblock, FileEntry, WFS_MAGIC, BLOCK_SIZE, ENTRIES_PER_BLOCK
 use alloc::boxed::Box;
 use watos_vfs::{FileMode, FileOperations, VfsError};
 use watos_fat::FatFilesystem;
+use watos_procfs::{ProcFs, SystemProvider};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -571,12 +572,108 @@ fn init_disk() -> bool {
 }
 
 /// Initialize VFS and mount boot disk (FAT) as drive C:
+/// System provider for procfs that returns real kernel stats
+struct WatosSystemProvider;
+
+impl SystemProvider for WatosSystemProvider {
+    fn cpu_info(&self) -> alloc::string::String {
+        use alloc::format;
+        format!(
+            "processor\t: 0\n\
+             vendor_id\t: WATOS\n\
+             model name\t: x86_64 Virtual CPU\n\
+             cpu family\t: 6\n\
+             model\t\t: 0\n\
+             stepping\t: 0\n"
+        )
+    }
+
+    fn mem_info(&self) -> alloc::string::String {
+        use alloc::format;
+        let phys_stats = watos_mem::phys::stats();
+        let heap_stats = watos_mem::heap::stats();
+
+        let total_kb = phys_stats.total_bytes() / 1024;
+        let free_kb = phys_stats.free_bytes() / 1024;
+        let used_kb = phys_stats.used_bytes() / 1024;
+        let heap_total_kb = heap_stats.total / 1024;
+        let heap_used_kb = heap_stats.used / 1024;
+        let heap_free_kb = (heap_stats.total - heap_stats.used) / 1024;
+
+        format!(
+            "MemTotal:       {} kB\n\
+             MemFree:        {} kB\n\
+             MemUsed:        {} kB\n\
+             HeapTotal:      {} kB\n\
+             HeapUsed:       {} kB\n\
+             HeapFree:       {} kB\n",
+            total_kb, free_kb, used_kb,
+            heap_total_kb, heap_used_kb, heap_free_kb
+        )
+    }
+
+    fn uptime_secs(&self) -> u64 {
+        // Get ticks and convert to seconds (assuming 1000 ticks/sec)
+        watos_arch::idt::get_ticks() / 1000
+    }
+
+    fn mounts_info(&self) -> alloc::string::String {
+        use alloc::format;
+        use alloc::string::String;
+
+        // Get drive list from kernel
+        let mut buf = [0u8; 1024];
+        let len = drive_list(&mut buf);
+        let drive_data = &buf[..len];
+
+        let mut result = String::new();
+
+        // Parse drives (format: "NAME:PATH:FSTYPE\n" per line)
+        let mut line_start = 0;
+        for i in 0..drive_data.len() {
+            if drive_data[i] == b'\n' {
+                let line = &drive_data[line_start..i];
+
+                // Parse "NAME:PATH:FSTYPE"
+                if let Some(colon1) = line.iter().position(|&c| c == b':') {
+                    if let Some(colon2) = line[colon1+1..].iter().position(|&c| c == b':') {
+                        let colon2 = colon1 + 1 + colon2;
+
+                        let name = core::str::from_utf8(&line[..colon1]).unwrap_or("?");
+                        let path = core::str::from_utf8(&line[colon1+1..colon2]).unwrap_or("?");
+                        let fstype = core::str::from_utf8(&line[colon2+1..]).unwrap_or("?");
+
+                        result.push_str(&format!("{} {} {} rw 0 0\n", name, path, fstype));
+                    }
+                }
+
+                line_start = i + 1;
+            }
+        }
+
+        result
+    }
+}
+
 fn init_vfs() -> bool {
     unsafe { watos_arch::serial_write(b"[KERNEL] Initializing VFS...\r\n"); }
 
     // Initialize the global VFS instance
     watos_vfs::init();
     unsafe { watos_arch::serial_write(b"[KERNEL] VFS initialized\r\n"); }
+
+    // Mount procfs at /proc
+    let procfs = ProcFs::new();
+    procfs.set_system_provider(Box::new(WatosSystemProvider));
+
+    match watos_vfs::mount("/proc", Box::new(procfs)) {
+        Ok(()) => {
+            unsafe { watos_arch::serial_write(b"[KERNEL] Mounted procfs at /proc\r\n"); }
+        }
+        Err(_) => {
+            unsafe { watos_arch::serial_write(b"[KERNEL] Failed to mount procfs\r\n"); }
+        }
+    }
 
     // Try all AHCI ports to find a valid FAT filesystem for C:
     // Port 0 = QEMU virtual FAT (invalid BPB), Port 2 = real FAT disk image
@@ -827,6 +924,11 @@ fn console_read(buf: &mut [u8]) -> usize {
 
 /// Convert PS/2 scancode to ASCII character (US keyboard layout)
 fn scancode_to_ascii(scancode: u8) -> u8 {
+    // Ignore key release events (scancode >= 0x80)
+    if scancode >= 0x80 {
+        return 0;
+    }
+
     // TODO: Handle shift, ctrl, alt modifiers properly
     // For now, simple unshifted ASCII mapping
     match scancode {
@@ -1194,6 +1296,15 @@ mod syscall {
     pub const SYS_SESSION_CREATE: u64 = 130;
     pub const SYS_SESSION_SWITCH: u64 = 131;
     pub const SYS_SESSION_GET_CURRENT: u64 = 132;
+
+    // Memory info
+    pub const SYS_MEMINFO: u64 = 135;
+
+    // Environment variables
+    pub const SYS_SETENV: u64 = 136;
+    pub const SYS_GETENV: u64 = 137;
+    pub const SYS_UNSETENV: u64 = 138;
+    pub const SYS_LISTENV: u64 = 139;
 }
 
 /// Syscall handler - naked function called from IDT
@@ -1205,7 +1316,24 @@ mod syscall {
 #[no_mangle]
 pub unsafe extern "C" fn syscall_handler() {
     core::arch::naked_asm!(
-        // Save all caller-saved registers (syscall may clobber them)
+        // Save original register state to global (for parent context saving during exec)
+        // This must be done BEFORE we modify any registers
+        "mov qword ptr [rip + {saved_regs} + 0], rbx",   // Save RBX
+        "mov qword ptr [rip + {saved_regs} + 8], rcx",   // Save RCX
+        "mov qword ptr [rip + {saved_regs} + 16], rdx",  // Save RDX
+        "mov qword ptr [rip + {saved_regs} + 24], rsi",  // Save RSI
+        "mov qword ptr [rip + {saved_regs} + 32], rdi",  // Save RDI
+        "mov qword ptr [rip + {saved_regs} + 40], r8",   // Save R8
+        "mov qword ptr [rip + {saved_regs} + 48], r9",   // Save R9
+        "mov qword ptr [rip + {saved_regs} + 56], r10",  // Save R10
+        "mov qword ptr [rip + {saved_regs} + 64], r11",  // Save R11
+        "mov qword ptr [rip + {saved_regs} + 72], rbp",  // Save RBP
+        "mov qword ptr [rip + {saved_regs} + 80], r12",  // Save R12
+        "mov qword ptr [rip + {saved_regs} + 88], r13",  // Save R13
+        "mov qword ptr [rip + {saved_regs} + 96], r14",  // Save R14
+        "mov qword ptr [rip + {saved_regs} + 104], r15", // Save R15
+
+        // Save all caller-saved registers on stack (syscall may clobber them)
         // RAX contains syscall number, will be overwritten with result
         // RDI, RSI, RDX contain args 1-3
         "push rbx",
@@ -1255,6 +1383,7 @@ pub unsafe extern "C" fn syscall_handler() {
         "iretq",
 
         handler = sym handle_syscall_inner,
+        saved_regs = sym SAVED_SYSCALL_REGS,
     );
 }
 
@@ -1262,6 +1391,30 @@ pub unsafe extern "C" fn syscall_handler() {
 static mut SYSCALL_PATH_BUF: [u8; 256] = [0u8; 256];
 /// Static buffer for file read operations
 static mut SYSCALL_READ_BUF: [u8; 4096] = [0u8; 4096];
+
+/// Saved register state from syscall entry (for parent context saving)
+#[repr(C)]
+struct SavedSyscallRegs {
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+static mut SAVED_SYSCALL_REGS: SavedSyscallRegs = SavedSyscallRegs {
+    rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
+    r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+};
 
 /// Inner syscall handler - called from naked handler
 /// return_rip and return_rsp are from the interrupt frame for saving parent context
@@ -1428,6 +1581,8 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_EXIT => {
             // Check if there's a parent process to return to
             if watos_process::has_parent_context() {
+                // Free the current child process before resuming parent
+                watos_process::free_current_process();
                 watos_process::resume_parent(); // Never returns
             }
             // No parent - top-level process exiting, halt
@@ -1441,6 +1596,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             let fd = arg1;
             let ptr = arg2 as *const u8;
             let len = arg3 as usize;
+
             unsafe {
                 let slice = core::slice::from_raw_parts(ptr, len);
 
@@ -1480,15 +1636,35 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 }
                 count as u64
             } else if fd >= 3 {
-                // Read from open file via VFS
-                unsafe {
-                    let buf = core::slice::from_raw_parts_mut(buf_ptr, buf_size);
-                    let result = fd_read(fd, buf);
-                    if result >= 0 {
-                        result as u64
-                    } else {
-                        0
+                // Read from open file via VFS - switch to kernel page table for disk access
+                let user_cr3 = watos_mem::paging::get_cr3();
+                let kernel_pml4 = watos_process::get_kernel_pml4();
+
+                if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                    unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+                }
+
+                // Read in kernel space using static buffer, then copy to user
+                let result = unsafe {
+                    let max_chunk = buf_size.min(SYSCALL_READ_BUF.len());
+                    let result = fd_read(fd, &mut SYSCALL_READ_BUF[..max_chunk]);
+                    result
+                };
+
+                // Restore user page table
+                if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                    unsafe { watos_mem::paging::load_cr3(user_cr3); }
+                }
+
+                // Copy data to user buffer (now in user page table)
+                if result > 0 {
+                    unsafe {
+                        let copy_len = (result as usize).min(buf_size);
+                        core::ptr::copy_nonoverlapping(SYSCALL_READ_BUF.as_ptr(), buf_ptr, copy_len);
                     }
+                    result as u64
+                } else {
+                    0
                 }
             } else {
                 // fd 1 or 2 - can't read from stdout/stderr
@@ -1597,12 +1773,18 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 return u64::MAX; // Invalid args
             }
 
-            let cmdline = unsafe { core::slice::from_raw_parts(cmdline_ptr, cmdline_len) };
+            // Copy cmdline from user memory while still in user page table
+            let mut cmdline_buf = [0u8; 256];
+            let cmdline_copy = unsafe {
+                let user_cmdline = core::slice::from_raw_parts(cmdline_ptr, cmdline_len);
+                cmdline_buf[..cmdline_len].copy_from_slice(user_cmdline);
+                &cmdline_buf[..cmdline_len]
+            };
 
             // Extract program name (first word before space)
             let program_name = {
-                let space_pos = cmdline.iter().position(|&c| c == b' ').unwrap_or(cmdline_len);
-                &cmdline[..space_pos]
+                let space_pos = cmdline_copy.iter().position(|&c| c == b' ').unwrap_or(cmdline_len);
+                &cmdline_copy[..space_pos]
             };
 
             // Convert program name to string and build path
@@ -1632,10 +1814,19 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 full_path_str,    // Try C:/apps/system/<name>
             ];
 
-            // Use a static buffer to avoid heap allocation during syscall
-            static mut EXEC_BUFFER: [u8; 256 * 1024] = [0; 256 * 1024]; // 256KB max
-            let mut total_read = 0usize;
-            let mut loaded = false;
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            // Now we can safely use heap allocation
+            extern crate alloc;
+            use alloc::vec::Vec;
+
+            let mut app_data: Option<Vec<u8>> = None;
 
             for path in &paths {
                 if path.is_empty() {
@@ -1657,10 +1848,10 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                         watos_arch::serial_write(b"\r\n");
                     }
 
-                    // Read file in chunks
+                    // Read file using Vec
+                    let mut file_contents = Vec::new();
                     const CHUNK_SIZE: usize = 4096;
                     let mut read_buf = [0u8; CHUNK_SIZE];
-                    total_read = 0;
 
                     loop {
                         let chunk_read = fd_read(fd as i64, &mut read_buf);
@@ -1668,57 +1859,67 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                             break;
                         }
 
-                        // Copy to static buffer
-                        unsafe {
-                            let end = total_read + chunk_read as usize;
-                            if end > EXEC_BUFFER.len() {
-                                watos_arch::serial_write(b"[KERNEL] File too large\r\n");
-                                break;
-                            }
-                            EXEC_BUFFER[total_read..end].copy_from_slice(&read_buf[..chunk_read as usize]);
-                            total_read = end;
-                        }
+                        file_contents.extend_from_slice(&read_buf[..chunk_read as usize]);
 
-                        // Safety limit: max 256KB per executable
-                        if total_read >= 256 * 1024 {
+                        // Safety limit: max 1MB per executable
+                        if file_contents.len() >= 1024 * 1024 {
+                            unsafe {
+                                watos_arch::serial_write(b"[KERNEL] File too large\r\n");
+                            }
                             break;
                         }
                     }
 
                     fd_close(fd as i64);
 
-                    if total_read > 0 {
-                        loaded = true;
-
+                    if !file_contents.is_empty() {
                         unsafe {
                             watos_arch::serial_write(b"[KERNEL] Loaded ");
-                            watos_arch::serial_hex(total_read as u64);
+                            watos_arch::serial_hex(file_contents.len() as u64);
                             watos_arch::serial_write(b" bytes from ");
                             watos_arch::serial_write(path.as_bytes());
                             watos_arch::serial_write(b"\r\n");
                         }
+                        app_data = Some(file_contents);
                         break;
                     }
                 }
             }
 
-            if loaded && total_read > 0 {
-                // Save parent context
-                watos_process::save_parent_context_with_frame(return_rip, return_rsp);
+            let result = if let Some(data) = app_data {
+                // Save parent context with all register state
+                let regs = unsafe { &SAVED_SYSCALL_REGS };
+                watos_process::save_parent_context_with_frame(
+                    return_rip,
+                    return_rsp,
+                    regs.rbx,
+                    regs.rcx,
+                    regs.rdx,
+                    regs.rsi,
+                    regs.rdi,
+                    regs.rbp,
+                    regs.r8,
+                    regs.r9,
+                    regs.r10,
+                    regs.r11,
+                    regs.r12,
+                    regs.r13,
+                    regs.r14,
+                    regs.r15,
+                );
 
                 // Execute the app with the full command line as args
-                let cmdline_str = core::str::from_utf8(cmdline).unwrap_or("");
+                let cmdline_str = core::str::from_utf8(cmdline_copy).unwrap_or("");
 
-                unsafe {
-                    let app_data = &EXEC_BUFFER[..total_read];
-                    match watos_process::exec(program_str, app_data, cmdline_str) {
-                        Ok(_pid) => 0, // Success
-                        Err(e) => {
+                match watos_process::exec(program_str, &data, cmdline_str) {
+                    Ok(_pid) => 0, // Success
+                    Err(e) => {
+                        unsafe {
                             watos_arch::serial_write(b"[KERNEL] exec failed: ");
                             watos_arch::serial_write(e.as_bytes());
                             watos_arch::serial_write(b"\r\n");
-                            1 // Error
                         }
+                        1 // Error
                     }
                 }
             } else {
@@ -1728,7 +1929,14 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                     watos_arch::serial_write(b"\r\n");
                 }
                 2 // Not found
+            };
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
             }
+
+            result
         }
 
         syscall::SYS_GETARGS => {
@@ -1779,6 +1987,27 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_GETTICKS => {
             // Returns timer ticks since boot
             watos_arch::idt::get_ticks()
+        }
+
+        syscall::SYS_MEMINFO => {
+            // arg1 = pointer to u64[5] buffer
+            // Returns: 0 on success, 1 on error
+            let buf_ptr = arg1 as *mut u64;
+            if buf_ptr.is_null() {
+                return 1;
+            }
+
+            unsafe {
+                let phys_stats = watos_mem::phys::stats();
+                let heap_stats = watos_mem::heap::stats();
+
+                *buf_ptr.offset(0) = phys_stats.total_bytes() as u64;
+                *buf_ptr.offset(1) = phys_stats.free_bytes() as u64;
+                *buf_ptr.offset(2) = phys_stats.used_bytes() as u64;
+                *buf_ptr.offset(3) = heap_stats.total as u64;
+                *buf_ptr.offset(4) = heap_stats.used as u64;
+            }
+            0
         }
 
         syscall::SYS_MOUNT => {
@@ -2436,6 +2665,118 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_SESSION_GET_CURRENT => {
             // Returns current session ID
             watos_console::manager().active_id() as u64
+        }
+
+        syscall::SYS_SETENV => {
+            // arg1 = key pointer, arg2 = key length, arg3 = value pointer, r10 = value length
+            let key_ptr = arg1 as *const u8;
+            let key_len = arg2 as usize;
+            let val_ptr = arg3 as *const u8;
+            let val_len = unsafe { SAVED_SYSCALL_REGS.r10 as usize };
+
+            if key_ptr.is_null() || val_ptr.is_null() || key_len == 0 || key_len > 256 || val_len > 4096 {
+                return 1; // Error
+            }
+
+            unsafe {
+                let key_slice = core::slice::from_raw_parts(key_ptr, key_len);
+                let val_slice = core::slice::from_raw_parts(val_ptr, val_len);
+
+                if let (Ok(key), Ok(val)) = (core::str::from_utf8(key_slice), core::str::from_utf8(val_slice)) {
+                    if watos_process::setenv(key, val) {
+                        0 // Success
+                    } else {
+                        1 // Error
+                    }
+                } else {
+                    1 // Invalid UTF-8
+                }
+            }
+        }
+
+        syscall::SYS_GETENV => {
+            // arg1 = key pointer, arg2 = key length, arg3 = buffer pointer, r10 = buffer length
+            // Returns actual length of value (0 if not found)
+            let key_ptr = arg1 as *const u8;
+            let key_len = arg2 as usize;
+            let buf_ptr = arg3 as *mut u8;
+            let buf_len = unsafe { SAVED_SYSCALL_REGS.r10 as usize };
+
+            if key_ptr.is_null() || buf_ptr.is_null() || key_len == 0 || key_len > 256 {
+                return 0; // Not found
+            }
+
+            unsafe {
+                let key_slice = core::slice::from_raw_parts(key_ptr, key_len);
+
+                if let Ok(key) = core::str::from_utf8(key_slice) {
+                    if let Some(value) = watos_process::getenv(key) {
+                        let value_bytes = value.as_bytes();
+                        let copy_len = core::cmp::min(value_bytes.len(), buf_len);
+                        core::ptr::copy_nonoverlapping(value_bytes.as_ptr(), buf_ptr, copy_len);
+                        value_bytes.len() as u64 // Return actual length
+                    } else {
+                        0 // Not found
+                    }
+                } else {
+                    0 // Invalid UTF-8
+                }
+            }
+        }
+
+        syscall::SYS_UNSETENV => {
+            // arg1 = key pointer, arg2 = key length
+            let key_ptr = arg1 as *const u8;
+            let key_len = arg2 as usize;
+
+            if key_ptr.is_null() || key_len == 0 || key_len > 256 {
+                return 1; // Error
+            }
+
+            unsafe {
+                let key_slice = core::slice::from_raw_parts(key_ptr, key_len);
+
+                if let Ok(key) = core::str::from_utf8(key_slice) {
+                    if watos_process::unsetenv(key) {
+                        0 // Success
+                    } else {
+                        1 // Error
+                    }
+                } else {
+                    1 // Invalid UTF-8
+                }
+            }
+        }
+
+        syscall::SYS_LISTENV => {
+            // arg1 = buffer pointer, arg2 = buffer length
+            // Returns number of variables
+            // Format: null-separated strings "KEY=VALUE\0KEY2=VALUE2\0"
+            let buf_ptr = arg1 as *mut u8;
+            let buf_len = arg2 as usize;
+
+            if buf_ptr.is_null() {
+                // Just return count
+                return watos_process::listenv().len() as u64;
+            }
+
+            unsafe {
+                let env_list = watos_process::listenv();
+                let mut offset = 0;
+
+                for entry in env_list.iter() {
+                    let entry_bytes = entry.as_bytes();
+                    if offset + entry_bytes.len() + 1 > buf_len {
+                        break; // Buffer full
+                    }
+                    core::ptr::copy_nonoverlapping(entry_bytes.as_ptr(), buf_ptr.add(offset), entry_bytes.len());
+                    offset += entry_bytes.len();
+                    *buf_ptr.add(offset) = 0; // Null terminator
+                    offset += 1;
+                }
+
+                env_list.len() as u64
+            }
         }
 
         _ => {

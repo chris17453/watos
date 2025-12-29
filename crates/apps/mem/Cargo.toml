@@ -1,0 +1,19 @@
+[package]
+name = "watos-app-mem"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mem"
+path = "src/main.rs"
+
+[dependencies]
+watos-syscall = { path = "../../core/syscall" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

@@ -158,10 +158,8 @@ impl ProcFs {
 
     /// Parse a path into components
     fn parse_path<'a>(&self, path: &'a str) -> Vec<&'a str> {
-        path.trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect()
+        // Use universal path module for consistency
+        watos_vfs::core_path::components(path)
     }
 
     /// Check if a string is a valid PID

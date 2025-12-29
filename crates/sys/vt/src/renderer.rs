@@ -100,9 +100,11 @@ impl VTRenderer {
             }
         }
 
-        // Render cursor
-        let (cursor_x, cursor_y) = vt.cursor();
-        self.render_cursor(fb, cursor_x as u32, cursor_y as u32);
+        // Render cursor if visible (handles blinking)
+        if vt.cursor_visible() {
+            let (cursor_x, cursor_y) = vt.cursor();
+            self.render_cursor(fb, cursor_x as u32, cursor_y as u32);
+        }
     }
 
     /// Render a single cell

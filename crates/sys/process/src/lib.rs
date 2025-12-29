@@ -190,6 +190,7 @@ pub struct Process {
     pub handle_table: HandleTable,
     pub uid: u32,  // User ID
     pub gid: u32,  // Group ID
+    pub environment: BTreeMap<String, String>,  // Environment variables
 }
 
 const MAX_PROCESSES: usize = 16;
@@ -227,6 +228,21 @@ pub struct SavedContext {
     pub rflags: u64,
     pub rsp: u64,    // User stack pointer at time of syscall
     pub ss: u64,
+    // General purpose registers that must be preserved across exec
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
 }
 
 static mut PARENT_CONTEXT: SavedContext = SavedContext {
@@ -238,11 +254,43 @@ static mut PARENT_CONTEXT: SavedContext = SavedContext {
     rflags: 0,
     rsp: 0,
     ss: 0,
+    rbx: 0,
+    rcx: 0,
+    rdx: 0,
+    rsi: 0,
+    rdi: 0,
+    rbp: 0,
+    r8: 0,
+    r9: 0,
+    r10: 0,
+    r11: 0,
+    r12: 0,
+    r13: 0,
+    r14: 0,
+    r15: 0,
 };
 
 /// Save the current process context before spawning a child
 /// The return_* parameters are from the interrupt frame on the kernel stack
-pub fn save_parent_context_with_frame(return_rip: u64, return_rsp: u64) {
+/// Register parameters are the values that were on the stack when syscall was invoked
+pub fn save_parent_context_with_frame(
+    return_rip: u64,
+    return_rsp: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+) {
     unsafe {
         if let Some(pid) = CURRENT_PROCESS {
             if let Some(proc) = PROCESSES.iter().find_map(|p| p.as_ref().filter(|p| p.id == pid)) {
@@ -259,6 +307,20 @@ pub fn save_parent_context_with_frame(return_rip: u64, return_rsp: u64) {
                     rflags: 0x202, // IF set
                     rsp: return_rsp,
                     ss: user_ss,
+                    rbx,
+                    rcx,
+                    rdx,
+                    rsi,
+                    rdi,
+                    rbp,
+                    r8,
+                    r9,
+                    r10,
+                    r11,
+                    r12,
+                    r13,
+                    r14,
+                    r15,
                 };
 
                 debug_serial(b"[PROCESS] Saved parent context, PID=");
@@ -292,6 +354,21 @@ pub fn save_parent_context() {
                     rflags: 0x202,
                     rsp: proc.stack_top - 8,
                     ss: user_ss,
+                    // No saved registers for restart mode (parent will be fresh)
+                    rbx: 0,
+                    rcx: 0,
+                    rdx: 0,
+                    rsi: 0,
+                    rdi: 0,
+                    rbp: 0,
+                    r8: 0,
+                    r9: 0,
+                    r10: 0,
+                    r11: 0,
+                    r12: 0,
+                    r13: 0,
+                    r14: 0,
+                    r15: 0,
                 };
                 debug_serial(b"[PROCESS] Saved parent context (restart mode), PID=");
                 debug_hex(pid as u64);
@@ -304,6 +381,26 @@ pub fn save_parent_context() {
 /// Check if there's a parent to return to
 pub fn has_parent_context() -> bool {
     unsafe { PARENT_CONTEXT.valid }
+}
+
+/// Free the current process slot (called when child process exits)
+pub fn free_current_process() {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            // Find and clear this process from the table
+            for proc_slot in PROCESSES.iter_mut() {
+                if let Some(proc) = proc_slot {
+                    if proc.id == pid {
+                        debug_serial(b"[PROCESS] Freeing PID=");
+                        debug_hex(pid as u64);
+                        debug_serial(b"\r\n");
+                        *proc_slot = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Resume the parent process after child exits
@@ -339,8 +436,13 @@ pub fn resume_parent() -> ! {
 
         let user_ds = watos_arch::gdt::selectors::USER_DATA as u64;
 
-        // Return to parent with exec success (RAX = 0)
+        // Build IRETQ frame on stack
+        // We must do this carefully to avoid running out of registers
+        // Stack frame (from top): SS, RSP, RFLAGS, CS, RIP
         core::arch::asm!(
+            // Save ctx pointer in r15 for later access
+            "mov r15, {ctx_ptr}",
+
             // Set up segments
             "mov ax, {ds:x}",
             "mov ds, ax",
@@ -348,24 +450,56 @@ pub fn resume_parent() -> ! {
             "mov fs, ax",
             "mov gs, ax",
 
+            // Build IRETQ frame
+            "push qword ptr [r15 + {off_ss}]",      // SS
+            "push qword ptr [r15 + {off_rsp}]",     // RSP
+            "push qword ptr [r15 + {off_rflags}]",  // RFLAGS
+            "push qword ptr [r15 + {off_cs}]",      // CS
+            "push qword ptr [r15 + {off_rip}]",     // RIP
+
+            // Restore general purpose registers from saved context
+            "mov rbx, [r15 + {off_rbx}]",
+            "mov rcx, [r15 + {off_rcx}]",
+            "mov rdx, [r15 + {off_rdx}]",
+            "mov rsi, [r15 + {off_rsi}]",
+            "mov rdi, [r15 + {off_rdi}]",
+            "mov rbp, [r15 + {off_rbp}]",
+            "mov r8,  [r15 + {off_r8}]",
+            "mov r9,  [r15 + {off_r9}]",
+            "mov r10, [r15 + {off_r10}]",
+            "mov r11, [r15 + {off_r11}]",
+            "mov r12, [r15 + {off_r12}]",
+            "mov r13, [r15 + {off_r13}]",
+            "mov r14, [r15 + {off_r14}]",
+            "mov r15, [r15 + {off_r15}]",  // Restore R15 last
+
             // Set RAX to 0 (exec success)
             "xor rax, rax",
 
-            // Set up IRETQ frame with saved values
-            "push {ss}",        // SS
-            "push {rsp}",       // RSP (user stack at time of syscall)
-            "push {rflags}",    // RFLAGS
-            "push {cs}",        // CS
-            "push {rip}",       // RIP (return address after syscall)
-
+            // Return to user mode
             "iretq",
 
+            ctx_ptr = in(reg) &ctx,
             ds = in(reg) user_ds as u16,
-            ss = in(reg) ctx.ss,
-            rsp = in(reg) ctx.rsp,
-            rflags = in(reg) ctx.rflags,
-            cs = in(reg) ctx.cs,
-            rip = in(reg) ctx.rip,
+            off_ss = const core::mem::offset_of!(SavedContext, ss),
+            off_rsp = const core::mem::offset_of!(SavedContext, rsp),
+            off_rflags = const core::mem::offset_of!(SavedContext, rflags),
+            off_cs = const core::mem::offset_of!(SavedContext, cs),
+            off_rip = const core::mem::offset_of!(SavedContext, rip),
+            off_rbx = const core::mem::offset_of!(SavedContext, rbx),
+            off_rcx = const core::mem::offset_of!(SavedContext, rcx),
+            off_rdx = const core::mem::offset_of!(SavedContext, rdx),
+            off_rsi = const core::mem::offset_of!(SavedContext, rsi),
+            off_rdi = const core::mem::offset_of!(SavedContext, rdi),
+            off_rbp = const core::mem::offset_of!(SavedContext, rbp),
+            off_r8 = const core::mem::offset_of!(SavedContext, r8),
+            off_r9 = const core::mem::offset_of!(SavedContext, r9),
+            off_r10 = const core::mem::offset_of!(SavedContext, r10),
+            off_r11 = const core::mem::offset_of!(SavedContext, r11),
+            off_r12 = const core::mem::offset_of!(SavedContext, r12),
+            off_r13 = const core::mem::offset_of!(SavedContext, r13),
+            off_r14 = const core::mem::offset_of!(SavedContext, r14),
+            off_r15 = const core::mem::offset_of!(SavedContext, r15),
             options(noreturn)
         );
     }
@@ -503,6 +637,22 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         }
     }
 
+    // Inherit environment from parent process
+    let inherited_env = unsafe {
+        if let Some(parent_pid) = CURRENT_PROCESS {
+            PROCESSES.iter()
+                .find_map(|p| p.as_ref().filter(|p| p.id == parent_pid))
+                .map(|parent| parent.environment.clone())
+                .unwrap_or_else(BTreeMap::new)
+        } else {
+            // No parent, create default environment
+            let mut env = BTreeMap::new();
+            env.insert(String::from("PATH"), String::from("/apps/system"));
+            env.insert(String::from("HOME"), String::from("/"));
+            env
+        }
+    };
+
     let process = Process {
         id: pid,
         name: name_copy,
@@ -516,6 +666,7 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         handle_table: HandleTable::new(),
         uid: get_current_uid(),  // Inherit from current process
         gid: get_current_gid(),  // Inherit from current process
+        environment: inherited_env,  // Inherit environment from parent
     };
 
     // Debug: show what args are being stored
@@ -1004,5 +1155,81 @@ pub fn set_current_gid(gid: u32) -> bool {
             }
         }
         false
+    }
+}
+
+// ============================================================================
+// Environment Variables
+// ============================================================================
+
+/// Set an environment variable for the current process
+pub fn setenv(key: &str, value: &str) -> bool {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(ref mut p) = slot {
+                    if p.id == pid {
+                        p.environment.insert(String::from(key), String::from(value));
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Get an environment variable from the current process
+pub fn getenv(key: &str) -> Option<String> {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter() {
+                if let Some(p) = slot {
+                    if p.id == pid {
+                        return p.environment.get(key).cloned();
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Unset an environment variable from the current process
+pub fn unsetenv(key: &str) -> bool {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(ref mut p) = slot {
+                    if p.id == pid {
+                        p.environment.remove(key);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// List all environment variables for the current process
+/// Returns a list of "KEY=VALUE" strings
+pub fn listenv() -> alloc::vec::Vec<String> {
+    use alloc::vec::Vec;
+    use alloc::format;
+
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter() {
+                if let Some(p) = slot {
+                    if p.id == pid {
+                        return p.environment.iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect();
+                    }
+                }
+            }
+        }
+        Vec::new()
     }
 }

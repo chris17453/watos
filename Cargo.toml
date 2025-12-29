@@ -33,6 +33,7 @@ watos-driver-video = { path = "crates/drivers/video" }
 wfs-common = { path = "crates/storage/wfs", features = ["vfs"] }
 watos-vfs = { path = "crates/storage/vfs" }
 watos-fat = { path = "crates/storage/fat" }
+watos-procfs = { path = "crates/storage/procfs" }
 
 [workspace]
 members = [
@@ -42,6 +43,7 @@ members = [
     # Core crates (no internal deps)
     "crates/core/arch",
     "crates/core/mem",
+    "crates/core/path",
     "crates/core/syscall",
 
     # Driver traits
@@ -58,6 +60,7 @@ members = [
 
     # Input drivers
     "crates/drivers/input/ps2",
+    "crates/drivers/input/keyboard",
 
     # Video drivers
     "crates/drivers/video",
@@ -112,6 +115,7 @@ members = [
     "crates/apps/reboot",
     "crates/apps/lsblk",
     "crates/apps/mount",
+    "crates/apps/mem",
     "crates/apps/login",
     "crates/apps/shell",
 ]

@@ -40,6 +40,10 @@ pub mod pipe;
 pub mod symlink;
 pub mod metadata;
 
+// Re-export universal path utilities for new code
+// TODO: Migrate VFS path module to use watos-path completely
+pub use watos_path as core_path;
+
 pub use error::{VfsError, VfsResult};
 pub use file::{FileHandle, FileMode, FileType, FileStat};
 pub use mount::{MountPoint, MountTable, DriveMount, MAX_DRIVES};

@@ -454,6 +454,31 @@ else
 fi
 cd "$PROJECT_ROOT"
 
+# Build mem application
+log "Building mem for WATOS..."
+cd "$PROJECT_ROOT/crates/apps/mem"
+
+MEM_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+if RUSTFLAGS="$MEM_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+    --target x86_64-unknown-none \
+    --bin mem 2>&1; then
+
+    if [ "$BUILD_TYPE" = "release" ]; then
+        MEM_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/release/mem"
+    else
+        MEM_BIN="$PROJECT_ROOT/target/x86_64-unknown-none/debug/mem"
+    fi
+
+    if [ -f "$MEM_BIN" ]; then
+        cp "$MEM_BIN" "$PROJECT_ROOT/rootfs/apps/system/mem"
+        cp "$MEM_BIN" "$PROJECT_ROOT/uefi_test/apps/system/mem"
+        success "mem built -> /apps/system/mem ($(du -h "$MEM_BIN" | cut -f1))"
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} mem build failed (optional)"
+fi
+cd "$PROJECT_ROOT"
+
 # Build pwd application
 log "Building pwd for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/pwd"

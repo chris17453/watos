@@ -1,0 +1,16 @@
+[package]
+name = "watos-driver-keyboard"
+version = "0.1.0"
+edition = "2021"
+description = "Keyboard driver with scancode to ASCII conversion for WATOS"
+
+[lib]
+name = "watos_driver_keyboard"
+path = "src/lib.rs"
+
+[dependencies]
+spin = "0.5.2"
+
+[features]
+default = []
+debug = []

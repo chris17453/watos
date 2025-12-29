@@ -120,6 +120,15 @@ pub mod numbers {
     pub const SYS_SESSION_GET_CURRENT: u32 = 132; // Get current session ID
     pub const SYS_SESSION_LIST: u32 = 133;   // List all sessions
     pub const SYS_SESSION_DESTROY: u32 = 134; // Destroy a session
+
+    // Memory info
+    pub const SYS_MEMINFO: u32 = 135;        // Get memory usage statistics
+
+    // Environment variables
+    pub const SYS_SETENV: u32 = 136;         // Set environment variable (key_ptr, key_len, val_ptr, val_len)
+    pub const SYS_GETENV: u32 = 137;         // Get environment variable (key_ptr, key_len, buf_ptr, buf_len) -> actual_len
+    pub const SYS_UNSETENV: u32 = 138;       // Unset environment variable (key_ptr, key_len)
+    pub const SYS_LISTENV: u32 = 139;        // List environment variables (buf_ptr, buf_len) -> num_vars
 }
 
 /// Raw syscall interface - performs INT 0x80
@@ -429,6 +438,15 @@ pub mod syscalls {
     pub fn getcwd(buf: &mut [u8]) -> usize {
         unsafe {
             raw_syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
+        }
+    }
+
+    /// Get memory usage statistics
+    /// buf should be at least 40 bytes (5 x u64)
+    /// Returns: [phys_total, phys_free, phys_used, heap_total, heap_used]
+    pub fn meminfo(buf: &mut [u64; 5]) -> u64 {
+        unsafe {
+            raw_syscall1(SYS_MEMINFO, buf.as_mut_ptr() as u64)
         }
     }
 
