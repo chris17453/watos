@@ -188,6 +188,8 @@ pub struct Process {
     pub heap_size: usize,
     pub page_table: ProcessPageTable,
     pub handle_table: HandleTable,
+    pub uid: u32,  // User ID
+    pub gid: u32,  // Group ID
 }
 
 const MAX_PROCESSES: usize = 16;
@@ -512,6 +514,8 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         heap_size: (heap_pages as usize) * PAGE_SIZE,
         page_table,
         handle_table: HandleTable::new(),
+        uid: get_current_uid(),  // Inherit from current process
+        gid: get_current_gid(),  // Inherit from current process
     };
 
     // Debug: show what args are being stored
@@ -934,5 +938,71 @@ pub fn cleanup() {
                 }
             }
         }
+    }
+}
+
+/// Get current process UID (returns 0 if no process)
+pub fn get_current_uid() -> u32 {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter() {
+                if let Some(ref p) = slot {
+                    if p.id == pid {
+                        return p.uid;
+                    }
+                }
+            }
+        }
+        0 // Default to root
+    }
+}
+
+/// Get current process GID (returns 0 if no process)
+pub fn get_current_gid() -> u32 {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter() {
+                if let Some(ref p) = slot {
+                    if p.id == pid {
+                        return p.gid;
+                    }
+                }
+            }
+        }
+        0 // Default to root group
+    }
+}
+
+/// Set current process UID
+pub fn set_current_uid(uid: u32) -> bool {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(ref mut p) = slot {
+                    if p.id == pid {
+                        p.uid = uid;
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Set current process GID
+pub fn set_current_gid(gid: u32) -> bool {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(ref mut p) = slot {
+                    if p.id == pid {
+                        p.gid = gid;
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }

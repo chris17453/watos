@@ -216,6 +216,7 @@ impl Console {
 pub struct ConsoleManager {
     consoles: Vec<Console>,
     active_idx: usize,
+    max_consoles: usize,
 }
 
 impl ConsoleManager {
@@ -223,6 +224,7 @@ impl ConsoleManager {
         let mut mgr = ConsoleManager {
             consoles: Vec::new(),
             active_idx: 0,
+            max_consoles: 12, // Support F1-F12 (tty0-tty11)
         };
         // Create console 0 - the main shell
         mgr.consoles.push(Console::new(0, "WATOS Shell"));
@@ -231,14 +233,17 @@ impl ConsoleManager {
 
     // Create a new console for a DOS task, returns console ID
     // Parent is the currently active console
-    pub fn create_console(&mut self, name: &str, task_id: u32) -> u8 {
+    pub fn create_console(&mut self, name: &str, task_id: u32) -> Option<u8> {
+        if self.consoles.len() >= self.max_consoles {
+            return None; // Max consoles reached
+        }
         let id = self.consoles.len() as u8;
         let parent = self.active_id();
         let mut console = Console::new(id, name);
         console.task_id = Some(task_id);
         console.parent_id = parent;
         self.consoles.push(console);
-        id
+        Some(id)
     }
 
     // Remove a console and return to parent (when task terminates)
@@ -301,6 +306,32 @@ impl ConsoleManager {
             true
         } else {
             false
+        }
+    }
+
+    // Switch to console by F-key number (F1=0, F2=1, ... F12=11)
+    // Creates a new console if it doesn't exist
+    pub fn switch_to_fkey(&mut self, fkey: u8) -> u8 {
+        // fkey should be 0-11 for F1-F12
+        if fkey >= self.max_consoles as u8 {
+            return self.active_id();
+        }
+
+        // Check if console with this ID exists
+        if let Some(pos) = self.consoles.iter().position(|c| c.id == fkey) {
+            self.active_idx = pos;
+            fkey
+        } else {
+            // Create a new console with this ID
+            let name = alloc::format!("tty{}", fkey);
+            let mut console = Console::new(fkey, &name);
+            console.parent_id = 0; // Parent is the main shell
+            self.consoles.push(console);
+            // Find it and switch to it
+            if let Some(pos) = self.consoles.iter().position(|c| c.id == fkey) {
+                self.active_idx = pos;
+            }
+            fkey
         }
     }
 

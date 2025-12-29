@@ -14,6 +14,12 @@ watos-mem = { path = "crates/core/mem" }
 # Process management
 watos-process = { path = "crates/sys/process" }
 
+# User management
+watos-users = { path = "crates/sys/users" }
+
+# Console management
+watos-console = { path = "crates/sys/console" }
+
 # Drivers
 watos-driver-traits = { path = "crates/drivers/traits" }
 watos-driver-pci = { path = "crates/drivers/bus/pci" }
@@ -68,6 +74,7 @@ members = [
     "crates/sys/process",
     "crates/sys/runtime",
     "crates/sys/terminal",
+    "crates/sys/users",
 
     # Emulation
     "crates/emu/dos16",
@@ -98,6 +105,7 @@ members = [
     "crates/apps/reboot",
     "crates/apps/lsblk",
     "crates/apps/mount",
+    "crates/apps/login",
 ]
 exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
 
