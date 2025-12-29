@@ -102,6 +102,21 @@ pub mod numbers {
 
     // Block device operations
     pub const SYS_LSBLK: u32 = 110;        // List block devices
+
+    // User authentication and session management
+    pub const SYS_AUTHENTICATE: u32 = 120; // Authenticate user (username, password)
+    pub const SYS_SETUID: u32 = 121;       // Set current user ID
+    pub const SYS_GETUID: u32 = 122;       // Get current user ID
+    pub const SYS_GETGID: u32 = 123;       // Get current group ID
+    pub const SYS_SETGID: u32 = 124;       // Set current group ID
+    pub const SYS_GET_USER_INFO: u32 = 125; // Get user information by UID
+    
+    // Console session management
+    pub const SYS_SESSION_CREATE: u32 = 130; // Create new console session
+    pub const SYS_SESSION_SWITCH: u32 = 131; // Switch to console session
+    pub const SYS_SESSION_GET_CURRENT: u32 = 132; // Get current session ID
+    pub const SYS_SESSION_LIST: u32 = 133;   // List all sessions
+    pub const SYS_SESSION_DESTROY: u32 = 134; // Destroy a session
 }
 
 /// Raw syscall interface - performs INT 0x80

@@ -959,9 +959,13 @@ pub extern "C" fn _start() -> ! {
     watos_mem::phys::init(0x1000000, 128 * 1024 * 1024);
     unsafe { watos_arch::serial_write(b"[KERNEL] Physical allocator initialized (128MB @ 16MB)\r\n"); }
 
-    // 5. Initialize process subsystem
+// 5. Initialize process subsystem
     watos_process::init();
     unsafe { watos_arch::serial_write(b"[KERNEL] Process subsystem initialized\r\n"); }
+
+    // 5.3 Initialize user management subsystem
+    watos_users::init();
+    unsafe { watos_arch::serial_write(b"[KERNEL] User management initialized\r\n"); }
 
     // 5.4 Initialize video driver from boot info
     unsafe {
@@ -997,42 +1001,65 @@ pub extern "C" fn _start() -> ! {
         drive_mount(b"D", b"/", b"WFS");
     }
 
-    // 6. Execute init app (TERM.EXE) if loaded by bootloader
+    // 6. Execute init app - try login first, then fall back to TERM.EXE
     unsafe {
         if let Some(info) = BOOT_INFO {
-            if info.init_app_addr != 0 && info.init_app_size != 0 {
-                watos_arch::serial_write(b"[KERNEL] Launching TERM.EXE at 0x");
-                watos_arch::serial_hex(info.init_app_addr);
-                watos_arch::serial_write(b" (");
-                watos_arch::serial_hex(info.init_app_size);
-                watos_arch::serial_write(b" bytes)\r\n");
+            // First try to find and launch login app from preloaded apps
+            let login_found = find_preloaded_app(b"login");
+            let init_app = if login_found.is_some() {
+                (b"login", login_found)
+            } else {
+                // Fall back to TERM.EXE from boot info
+                if info.init_app_addr != 0 && info.init_app_size != 0 {
+                    (b"TERM.EXE", Some((info.init_app_addr, info.init_app_size)))
+                } else {
+                    (b"none", None)
+                }
+            };
 
-                // Create slice from the loaded app data
-                let app_data = core::slice::from_raw_parts(
-                    info.init_app_addr as *const u8,
-                    info.init_app_size as usize,
-                );
+            match init_app {
+                (name, Some((addr, size))) => {
+                    watos_arch::serial_write(b"[KERNEL] Launching ");
+                    watos_arch::serial_write(name);
+                    watos_arch::serial_write(b" at 0x");
+                    watos_arch::serial_hex(addr);
+                    watos_arch::serial_write(b" (");
+                    watos_arch::serial_hex(size);
+                    watos_arch::serial_write(b" bytes)\r\n");
 
-                // Execute the app (no arguments for initial terminal)
-                match watos_process::exec("TERM.EXE", app_data, "TERM.EXE") {
-                    Ok(pid) => {
-                        watos_arch::serial_write(b"[KERNEL] TERM.EXE running as PID ");
-                        watos_arch::serial_hex(pid as u64);
-                        watos_arch::serial_write(b"\r\n");
-                    }
-                    Err(e) => {
-                        watos_arch::serial_write(b"[KERNEL] Failed to exec TERM.EXE: ");
-                        watos_arch::serial_write(e.as_bytes());
-                        watos_arch::serial_write(b"\r\n");
+                    // Create slice from the loaded app data
+                    let app_data = core::slice::from_raw_parts(
+                        addr as *const u8,
+                        size as usize,
+                    );
+
+                    // Execute the app
+                    let name_str = core::str::from_utf8(name).unwrap_or("app");
+                    match watos_process::exec(name_str, app_data, name_str) {
+                        Ok(pid) => {
+                            watos_arch::serial_write(b"[KERNEL] ");
+                            watos_arch::serial_write(name);
+                            watos_arch::serial_write(b" running as PID ");
+                            watos_arch::serial_hex(pid as u64);
+                            watos_arch::serial_write(b"\r\n");
+                        }
+                        Err(e) => {
+                            watos_arch::serial_write(b"[KERNEL] Failed to exec ");
+                            watos_arch::serial_write(name);
+                            watos_arch::serial_write(b": ");
+                            watos_arch::serial_write(e.as_bytes());
+                            watos_arch::serial_write(b"\r\n");
+                        }
                     }
                 }
-            } else {
-                watos_arch::serial_write(b"[KERNEL] No init app loaded\r\n");
+                _ => {
+                    watos_arch::serial_write(b"[KERNEL] No init app loaded\r\n");
+                }
             }
         }
     }
 
-    // 7. Idle loop (should not reach here if TERM.EXE runs)
+    // 7. Idle loop (should not reach here if init app runs)
     unsafe { watos_arch::serial_write(b"[KERNEL] Entering idle loop\r\n"); }
     loop {
         watos_arch::halt();
@@ -1106,6 +1133,13 @@ mod syscall {
     pub const SYS_READDIR: u64 = 71;
     pub const SYS_MKDIR: u64 = 72;
     pub const SYS_STAT: u64 = 70;
+
+    // User authentication and session management
+    pub const SYS_AUTHENTICATE: u64 = 120;
+    pub const SYS_SETUID: u64 = 121;
+    pub const SYS_GETUID: u64 = 122;
+    pub const SYS_GETGID: u64 = 123;
+    pub const SYS_SETGID: u64 = 124;
 }
 
 /// Syscall handler - naked function called from IDT
@@ -2133,6 +2167,87 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             }
 
             count as u64
+        }
+
+        syscall::SYS_AUTHENTICATE => {
+            // arg1 = username pointer
+            // arg2 = username length
+            // arg3 = password pointer (length implicit from null-term or assume max 64)
+            // Returns UID on success, u64::MAX on failure
+            let username_ptr = arg1 as *const u8;
+            let username_len = arg2 as usize;
+            let password_ptr = arg3 as *const u8;
+
+            if username_ptr.is_null() || username_len == 0 || password_ptr.is_null() {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let username = core::slice::from_raw_parts(username_ptr, username_len);
+                
+                // Find null terminator or assume max password length
+                let mut password_len = 0usize;
+                while password_len < 64 && *password_ptr.add(password_len) != 0 {
+                    password_len += 1;
+                }
+                let password = core::slice::from_raw_parts(password_ptr, password_len);
+
+                watos_arch::serial_write(b"[KERNEL] SYS_AUTHENTICATE: user=");
+                watos_arch::serial_write(username);
+                watos_arch::serial_write(b"\r\n");
+
+                // Authenticate via users subsystem
+                match watos_users::authenticate(username, password) {
+                    Some(uid) => {
+                        watos_arch::serial_write(b"[KERNEL] Authentication successful, UID=");
+                        watos_arch::serial_hex(uid as u64);
+                        watos_arch::serial_write(b"\r\n");
+                        uid as u64
+                    }
+                    None => {
+                        watos_arch::serial_write(b"[KERNEL] Authentication failed\r\n");
+                        u64::MAX
+                    }
+                }
+            }
+        }
+
+        syscall::SYS_SETUID => {
+            // arg1 = UID to set
+            let uid = arg1 as u32;
+            
+            unsafe {
+                watos_arch::serial_write(b"[KERNEL] SYS_SETUID: ");
+                watos_arch::serial_hex(uid as u64);
+                watos_arch::serial_write(b"\r\n");
+            }
+
+            if watos_process::set_current_uid(uid) {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        syscall::SYS_GETUID => {
+            // Returns current process UID
+            watos_process::get_current_uid() as u64
+        }
+
+        syscall::SYS_GETGID => {
+            // Returns current process GID
+            watos_process::get_current_gid() as u64
+        }
+
+        syscall::SYS_SETGID => {
+            // arg1 = GID to set
+            let gid = arg1 as u32;
+            
+            if watos_process::set_current_gid(gid) {
+                0
+            } else {
+                u64::MAX
+            }
         }
 
         _ => {
