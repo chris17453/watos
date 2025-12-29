@@ -143,8 +143,8 @@ fn read_password(buf: &mut [u8]) -> usize {
 }
 
 fn exec_console() {
-    // Execute the console application (TERM.EXE or console)
-    let cmd = b"TERM.EXE";
+    // Execute the shell
+    let cmd = b"shell";
     unsafe {
         syscall2(syscall::SYS_EXEC, cmd.as_ptr() as u64, cmd.len() as u64);
     }

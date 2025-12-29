@@ -138,16 +138,28 @@ if [ ! -f "$PROJECT_ROOT/uefi_test/EFI/BOOT/BOOTX64.EFI" ]; then
     exit 1
 fi
 
-if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    fail "QEMU not found. Install with: sudo dnf install qemu-system-x86"
+# Detect QEMU binary (different locations on different distros)
+if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+    QEMU_CMD="qemu-system-x86_64"
+elif [ -x /usr/libexec/qemu-kvm ]; then
+    QEMU_CMD="/usr/libexec/qemu-kvm"
+else
+    fail "QEMU not found. Install with: sudo dnf install qemu-kvm (RHEL/Fedora) or sudo apt install qemu-system-x86 (Ubuntu/Debian)"
     exit 1
 fi
 
-OVMF_CODE="/usr/share/OVMF/OVMF_CODE.fd"
-OVMF_VARS_TEMPLATE="/usr/share/OVMF/OVMF_VARS.fd"
-
-if [ ! -f "$OVMF_CODE" ]; then
-    fail "OVMF firmware not found. Install with: sudo dnf install edk2-ovmf"
+# Detect OVMF firmware (different locations on different distros/versions)
+if [ -f "/usr/share/edk2/ovmf/OVMF_CODE.fd" ]; then
+    OVMF_CODE="/usr/share/edk2/ovmf/OVMF_CODE.fd"
+    OVMF_VARS_TEMPLATE="/usr/share/edk2/ovmf/OVMF_VARS.fd"
+elif [ -f "/usr/share/OVMF/OVMF_CODE.fd" ]; then
+    OVMF_CODE="/usr/share/OVMF/OVMF_CODE.fd"
+    OVMF_VARS_TEMPLATE="/usr/share/OVMF/OVMF_VARS.fd"
+elif [ -f "/usr/share/qemu/OVMF_CODE.fd" ]; then
+    OVMF_CODE="/usr/share/qemu/OVMF_CODE.fd"
+    OVMF_VARS_TEMPLATE="/usr/share/qemu/OVMF_VARS.fd"
+else
+    fail "OVMF firmware not found. Install with: sudo dnf install edk2-ovmf (RHEL/Fedora) or sudo apt install ovmf (Ubuntu/Debian)"
     exit 1
 fi
 
@@ -214,14 +226,14 @@ fi
 # Attach boot disk and WFS data disk to ICH9's IDE buses (SATA emulation)
 # Use KVM if available for proper CPU idle handling (hlt instruction)
 QEMU_CMD=(
-    qemu-system-x86_64
+    $QEMU_CMD
     -machine q35,accel=kvm:tcg
     -cpu max,+invtsc
     -smp 2
     -m 256M
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
     -drive "if=pflash,format=raw,file=$OVMF_VARS"
-    -drive "format=raw,file=fat:rw:$PROJECT_ROOT/uefi_test,if=none,id=bootdisk"
+    -drive "format=raw,file=$PROJECT_ROOT/uefi_boot.img,if=none,id=bootdisk"
     -device ide-hd,drive=bootdisk,bus=ide.0
     -netdev user,id=net0
     -device e1000,netdev=net0
@@ -245,17 +257,55 @@ if [ -f "$AUTOEXEC_IMG" ]; then
     QEMU_CMD+=(-device ide-hd,drive=cmdisk,bus=ide.2)
 fi
 
-# Add DOS 6.22 disk as FAT drive if the folder exists
-DOS_DIR="$PROJECT_ROOT/dos-6.22"
-if [ -d "$DOS_DIR" ]; then
-    QEMU_CMD+=(-drive "file=fat:rw:$DOS_DIR,format=raw,if=none,id=dosdisk")
+# Add DOS 6.22 disk if the image exists
+DOS_IMG="$PROJECT_ROOT/dos.img"
+if [ -f "$DOS_IMG" ]; then
+    QEMU_CMD+=(-drive "file=$DOS_IMG,format=raw,if=none,id=dosdisk")
     QEMU_CMD+=(-device ide-hd,drive=dosdisk,bus=ide.3)
 fi
 
 if [ "$INTERACTIVE" = true ]; then
     log "Starting QEMU in interactive mode..."
     log "Serial log: $SERIAL_LOG"
-    log "Close the QEMU window to exit (Ctrl+C in terminal)"
+
+    # Detect if we can use graphical display or need VNC
+    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        # Full QEMU supports GTK
+        DISPLAY_OPTS=(-display gtk)
+        log "Using GTK display - window will open"
+        USE_VNC=false
+    else
+        # qemu-kvm only supports VNC - check for VNC viewer
+        DISPLAY_OPTS=(-vnc :0)
+        USE_VNC=true
+
+        # Look for available VNC viewers
+        VNC_VIEWER=""
+        if command -v remote-viewer >/dev/null 2>&1; then
+            VNC_VIEWER="remote-viewer"
+        elif command -v virt-viewer >/dev/null 2>&1; then
+            VNC_VIEWER="virt-viewer -c"
+        elif command -v vncviewer >/dev/null 2>&1; then
+            VNC_VIEWER="vncviewer"
+        fi
+
+        if [ -n "$VNC_VIEWER" ]; then
+            log "Using VNC display with $(echo $VNC_VIEWER | awk '{print $1}') - window will open"
+        else
+            echo ""
+            echo "============================================"
+            echo "No VNC viewer found. Install one to get a window:"
+            echo "  sudo dnf install virt-viewer    (RHEL/Fedora)"
+            echo "  sudo apt install tigervnc-viewer (Ubuntu/Debian)"
+            echo ""
+            echo "Or connect manually:"
+            echo "  remote-viewer vnc://localhost:5900"
+            echo "============================================"
+            echo ""
+            log "VNC server running on localhost:5900"
+            log "Press Ctrl+C to exit"
+        fi
+    fi
 
     # Build QEMU command with optional WFS data disk
     # Use KVM if available for proper CPU idle handling (hlt instruction)
@@ -264,13 +314,14 @@ if [ "$INTERACTIVE" = true ]; then
         -cpu max,+invtsc
         -smp 2
         -m 256M
-        -bios "$OVMF_CODE"
-        -drive "file=fat:rw:$PROJECT_ROOT/uefi_test,format=raw,if=none,id=bootdisk"
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+        -drive "if=pflash,format=raw,file=$OVMF_VARS"
+        -drive "file=$PROJECT_ROOT/uefi_boot.img,format=raw,if=none,id=bootdisk"
         -device ide-hd,drive=bootdisk,bus=ide.0
         -netdev user,id=net0
         -device e1000,netdev=net0
         -vga std
-        -display gtk
+        "${DISPLAY_OPTS[@]}"
         -chardev stdio,id=char0,mux=on,logfile="$SERIAL_LOG"
         -serial chardev:char0
     )
@@ -282,15 +333,42 @@ if [ "$INTERACTIVE" = true ]; then
         QEMU_ARGS+=(-device ide-hd,drive=wfsdisk,bus=ide.1)
     fi
 
-    # Add DOS 6.22 disk as FAT drive if the folder exists
-    DOS_DIR="$PROJECT_ROOT/dos-6.22"
-    if [ -d "$DOS_DIR" ]; then
-        log "Adding DOS 6.22 disk: dos-6.22/ as FAT drive on ide.2"
-        QEMU_ARGS+=(-drive "file=fat:rw:$DOS_DIR,format=raw,if=none,id=dosdisk")
+    # Add DOS 6.22 disk if the image exists
+    DOS_IMG="$PROJECT_ROOT/dos.img"
+    if [ -f "$DOS_IMG" ]; then
+        log "Adding DOS 6.22 disk: dos.img on ide.2"
+        QEMU_ARGS+=(-drive "file=$DOS_IMG,format=raw,if=none,id=dosdisk")
         QEMU_ARGS+=(-device ide-hd,drive=dosdisk,bus=ide.2)
     fi
 
-    qemu-system-x86_64 "${QEMU_ARGS[@]}"
+    # Launch QEMU with auto VNC viewer if available
+    if [ "$USE_VNC" = true ] && [ -n "$VNC_VIEWER" ]; then
+        # Start QEMU in background
+        $QEMU_CMD "${QEMU_ARGS[@]}" &
+        QEMU_PID=$!
+        log "QEMU started (PID: $QEMU_PID)"
+
+        # Wait for VNC server to be ready
+        sleep 2
+
+        # Launch VNC viewer - when it closes, QEMU will be killed
+        log "Launching VNC viewer window..."
+        # Use correct format based on viewer type
+        if [[ "$VNC_VIEWER" == "remote-viewer" ]]; then
+            $VNC_VIEWER vnc://localhost:5900 2>/dev/null
+        else
+            $VNC_VIEWER localhost:5900 2>/dev/null
+        fi
+
+        # VNC viewer closed - kill QEMU
+        log "VNC viewer closed, stopping QEMU..."
+        kill $QEMU_PID 2>/dev/null || true
+        wait $QEMU_PID 2>/dev/null || true
+    else
+        # Regular interactive mode (GTK or VNC without viewer)
+        $QEMU_CMD "${QEMU_ARGS[@]}"
+    fi
+
     exit 0
 fi
 

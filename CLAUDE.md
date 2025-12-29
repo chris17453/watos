@@ -35,6 +35,59 @@ crates/
 ### Key Principle
 The kernel entry (`src/main.rs`) is minimal (~50 lines). All functionality lives in crates.
 
+## Branch Workflow
+
+**IMPORTANT**: The `main` branch is protected. All development work must follow this workflow:
+
+### Branch Structure
+- `main` - Protected production branch (stable releases only)
+- `uat` - User acceptance testing branch (pre-release testing)
+- `dev` - Active development branch (integration)
+
+### Development Process
+1. **Create feature branch from dev**:
+   ```bash
+   git checkout dev
+   git pull origin dev
+   git checkout -b feature/your-feature-name
+   ```
+
+2. **Make changes and test**:
+   ```bash
+   ./scripts/test.sh
+   ./scripts/boot_test.sh
+   ```
+
+3. **Commit and push to dev**:
+   ```bash
+   git add .
+   git commit -m "Description of changes"
+   git checkout dev
+   git merge feature/your-feature-name
+   git push origin dev
+   ```
+
+4. **Promote to UAT for testing**:
+   ```bash
+   git checkout uat
+   git merge dev
+   git push origin uat
+   # Run full test suite
+   ```
+
+5. **Promote to main after UAT approval**:
+   ```bash
+   git checkout main
+   git merge uat
+   git push origin main
+   ```
+
+### Claude Code Usage
+When working with Claude Code:
+- Always work on the `dev` branch or feature branches
+- Create PRs to merge changes from `dev` -> `uat` -> `main`
+- Never commit directly to `main` or `uat`
+
 ## Build System
 
 ### Quick Commands

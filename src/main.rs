@@ -34,7 +34,7 @@ const HEAP_START: usize = 0x200000;
 const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 /// Maximum number of preloaded apps
-const MAX_PRELOADED_APPS: usize = 16;
+const MAX_PRELOADED_APPS: usize = 32;
 
 /// Entry for a preloaded application
 #[repr(C)]
@@ -822,6 +822,43 @@ fn console_read(buf: &mut [u8]) -> usize {
 }
 
 // ============================================================================
+// Keyboard Scancode to ASCII Conversion
+// ============================================================================
+
+/// Convert PS/2 scancode to ASCII character (US keyboard layout)
+fn scancode_to_ascii(scancode: u8) -> u8 {
+    // TODO: Handle shift, ctrl, alt modifiers properly
+    // For now, simple unshifted ASCII mapping
+    match scancode {
+        0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd',
+        0x12 => b'e', 0x21 => b'f', 0x22 => b'g', 0x23 => b'h',
+        0x17 => b'i', 0x24 => b'j', 0x25 => b'k', 0x26 => b'l',
+        0x32 => b'm', 0x31 => b'n', 0x18 => b'o', 0x19 => b'p',
+        0x10 => b'q', 0x13 => b'r', 0x1F => b's', 0x14 => b't',
+        0x16 => b'u', 0x2F => b'v', 0x11 => b'w', 0x2D => b'x',
+        0x15 => b'y', 0x2C => b'z',
+
+        // Numbers
+        0x0B => b'0', 0x02 => b'1', 0x03 => b'2', 0x04 => b'3',
+        0x05 => b'4', 0x06 => b'5', 0x07 => b'6', 0x08 => b'7',
+        0x09 => b'8', 0x0A => b'9',
+
+        // Special keys
+        0x1C => b'\n',  // Enter
+        0x39 => b' ',   // Space
+        0x0E => 0x08,   // Backspace
+        0x0F => b'\t',  // Tab
+        0x1A => b'[', 0x1B => b']',
+        0x27 => b';', 0x28 => b'\'',
+        0x29 => b'`', 0x2B => b'\\',
+        0x33 => b',', 0x34 => b'.', 0x35 => b'/',
+        0x0C => b'-', 0x0D => b'=',
+
+        _ => 0,  // Unknown or modifier key
+    }
+}
+
+// ============================================================================
 // File Descriptor Table
 // ============================================================================
 
@@ -985,6 +1022,16 @@ pub extern "C" fn _start() -> ! {
                     is_bgr,
                 );
                 watos_arch::serial_write(b"[KERNEL] Video driver initialized\r\n");
+
+                // Initialize VT subsystem (kernel virtual terminals)
+                watos_vt::init(
+                    info.framebuffer_addr as usize,
+                    info.framebuffer_width,
+                    info.framebuffer_height,
+                    info.framebuffer_pitch,
+                    info.framebuffer_bpp,
+                    is_bgr,
+                );
             } else {
                 watos_arch::serial_write(b"[KERNEL] WARNING: No framebuffer from bootloader\r\n");
             }
@@ -1400,10 +1447,10 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 // Always write to serial for debugging
                 watos_arch::serial_write(slice);
 
-                // If fd is stdout (1) or stderr (2), also write to console buffer
-                // The console app will read from this buffer and display it
+                // If fd is stdout (1) or stderr (2), write to active VT
+                // The kernel VT driver will render it to the framebuffer
                 if fd == 1 || fd == 2 {
-                    console_write(slice);
+                    watos_vt::vt_write_active(slice);
                 }
             }
             len as u64
@@ -1473,8 +1520,10 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         }
 
         syscall::SYS_GETKEY => {
-            // Returns ASCII key or 0 if no key (higher-level than scancode)
-            watos_arch::idt::get_scancode().map(|s| s as u64).unwrap_or(0)
+            // Returns ASCII key or 0 if no key
+            watos_arch::idt::get_scancode().map(|scancode| {
+                scancode_to_ascii(scancode) as u64
+            }).unwrap_or(0)
         }
 
         syscall::SYS_MALLOC => {
@@ -1556,36 +1605,120 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 &cmdline[..space_pos]
             };
 
-            // Find the app in preloaded apps table
-            if let Some((addr, size)) = find_preloaded_app(program_name) {
-                // Get the app data slice
-                let app_data = unsafe {
-                    core::slice::from_raw_parts(addr as *const u8, size as usize)
-                };
+            // Convert program name to string and build path
+            let program_str = core::str::from_utf8(program_name).unwrap_or("app");
 
-                // Save parent context with actual return address so we can return after child exits
-                watos_process::save_parent_context_with_frame(return_rip, return_rsp);
+            // Build full path: C:/apps/system/<name>
+            let mut full_path_buf = [0u8; 128];
+            let prefix = b"C:/apps/system/";
+            let mut pos = 0;
+            for &b in prefix {
+                if pos < full_path_buf.len() {
+                    full_path_buf[pos] = b;
+                    pos += 1;
+                }
+            }
+            for &b in program_name {
+                if pos < full_path_buf.len() {
+                    full_path_buf[pos] = b;
+                    pos += 1;
+                }
+            }
+            let full_path_str = core::str::from_utf8(&full_path_buf[..pos]).unwrap_or("");
+
+            // Try multiple paths to find the executable
+            let paths = [
+                program_str,      // Try as-is (e.g., "/apps/system/shell")
+                full_path_str,    // Try C:/apps/system/<name>
+            ];
+
+            // Use a static buffer to avoid heap allocation during syscall
+            static mut EXEC_BUFFER: [u8; 256 * 1024] = [0; 256 * 1024]; // 256KB max
+            let mut total_read = 0usize;
+            let mut loaded = false;
+
+            for path in &paths {
+                if path.is_empty() {
+                    continue;
+                }
 
                 unsafe {
-                    watos_arch::serial_write(b"[SYSCALL] after save_parent_context\r\n");
+                    watos_arch::serial_write(b"[KERNEL] Trying to load: ");
+                    watos_arch::serial_write(path.as_bytes());
+                    watos_arch::serial_write(b"\r\n");
                 }
+
+                // Try to open and read the file from VFS
+                let fd = handle_sys_open(path.as_bytes(), 0); // 0 = read mode
+                if fd != u64::MAX {
+                    unsafe {
+                        watos_arch::serial_write(b"[KERNEL] File opened, fd=");
+                        watos_arch::serial_hex(fd);
+                        watos_arch::serial_write(b"\r\n");
+                    }
+
+                    // Read file in chunks
+                    const CHUNK_SIZE: usize = 4096;
+                    let mut read_buf = [0u8; CHUNK_SIZE];
+                    total_read = 0;
+
+                    loop {
+                        let chunk_read = fd_read(fd as i64, &mut read_buf);
+                        if chunk_read <= 0 {
+                            break;
+                        }
+
+                        // Copy to static buffer
+                        unsafe {
+                            let end = total_read + chunk_read as usize;
+                            if end > EXEC_BUFFER.len() {
+                                watos_arch::serial_write(b"[KERNEL] File too large\r\n");
+                                break;
+                            }
+                            EXEC_BUFFER[total_read..end].copy_from_slice(&read_buf[..chunk_read as usize]);
+                            total_read = end;
+                        }
+
+                        // Safety limit: max 256KB per executable
+                        if total_read >= 256 * 1024 {
+                            break;
+                        }
+                    }
+
+                    fd_close(fd as i64);
+
+                    if total_read > 0 {
+                        loaded = true;
+
+                        unsafe {
+                            watos_arch::serial_write(b"[KERNEL] Loaded ");
+                            watos_arch::serial_hex(total_read as u64);
+                            watos_arch::serial_write(b" bytes from ");
+                            watos_arch::serial_write(path.as_bytes());
+                            watos_arch::serial_write(b"\r\n");
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if loaded && total_read > 0 {
+                // Save parent context
+                watos_process::save_parent_context_with_frame(return_rip, return_rsp);
 
                 // Execute the app with the full command line as args
                 let cmdline_str = core::str::from_utf8(cmdline).unwrap_or("");
-                unsafe {
-                    watos_arch::serial_write(b"[SYSCALL] calling exec\r\n");
-                }
-                let program_str = core::str::from_utf8(program_name).unwrap_or("app");
 
-                match watos_process::exec(program_str, app_data, cmdline_str) {
-                    Ok(_pid) => 0, // Success
-                    Err(e) => {
-                        unsafe {
+                unsafe {
+                    let app_data = &EXEC_BUFFER[..total_read];
+                    match watos_process::exec(program_str, app_data, cmdline_str) {
+                        Ok(_pid) => 0, // Success
+                        Err(e) => {
                             watos_arch::serial_write(b"[KERNEL] exec failed: ");
                             watos_arch::serial_write(e.as_bytes());
                             watos_arch::serial_write(b"\r\n");
+                            1 // Error
                         }
-                        1 // Error
                     }
                 }
             } else {

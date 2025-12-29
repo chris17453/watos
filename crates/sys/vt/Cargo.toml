@@ -1,0 +1,12 @@
+[package]
+name = "watos-vt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+watos-arch = { path = "../../core/arch" }
+watos-terminal = { path = "../terminal" }
+
+[lib]
+name = "watos_vt"
+path = "src/lib.rs"

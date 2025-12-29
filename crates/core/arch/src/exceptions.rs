@@ -377,9 +377,9 @@ pub unsafe extern "C" fn general_protection() {
         "and rcx, 0xF",
         "add cl, 0x30",
         "cmp cl, 0x3A",
-        "jl 1f",
+        "jl 2f",
         "add cl, 7",
-        "1:",
+        "2:",
         "mov al, cl",
         "out dx, al",
 
@@ -387,9 +387,9 @@ pub unsafe extern "C" fn general_protection() {
         "and rcx, 0xF",
         "add cl, 0x30",
         "cmp cl, 0x3A",
-        "jl 2f",
+        "jl 3f",
         "add cl, 7",
-        "2:",
+        "3:",
         "mov al, cl",
         "out dx, al",
 

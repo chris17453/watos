@@ -20,6 +20,9 @@ watos-users = { path = "crates/sys/users" }
 # Console management
 watos-console = { path = "crates/sys/console" }
 
+# Virtual terminal subsystem
+watos-vt = { path = "crates/sys/vt" }
+
 # Drivers
 watos-driver-traits = { path = "crates/drivers/traits" }
 watos-driver-pci = { path = "crates/drivers/bus/pci" }
@@ -78,6 +81,7 @@ members = [
     "crates/sys/runtime",
     "crates/sys/terminal",
     "crates/sys/users",
+    "crates/sys/vt",
 
     # Emulation
     "crates/emu/dos16",
@@ -109,6 +113,7 @@ members = [
     "crates/apps/lsblk",
     "crates/apps/mount",
     "crates/apps/login",
+    "crates/apps/shell",
 ]
 exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
 

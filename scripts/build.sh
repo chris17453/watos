@@ -135,7 +135,21 @@ if [ ! -f "$KERNEL_ELF" ]; then
     error "Kernel ELF not found at $KERNEL_ELF"
 fi
 
-$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy --binary-architecture=i386:x86-64 "$KERNEL_ELF" -O binary "$PROJECT_ROOT/kernel.bin"
+# Try to find objcopy tool (prefer rust-objcopy, fallback to llvm-objcopy or objcopy)
+OBJCOPY=""
+RUST_OBJCOPY="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy"
+if [ -f "$RUST_OBJCOPY" ]; then
+    OBJCOPY="$RUST_OBJCOPY"
+elif command -v llvm-objcopy &> /dev/null; then
+    OBJCOPY="llvm-objcopy"
+elif command -v objcopy &> /dev/null; then
+    OBJCOPY="objcopy"
+else
+    error "No objcopy tool found. Install one of: llvm-tools-preview (rustup), llvm, or binutils"
+fi
+
+log "Using objcopy: $OBJCOPY"
+$OBJCOPY --binary-architecture=i386:x86-64 "$KERNEL_ELF" -O binary "$PROJECT_ROOT/kernel.bin"
 success "Kernel binary extracted: kernel.bin ($(du -h "$PROJECT_ROOT/kernel.bin" | cut -f1))"
 
 # Step 3: Build bootloader
@@ -702,6 +716,16 @@ for app_file in "$PROJECT_ROOT/rootfs/SYSTEM"/*.EXE; do
         fi
     fi
 done
+echo ""
+
+# Step: Create bootable disk image
+log "Creating bootable disk image..."
+if "$PROJECT_ROOT/scripts/create_boot_image.sh"; then
+    success "Boot disk image created: uefi_boot.img"
+else
+    error "Failed to create boot disk image"
+fi
+
 echo ""
 echo "Next steps:"
 echo "  ./scripts/test.sh        - Run automated tests"

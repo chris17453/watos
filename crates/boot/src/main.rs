@@ -10,7 +10,7 @@ use uefi::cstr16;
 use core::fmt::Write;
 
 /// Maximum number of preloaded apps
-const MAX_PRELOADED_APPS: usize = 16;
+const MAX_PRELOADED_APPS: usize = 32;
 
 /// Entry for a preloaded application
 #[repr(C)]
