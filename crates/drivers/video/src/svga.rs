@@ -31,7 +31,7 @@ impl SvgaDriver {
             .unwrap_or(modes::SVGA_800X600X32);
 
         SvgaDriver {
-            state: DriverState::Uninitialized,
+            state: DriverState::Loaded,
             current_mode: mode,
             available_modes: &[
                 // 800x600
@@ -77,14 +77,19 @@ impl SvgaDriver {
 }
 
 impl Driver for SvgaDriver {
-    fn name(&self) -> &'static str {
-        "SVGA/VESA Driver"
+    fn info(&self) -> watos_driver_traits::DriverInfo {
+        watos_driver_traits::DriverInfo {
+            name: "SVGA/VESA Driver",
+            version: "0.1.0",
+            author: "WATOS",
+            description: "SVGA/VESA driver",
+        }
     }
 
     fn init(&mut self) -> DriverResult<()> {
         // Initialize default palette
         init_svga_palette(&mut self.palette);
-        self.state = DriverState::Initialized;
+        self.state = DriverState::Ready;
         Ok(())
     }
 
@@ -201,7 +206,10 @@ impl VideoDevice for SvgaDriver {
                 let r = ((val >> 11) & 0x1F) as u8;
                 let g = ((val >> 5) & 0x3F) as u8;
                 let b = (val & 0x1F) as u8;
-                ((r << 19) | (g << 10) | (b << 3) | 0xFF000000) as Color
+                let r8 = (r * 255 / 31) as u32;
+                let g8 = (g * 255 / 63) as u32;
+                let b8 = (b * 255 / 31) as u32;
+                (r8 << 16) | (g8 << 8) | b8 | 0xFF000000
             }
             3 => {
                 let b = fb[offset];
@@ -221,7 +229,7 @@ impl VideoDevice for SvgaDriver {
 
     fn info(&self) -> VideoDeviceInfo {
         VideoDeviceInfo {
-            name: self.name(),
+            name: "SVGA/VESA Driver",
             mode: self.current_mode,
             framebuffer_size: self.pitch * self.current_mode.height as usize,
         }

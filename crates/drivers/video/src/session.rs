@@ -55,7 +55,11 @@ impl VirtualFramebuffer {
                 let r = ((val >> 11) & 0x1F) as u8;
                 let g = ((val >> 5) & 0x3F) as u8;
                 let b = (val & 0x1F) as u8;
-                ((r << 19) | (g << 10) | (b << 3) | 0xFF000000) as Color
+                // Scale to 8-bit: r5->r8 (*255/31), g6->g8 (*255/63), b5->b8 (*255/31)
+                let r8 = (r * 255 / 31) as u32;
+                let g8 = (g * 255 / 63) as u32;
+                let b8 = (b * 255 / 31) as u32;
+                (r8 << 16) | (g8 << 8) | b8 | 0xFF000000
             }
             3 | 4 => {
                 let b = self.buffer[offset];

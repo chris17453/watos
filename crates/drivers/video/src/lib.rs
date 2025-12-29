@@ -222,9 +222,27 @@ pub fn session_blit(session_id: u32, data: &[u8], width: usize, height: usize, s
 
 /// Composite a session to the physical display (flip/swap buffers)
 pub fn session_flip(session_id: u32) {
-    let manager = SESSION_MANAGER.lock();
-    manager.composite_to_physical(session_id, |x, y, color| {
-        drop(manager); // Release lock before calling set_pixel
-        set_pixel(x, y, color);
-    });
+    // Create a temporary copy of the session data to avoid lock conflicts
+    let session_data: Option<alloc::vec::Vec<(u32, u32, Color)>> = {
+        let manager = SESSION_MANAGER.lock();
+        if let Some(fb) = manager.get_session(session_id) {
+            let mut pixels = alloc::vec::Vec::new();
+            for y in 0..fb.mode.height {
+                for x in 0..fb.mode.width {
+                    let color = fb.get_pixel(x, y);
+                    pixels.push((x, y, color));
+                }
+            }
+            Some(pixels)
+        } else {
+            None
+        }
+    };
+    
+    // Now write the pixels without holding the session lock
+    if let Some(pixels) = session_data {
+        for (x, y, color) in pixels {
+            set_pixel(x, y, color);
+        }
+    }
 }

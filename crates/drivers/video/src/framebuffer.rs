@@ -38,7 +38,7 @@ impl FramebufferDriver {
         init_default_palette(&mut palette);
 
         FramebufferDriver {
-            state: DriverState::Initialized,
+            state: DriverState::Loaded,
             framebuffer_addr: fb_addr,
             current_mode: mode,
             pitch: pitch as usize,
@@ -64,12 +64,17 @@ impl FramebufferDriver {
 }
 
 impl Driver for FramebufferDriver {
-    fn name(&self) -> &'static str {
-        "GOP Framebuffer"
+    fn info(&self) -> watos_driver_traits::DriverInfo {
+        watos_driver_traits::DriverInfo {
+            name: "GOP Framebuffer",
+            version: "0.1.0",
+            author: "WATOS",
+            description: "UEFI GOP framebuffer driver",
+        }
     }
 
     fn init(&mut self) -> DriverResult<()> {
-        self.state = DriverState::Initialized;
+        self.state = DriverState::Ready;
         Ok(())
     }
 
@@ -126,6 +131,7 @@ impl VideoDevice for FramebufferDriver {
         let bytes_per_pixel = (self.current_mode.bpp as usize + 7) / 8;
         let offset = y as usize * self.pitch + x as usize * bytes_per_pixel;
 
+        let is_bgr = self.current_mode.format == PixelFormat::Bgr;
         let fb = self.framebuffer_mut();
         let r = ((color >> 16) & 0xFF) as u8;
         let g = ((color >> 8) & 0xFF) as u8;
@@ -147,7 +153,7 @@ impl VideoDevice for FramebufferDriver {
             }
             3 => {
                 // RGB24 or BGR24
-                if self.current_mode.format == PixelFormat::Bgr {
+                if is_bgr {
                     fb[offset] = b;
                     fb[offset + 1] = g;
                     fb[offset + 2] = r;
@@ -159,7 +165,7 @@ impl VideoDevice for FramebufferDriver {
             }
             4 => {
                 // RGBA32 or BGRA32
-                if self.current_mode.format == PixelFormat::Bgr {
+                if is_bgr {
                     fb[offset] = b;
                     fb[offset + 1] = g;
                     fb[offset + 2] = r;
@@ -197,7 +203,10 @@ impl VideoDevice for FramebufferDriver {
                 let r = ((val >> 11) & 0x1F) as u8;
                 let g = ((val >> 5) & 0x3F) as u8;
                 let b = (val & 0x1F) as u8;
-                ((r << 19) | (g << 10) | (b << 3) | 0xFF000000) as Color
+                let r8 = (r * 255 / 31) as u32;
+                let g8 = (g * 255 / 63) as u32;
+                let b8 = (b * 255 / 31) as u32;
+                (r8 << 16) | (g8 << 8) | b8 | 0xFF000000
             }
             3 => {
                 // RGB24 or BGR24
@@ -233,7 +242,7 @@ impl VideoDevice for FramebufferDriver {
 
     fn info(&self) -> VideoDeviceInfo {
         VideoDeviceInfo {
-            name: self.name(),
+            name: "GOP Framebuffer",
             mode: self.current_mode,
             framebuffer_size: self.pitch * self.current_mode.height as usize,
         }

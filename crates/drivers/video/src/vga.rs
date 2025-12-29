@@ -40,7 +40,7 @@ impl VgaDriver {
     pub fn new() -> Self {
         // Start with text mode 80x25
         VgaDriver {
-            state: DriverState::Uninitialized,
+            state: DriverState::Loaded,
             current_mode: modes::TEXT_80X25,
             available_modes: &[
                 modes::TEXT_80X25,
@@ -100,14 +100,19 @@ impl VgaDriver {
 }
 
 impl Driver for VgaDriver {
-    fn name(&self) -> &'static str {
-        "VGA Driver"
+    fn info(&self) -> watos_driver_traits::DriverInfo {
+        watos_driver_traits::DriverInfo {
+            name: "VGA Driver",
+            version: "0.1.0",
+            author: "WATOS",
+            description: "Standard VGA driver",
+        }
     }
 
     fn init(&mut self) -> DriverResult<()> {
         // Initialize default VGA palette
         init_vga_palette(&mut self.palette);
-        self.state = DriverState::Initialized;
+        self.state = DriverState::Ready;
         Ok(())
     }
 
@@ -209,7 +214,7 @@ impl VideoDevice for VgaDriver {
 
     fn info(&self) -> VideoDeviceInfo {
         VideoDeviceInfo {
-            name: self.name(),
+            name: "VGA Driver",
             mode: self.current_mode,
             framebuffer_size: match self.current_mode.format {
                 PixelFormat::Indexed if self.current_mode.bpp == 8 => {
