@@ -1,0 +1,13 @@
+[package]
+name = "watos-driver-audio-generic"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS Generic Sound Card Driver"
+
+[dependencies]
+watos-driver-traits = { path = "../../../drivers/traits" }
+watos-driver-pci = { path = "../../../drivers/bus/pci" }
+
+[features]
+default = []
+debug = ["watos-driver-traits/debug-audio"]
