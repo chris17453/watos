@@ -399,7 +399,11 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
     // When called from user process, CR3 points to that process's page table
     // which only has limited mappings. Kernel's UEFI page table has full identity map.
     unsafe {
-        debug_serial(b"[EXEC] switching CR3, KERNEL_PML4=0x");
+        let rsp_before: u64;
+        core::arch::asm!("mov {}, rsp", out(reg) rsp_before);
+        debug_serial(b"[EXEC] RSP before=0x");
+        debug_hex(rsp_before);
+        debug_serial(b" KERNEL_PML4=0x");
         debug_hex(KERNEL_PML4);
         debug_serial(b"\r\n");
         if KERNEL_PML4 != 0 && KERNEL_PML4 < 0x10000000 {
@@ -408,10 +412,20 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
             debug_serial(b"[EXEC] ERROR: Invalid KERNEL_PML4!\r\n");
             return Err("Invalid kernel page table");
         }
-        debug_serial(b"[EXEC] CR3 switched\r\n");
+        let rsp_after: u64;
+        core::arch::asm!("mov {}, rsp", out(reg) rsp_after);
+        debug_serial(b"[EXEC] RSP after=0x");
+        debug_hex(rsp_after);
+        debug_serial(b" CR3 switched\r\n");
     }
 
-    unsafe { debug_serial(b"[EXEC] parsing ELF\r\n"); }
+    unsafe {
+        debug_serial(b"[EXEC] parsing ELF, data ptr=0x");
+        debug_hex(data.as_ptr() as u64);
+        debug_serial(b" len=");
+        debug_hex(data.len() as u64);
+        debug_serial(b"\r\n");
+    }
     let elf = elf::Elf64::parse(data)?;
 
     let pid = unsafe {
