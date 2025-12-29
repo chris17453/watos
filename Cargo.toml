@@ -59,6 +59,9 @@ members = [
     # Video drivers
     "crates/drivers/video",
 
+    # Audio drivers
+    "crates/drivers/audio/generic",
+
     # Storage subsystem
     "crates/storage/vfs",
     "crates/storage/fat",
