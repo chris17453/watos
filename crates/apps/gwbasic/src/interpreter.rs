@@ -381,6 +381,9 @@ impl Interpreter {
                 let (width, height) = match m {
                     1 => (320, 200),  // SCREEN 1: 320x200 graphics mode (CGA)
                     2 => (640, 200),  // SCREEN 2: 640x200 high-res monochrome
+                    3 => (640, 480),  // SCREEN 3: 640x480 VGA
+                    4 => (800, 600),  // SCREEN 4: 800x600 SVGA
+                    5 => (1024, 768), // SCREEN 5: 1024x768 SVGA
                     _ => (80, 25),    // SCREEN 0 or others: 80x25 text mode
                 };
 
@@ -402,8 +405,31 @@ impl Interpreter {
                 }
                 #[cfg(not(feature = "host"))]
                 {
-                    // On WATOS, use the VGA backend through syscalls
-                    self.screen = Screen::new(width, height);
+                    // On WATOS, use the VGA backend through syscalls for graphics modes
+                    #[cfg(not(feature = "std"))]
+                    {
+                        use crate::graphics_backend::watos_vga;
+                        
+                        if m > 0 {
+                            // Graphics mode - create VGA/SVGA backend
+                            match watos_vga::from_screen_mode(m as u8) {
+                                Ok(backend) => {
+                                    self.screen = Screen::new_with_backend(Box::new(backend));
+                                }
+                                Err(_) => {
+                                    // Fall back to ASCII mode if VGA initialization fails
+                                    self.screen = Screen::new(width, height);
+                                }
+                            }
+                        } else {
+                            // Text mode - use ASCII backend
+                            self.screen = Screen::new(width, height);
+                        }
+                    }
+                    #[cfg(feature = "std")]
+                    {
+                        self.screen = Screen::new(width, height);
+                    }
                 }
                 Ok(())
             }
