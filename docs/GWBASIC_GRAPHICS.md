@@ -46,11 +46,13 @@ Each GW-BASIC graphics screen mode creates its own VGA session, providing isolat
 | Mode | Resolution | BPP | Description |
 |------|-----------|-----|-------------|
 | 0 | 80x25 | text | Text mode (ASCII backend) |
-| 1 | 320x200 | 8 | VGA low-res, 256 colors |
-| 2 | 640x200 | 4 | VGA medium-res, 16 colors |
-| 3 | 640x480 | 4 | VGA high-res, 16 colors |
-| 4 | 800x600 | 32 | SVGA 800x600, true color |
-| 5 | 1024x768 | 32 | SVGA 1024x768, true color |
+| 1 | 320x200 | 8 | VGA low-res, 256 indexed colors |
+| 2 | 640x200 | 4 | VGA medium-res, 16 indexed colors |
+| 3 | 640x480 | 4 | VGA high-res, 16 indexed colors |
+| 4 | 800x600 | 32 | SVGA 800x600, 32-bit RGBA with color index mapping |
+| 5 | 1024x768 | 32 | SVGA 1024x768, 32-bit RGBA with color index mapping |
+
+**Note on SVGA Color Modes**: While SVGA modes use 32-bit RGBA framebuffers internally for better driver compatibility, GW-BASIC programs still use 8-bit color indices (0-255) in PSET, LINE, and CIRCLE commands. The backend automatically maps these indices to RGB values using the EGA 16-color palette for indices 0-15, and grayscale for higher indices.
 
 ## Graphics Commands
 

@@ -171,8 +171,9 @@ impl WatosVgaBackend {
     /// Create a new VGA backend with the specified mode using SVGA sessions
     pub fn new(mode: VideoMode) -> Result<Self> {
         // Calculate buffer size based on bits per pixel
-        // For 8-bit modes: 1 byte per pixel
+        // For 8-bit modes: 1 byte per pixel (indexed color)
         // For 32-bit modes: 4 bytes per pixel (RGBA)
+        // Formula: (bpp + 7) / 8 rounds up to nearest byte
         let bytes_per_pixel = if mode.bpp <= 8 { 1 } else { (mode.bpp as usize + 7) / 8 };
         let buffer_size = mode.width * mode.height * bytes_per_pixel;
         let framebuffer = vec![0u8; buffer_size];
@@ -192,6 +193,7 @@ impl WatosVgaBackend {
                 )
             };
 
+            // u64::MAX is used by kernel to indicate syscall errors
             if session_result == u64::MAX {
                 return Err(Error::RuntimeError(format!(
                     "Failed to create VGA session for mode {}x{}x{}",
