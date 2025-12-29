@@ -31,8 +31,8 @@ pub fn play_tone_example() -> Result<(), &'static str> {
     driver.init()
         .map_err(|_| "Failed to initialize driver")?;
     
-    // Start the driver
-    driver.start()
+    // Start the driver (transitions to Active state)
+    Driver::start(&mut driver)
         .map_err(|_| "Failed to start driver")?;
 
     // Configure audio settings: 44.1kHz, stereo, 16-bit
@@ -45,8 +45,8 @@ pub fn play_tone_example() -> Result<(), &'static str> {
     driver.set_config(config)
         .map_err(|_| "Failed to set audio config")?;
 
-    // Start playback
-    driver.start()
+    // Start playback (AudioDevice start)
+    AudioDevice::start(&mut driver)
         .map_err(|_| "Failed to start playback")?;
 
     // Generate a simple 440Hz sine wave (A4 note)
@@ -81,8 +81,8 @@ pub fn play_tone_example() -> Result<(), &'static str> {
     // Wait for playback to complete (simplified)
     // In a real application, you would poll the buffer status
     
-    // Stop playback
-    driver.stop()
+    // Stop playback (AudioDevice stop)
+    AudioDevice::stop(&mut driver)
         .map_err(|_| "Failed to stop playback")?;
 
     Ok(())
@@ -94,7 +94,7 @@ pub fn volume_control_example() -> Result<(), &'static str> {
         .ok_or("No sound card found")?;
 
     driver.init().map_err(|_| "Init failed")?;
-    driver.start().map_err(|_| "Start failed")?;
+    Driver::start(&mut driver).map_err(|_| "Start failed")?;
 
     // Get current volume
     let current_volume = driver.volume();
@@ -126,17 +126,20 @@ pub fn enumerate_sound_cards() -> alloc::vec::Vec<GenericSoundDriver> {
 
 /// Example: Get device information
 pub fn get_device_info() -> Result<(), &'static str> {
-    let driver = GenericSoundDriver::probe()
+    let mut driver = GenericSoundDriver::probe()
         .ok_or("No sound card found")?;
 
-    let info = driver.info();
+    // Get driver information
+    let driver_info = Driver::info(&driver);
+    // driver_info.name, driver_info.version, driver_info.author, driver_info.description
     
-    // Access driver information
-    // info.name, info.version, info.author, info.description
+    // Initialize driver to get audio device info
+    driver.init().map_err(|_| "Init failed")?;
+    Driver::start(&mut driver).map_err(|_| "Start failed")?;
     
-    // Get audio device info (after initialization)
-    // let audio_info = driver.info();
-    // audio_info.config, audio_info.buffer_size, audio_info.playing
+    // Get audio device info
+    let audio_device_info = AudioDevice::info(&driver);
+    // audio_device_info.config, audio_device_info.buffer_size, audio_device_info.playing
     
     Ok(())
 }

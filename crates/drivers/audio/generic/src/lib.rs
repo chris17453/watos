@@ -171,7 +171,7 @@ impl Driver for GenericSoundDriver {
     }
 
     fn init(&mut self) -> DriverResult<()> {
-        if self.state != DriverState::Ready {
+        if self.state != DriverState::Ready && self.state != DriverState::Loaded {
             return Err(DriverError::InvalidState);
         }
 
@@ -191,7 +191,7 @@ impl Driver for GenericSoundDriver {
     }
 
     fn start(&mut self) -> DriverResult<()> {
-        if self.state != DriverState::Ready {
+        if self.state != DriverState::Ready && self.state != DriverState::Stopped {
             return Err(DriverError::InvalidState);
         }
 
@@ -241,11 +241,21 @@ impl AudioDevice for GenericSoundDriver {
             return Err(DriverError::InvalidState);
         }
 
+        if self.playing {
+            // Already playing
+            return Ok(());
+        }
+
         self.playing = true;
         Ok(())
     }
 
     fn stop(&mut self) -> DriverResult<()> {
+        if !self.playing {
+            // Already stopped
+            return Ok(());
+        }
+
         self.playing = false;
         Ok(())
     }
@@ -260,9 +270,40 @@ impl AudioDevice for GenericSoundDriver {
             return Ok(samples.len());
         }
 
-        // Apply volume scaling (simplified)
-        // In a real driver, this would be done in hardware or with proper DSP
-        let written = self.buffer_write(samples);
+        // Apply volume scaling
+        // For efficiency, we apply volume to the buffer as we write
+        // Volume scaling: new_sample = (sample * volume) / 100
+        let volume_scale = self.volume as u32;
+        let mut scaled_samples = alloc::vec::Vec::with_capacity(samples.len());
+        
+        // Scale samples based on format
+        match self.config.format {
+            SampleFormat::S16Le | SampleFormat::S16Be => {
+                // 16-bit samples: process in pairs
+                for chunk in samples.chunks_exact(2) {
+                    if chunk.len() == 2 {
+                        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        let scaled = ((sample as i32 * volume_scale as i32) / 100) as i16;
+                        scaled_samples.push((scaled & 0xFF) as u8);
+                        scaled_samples.push(((scaled >> 8) & 0xFF) as u8);
+                    }
+                }
+            }
+            SampleFormat::U8 => {
+                // 8-bit samples: scale directly
+                for &sample in samples {
+                    let centered = sample as i32 - 128;
+                    let scaled = (centered * volume_scale as i32) / 100;
+                    scaled_samples.push((scaled + 128).clamp(0, 255) as u8);
+                }
+            }
+            _ => {
+                // For unsupported formats, just copy without scaling
+                scaled_samples.extend_from_slice(samples);
+            }
+        }
+
+        let written = self.buffer_write(&scaled_samples);
 
         // Simulate hardware consumption for testing
         // In a real driver, this would happen via interrupt
