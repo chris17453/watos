@@ -1,6 +1,6 @@
 //! WATOS VGA/SVGA Graphics Backend
 //!
-//! Implements pixel-buffer graphics for WATOS using kernel VGA driver.
+//! Implements pixel-buffer graphics for WATOS using kernel SVGA driver via sessions.
 //! Supports multiple video modes including:
 //! - Mode 0: 80x25 text mode (handled by console)
 //! - Mode 1: 320x200 VGA (256 colors)
@@ -53,8 +53,8 @@ impl VideoMode {
     pub const VGA_320X200: Self = VideoMode { width: 320, height: 200, bpp: 8, mode_num: 1 };
     pub const VGA_640X200: Self = VideoMode { width: 640, height: 200, bpp: 4, mode_num: 2 };
     pub const VGA_640X480: Self = VideoMode { width: 640, height: 480, bpp: 4, mode_num: 3 };
-    pub const SVGA_800X600: Self = VideoMode { width: 800, height: 600, bpp: 8, mode_num: 4 };
-    pub const SVGA_1024X768: Self = VideoMode { width: 1024, height: 768, bpp: 8, mode_num: 5 };
+    pub const SVGA_800X600: Self = VideoMode { width: 800, height: 600, bpp: 32, mode_num: 4 };
+    pub const SVGA_1024X768: Self = VideoMode { width: 1024, height: 768, bpp: 32, mode_num: 5 };
 
     pub fn from_basic_mode(mode: u8) -> Self {
         match mode {
@@ -72,12 +72,13 @@ impl VideoMode {
 /// WATOS VGA/SVGA graphics backend
 pub struct WatosVgaBackend {
     mode: VideoMode,
-    framebuffer: Vec<u8>,    // Pixel data (8-bit color indices)
+    framebuffer: Vec<u8>,    // Pixel data (8-bit color indices for now)
     cursor_x: usize,
     cursor_y: usize,
     fg_color: u8,
     bg_color: u8,
     dirty: bool,             // Track if buffer needs refresh
+    session_id: Option<u32>, // VGA session ID for multi-session support
 }
 
 /// WATOS VGA syscalls
@@ -89,6 +90,11 @@ mod syscall {
     pub const SYS_VGA_CLEAR: u32 = 34;
     pub const SYS_VGA_FLIP: u32 = 35;
     pub const SYS_VGA_SET_PALETTE: u32 = 36;
+    pub const SYS_VGA_CREATE_SESSION: u32 = 37;
+    pub const SYS_VGA_DESTROY_SESSION: u32 = 38;
+    pub const SYS_VGA_SET_ACTIVE_SESSION: u32 = 39;
+    pub const SYS_VGA_GET_SESSION_INFO: u32 = 40;
+    pub const SYS_VGA_ENUMERATE_MODES: u32 = 41;
 
     #[inline(always)]
     pub unsafe fn syscall0(num: u32) -> u64 {
@@ -162,22 +168,40 @@ mod syscall {
 }
 
 impl WatosVgaBackend {
-    /// Create a new VGA backend with the specified mode
+    /// Create a new VGA backend with the specified mode using SVGA sessions
     pub fn new(mode: VideoMode) -> Result<Self> {
         let buffer_size = mode.width * mode.height;
         let framebuffer = vec![0u8; buffer_size];
 
-        // Request video mode from kernel
-        let result = unsafe {
-            syscall::syscall1(syscall::SYS_VGA_SET_MODE, mode.mode_num as u64)
-        };
+        // For text mode (mode 0), we don't create a graphics session
+        let session_id = if mode.mode_num == 0 {
+            None
+        } else {
+            // Create a VGA session for graphics mode
+            // Args: width, height, bpp
+            let session_result = unsafe {
+                syscall::syscall3(
+                    syscall::SYS_VGA_CREATE_SESSION,
+                    mode.width as u64,
+                    mode.height as u64,
+                    mode.bpp as u64,
+                )
+            };
 
-        if result == u64::MAX {
-            return Err(Error::RuntimeError(format!(
-                "Failed to set video mode {}x{}",
-                mode.width, mode.height
-            )));
-        }
+            if session_result == u64::MAX {
+                return Err(Error::RuntimeError(format!(
+                    "Failed to create VGA session for mode {}x{}x{}",
+                    mode.width, mode.height, mode.bpp
+                )));
+            }
+
+            // Set this session as active
+            unsafe {
+                syscall::syscall1(syscall::SYS_VGA_SET_ACTIVE_SESSION, session_result);
+            }
+
+            Some(session_result as u32)
+        };
 
         Ok(WatosVgaBackend {
             mode,
@@ -187,6 +211,7 @@ impl WatosVgaBackend {
             fg_color: 15,  // White
             bg_color: 0,   // Black
             dirty: true,
+            session_id,
         })
     }
 
@@ -198,6 +223,16 @@ impl WatosVgaBackend {
     /// Create backend for 640x480 VGA mode
     pub fn new_vga_hi() -> Result<Self> {
         Self::new(VideoMode::VGA_640X480)
+    }
+
+    /// Create backend for 800x600 SVGA mode
+    pub fn new_svga() -> Result<Self> {
+        Self::new(VideoMode::SVGA_800X600)
+    }
+
+    /// Create backend for 1024x768 SVGA mode
+    pub fn new_svga_hi() -> Result<Self> {
+        Self::new(VideoMode::SVGA_1024X768)
     }
 
     /// Get pixel buffer for direct access
@@ -384,4 +419,15 @@ impl GraphicsBackend for WatosVgaBackend {
 pub fn from_screen_mode(mode: u8) -> Result<WatosVgaBackend> {
     let video_mode = VideoMode::from_basic_mode(mode);
     WatosVgaBackend::new(video_mode)
+}
+
+impl Drop for WatosVgaBackend {
+    fn drop(&mut self) {
+        // Clean up VGA session when backend is dropped
+        if let Some(session_id) = self.session_id {
+            unsafe {
+                syscall::syscall1(syscall::SYS_VGA_DESTROY_SESSION, session_id as u64);
+            }
+        }
+    }
 }
