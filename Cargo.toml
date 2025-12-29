@@ -17,6 +17,9 @@ watos-process = { path = "crates/sys/process" }
 # User management
 watos-users = { path = "crates/sys/users" }
 
+# Console management
+watos-console = { path = "crates/sys/console" }
+
 # Drivers
 watos-driver-traits = { path = "crates/drivers/traits" }
 watos-driver-pci = { path = "crates/drivers/bus/pci" }

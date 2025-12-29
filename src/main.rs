@@ -967,6 +967,10 @@ pub extern "C" fn _start() -> ! {
     watos_users::init();
     unsafe { watos_arch::serial_write(b"[KERNEL] User management initialized\r\n"); }
 
+    // 5.4 Initialize console session manager
+    watos_console::init();
+    unsafe { watos_arch::serial_write(b"[KERNEL] Console session manager initialized\r\n"); }
+
     // 5.4 Initialize video driver from boot info
     unsafe {
         if let Some(info) = BOOT_INFO {
@@ -1006,21 +1010,19 @@ pub extern "C" fn _start() -> ! {
         if let Some(info) = BOOT_INFO {
             // First try to find and launch login app from preloaded apps
             let login_found = find_preloaded_app(b"login");
-            let init_app = if login_found.is_some() {
+            
+            let (name_bytes, app_data_opt): (&[u8], Option<(u64, u64)>) = if login_found.is_some() {
                 (b"login", login_found)
+            } else if info.init_app_addr != 0 && info.init_app_size != 0 {
+                (b"TERM.EXE", Some((info.init_app_addr, info.init_app_size)))
             } else {
-                // Fall back to TERM.EXE from boot info
-                if info.init_app_addr != 0 && info.init_app_size != 0 {
-                    (b"TERM.EXE", Some((info.init_app_addr, info.init_app_size)))
-                } else {
-                    (b"none", None)
-                }
+                (b"", None)
             };
 
-            match init_app {
-                (name, Some((addr, size))) => {
+            match app_data_opt {
+                Some((addr, size)) => {
                     watos_arch::serial_write(b"[KERNEL] Launching ");
-                    watos_arch::serial_write(name);
+                    watos_arch::serial_write(name_bytes);
                     watos_arch::serial_write(b" at 0x");
                     watos_arch::serial_hex(addr);
                     watos_arch::serial_write(b" (");
@@ -1034,25 +1036,25 @@ pub extern "C" fn _start() -> ! {
                     );
 
                     // Execute the app
-                    let name_str = core::str::from_utf8(name).unwrap_or("app");
+                    let name_str = core::str::from_utf8(name_bytes).unwrap_or("app");
                     match watos_process::exec(name_str, app_data, name_str) {
                         Ok(pid) => {
                             watos_arch::serial_write(b"[KERNEL] ");
-                            watos_arch::serial_write(name);
+                            watos_arch::serial_write(name_bytes);
                             watos_arch::serial_write(b" running as PID ");
                             watos_arch::serial_hex(pid as u64);
                             watos_arch::serial_write(b"\r\n");
                         }
                         Err(e) => {
                             watos_arch::serial_write(b"[KERNEL] Failed to exec ");
-                            watos_arch::serial_write(name);
+                            watos_arch::serial_write(name_bytes);
                             watos_arch::serial_write(b": ");
                             watos_arch::serial_write(e.as_bytes());
                             watos_arch::serial_write(b"\r\n");
                         }
                     }
                 }
-                _ => {
+                None => {
                     watos_arch::serial_write(b"[KERNEL] No init app loaded\r\n");
                 }
             }
@@ -1140,6 +1142,11 @@ mod syscall {
     pub const SYS_GETUID: u64 = 122;
     pub const SYS_GETGID: u64 = 123;
     pub const SYS_SETGID: u64 = 124;
+
+    // Console session management
+    pub const SYS_SESSION_CREATE: u64 = 130;
+    pub const SYS_SESSION_SWITCH: u64 = 131;
+    pub const SYS_SESSION_GET_CURRENT: u64 = 132;
 }
 
 /// Syscall handler - naked function called from IDT
@@ -2248,6 +2255,43 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             } else {
                 u64::MAX
             }
+        }
+
+        syscall::SYS_SESSION_CREATE => {
+            // arg1 = name pointer
+            // arg2 = name length
+            // arg3 = task_id
+            // Returns session ID on success, u64::MAX on failure
+            let name_ptr = arg1 as *const u8;
+            let name_len = arg2 as usize;
+            let task_id = arg3 as u32;
+
+            if name_ptr.is_null() || name_len == 0 {
+                return u64::MAX;
+            }
+
+            unsafe {
+                let name_bytes = core::slice::from_raw_parts(name_ptr, name_len);
+                let name_str = core::str::from_utf8(name_bytes).unwrap_or("session");
+                
+                match watos_console::manager().create_console(name_str, task_id) {
+                    Some(id) => id as u64,
+                    None => u64::MAX,
+                }
+            }
+        }
+
+        syscall::SYS_SESSION_SWITCH => {
+            // arg1 = session ID (or F-key number 0-11)
+            let session_id = arg1 as u8;
+            
+            let new_id = watos_console::manager().switch_to_fkey(session_id);
+            new_id as u64
+        }
+
+        syscall::SYS_SESSION_GET_CURRENT => {
+            // Returns current session ID
+            watos_console::manager().active_id() as u64
         }
 
         _ => {

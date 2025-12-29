@@ -4,7 +4,10 @@
 //! for WATOS. It's used by both the kernel and user applications to ensure
 //! consistency in the syscall ABI.
 
-#![cfg_attr(feature = "no-std", no_std)]
+#![no_std]
+
+use core::option::Option;
+use core::option::Option::{Some, None};
 
 /// WATOS System Call Numbers - AUTHORITATIVE DEFINITION
 pub mod numbers {
