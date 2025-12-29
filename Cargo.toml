@@ -18,6 +18,7 @@ watos-process = { path = "crates/sys/process" }
 watos-driver-traits = { path = "crates/drivers/traits" }
 watos-driver-pci = { path = "crates/drivers/bus/pci" }
 watos-driver-ahci = { path = "crates/drivers/storage/ahci" }
+watos-driver-video = { path = "crates/drivers/video" }
 
 # Filesystem
 wfs-common = { path = "crates/storage/wfs", features = ["vfs"] }
@@ -48,6 +49,9 @@ members = [
 
     # Input drivers
     "crates/drivers/input/ps2",
+
+    # Video drivers
+    "crates/drivers/video",
 
     # Storage subsystem
     "crates/storage/vfs",

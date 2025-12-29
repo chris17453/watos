@@ -1,0 +1,12 @@
+[package]
+name = "watos-driver-video"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+watos-driver-traits = { path = "../traits" }
+spin = "0.5.2"
+
+[features]
+default = []
+debug = ["watos-driver-traits/debug-video"]
