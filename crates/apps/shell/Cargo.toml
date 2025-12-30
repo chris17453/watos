@@ -11,7 +11,3 @@ watos-readline = { path = "../../sys/readline" }
 name = "shell"
 path = "src/main.rs"
 
-[profile.release]
-panic = "abort"
-opt-level = "z"
-lto = true

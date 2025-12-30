@@ -1,12 +1,6 @@
 //! mkfs.wfs - Create WFS (WATOS File System) disk images
 //!
-//! WFS v2 Features:
-//! - Up to 65536 files per volume
-//! - Case-sensitive filenames with whitespace support
-//! - Boundary markers for visual debugging
-//! - CRC32 on all structures
-//!
-//! WFS v3 Features (CoW):
+//! WFS v1 Features (CoW):
 //! - Copy-on-Write with atomic transactions
 //! - B+tree indexed directories (O(log n) lookup)
 //! - Extent-based file storage
@@ -14,27 +8,27 @@
 //! - Checksums on all metadata
 //!
 //! Usage:
-//!   mkfs.wfs -o disk.img -s 64M           # Create 64MB v2 disk image
-//!   mkfs.wfs -o disk.img -s 64M -d files/ # Create and populate from directory
-//!   mkfs.wfs -o disk.img -s 1G -m 8192    # 1GB with 8192 max files
-//!   mkfs.wfs -o disk.img -s 64M --v3      # Create v3 CoW filesystem
+//!   mkfs.wfs -o disk.img -s 64M          # Create 64MB v1 disk image
+//!   mkfs.wfs -o disk.img -s 1G           # Create 1GB v1 disk image
 
 use clap::Parser;
+use std::cell::UnsafeCell;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Import all shared WFS definitions
 use wfs_common::*;
-use wfs_common::v3::{
-    SuperblockV3, TreeNode, NodeType, Inode, BPlusTree, BlockDevice, TreeError,
-    TreeOps, TreeKey, TreeValue, WFS3_MAGIC, BLOCK_SIZE as V3_BLOCK_SIZE,
-    ROOT_INODE, WFS3_SIGNATURE, InodeOps, DirOps, FilesystemState,
+use wfs_common::core::{
+    Superblock, TreeNode, NodeType, Inode, BPlusTree, BlockDevice, BlockAllocator, TreeError,
+    TreeOps, BLOCK_SIZE, ROOT_INODE, InodeOps, DirOps, FilesystemState,
 };
+use wfs_common::core::inode::INODE_INLINE_SIZE;
+use wfs_common::core::dir::{DirEntry, EntryType};
 
 #[derive(Parser)]
 #[command(name = "mkfs.wfs")]
-#[command(about = "Create WFS (WATOS File System) disk images")]
+#[command(about = "Create WFS (WATOS File System) v1 disk images")]
 struct Args {
     /// Output disk image file
     #[arg(short, long)]
@@ -47,14 +41,6 @@ struct Args {
     /// Directory to copy files from
     #[arg(short, long)]
     dir: Option<PathBuf>,
-
-    /// Maximum files (default: 4096) - v2 only
-    #[arg(short, long, default_value = "4096")]
-    max_files: u32,
-
-    /// Create v3 CoW filesystem instead of v2
-    #[arg(long)]
-    v3: bool,
 
     /// Verbose output
     #[arg(short, long)]
@@ -76,557 +62,379 @@ fn parse_size(s: &str) -> Option<u64> {
     num_str.parse::<u64>().ok().map(|n| n * mult)
 }
 
-struct WfsImage {
-    file: File,
-    layout: DiskLayout,
-    next_data_block: u64,
-    file_count: u32,
-    bitmap: Vec<u8>,
-    file_table: Vec<u8>,
-}
-
-impl WfsImage {
-    fn create(path: &PathBuf, size: u64, max_files: u32) -> std::io::Result<Self> {
-        let file = File::create(path)?;
-        file.set_len(size)?;
-
-        let total_blocks = size / BLOCK_SIZE as u64;
-        let layout = DiskLayout::calculate(total_blocks, max_files);
-
-        // Allocate bitmap
-        let bitmap_bytes = ((total_blocks + 7) / 8) as usize;
-        let mut bitmap = vec![0u8; bitmap_bytes];
-
-        // Mark all metadata blocks as used
-        Self::mark_block(&mut bitmap, 0);  // Primary superblock
-        Self::mark_block(&mut bitmap, 1);  // Boundary after superblock
-
-        // Bitmap blocks
-        for i in 0..layout.bitmap_blocks {
-            Self::mark_block(&mut bitmap, layout.bitmap_block + i as u64);
-        }
-
-        // Boundary after bitmap
-        Self::mark_block(&mut bitmap, layout.bitmap_block + layout.bitmap_blocks as u64);
-
-        // File table blocks
-        for i in 0..layout.filetable_blocks {
-            Self::mark_block(&mut bitmap, layout.filetable_block + i as u64);
-        }
-
-        // Boundary after file table
-        Self::mark_block(&mut bitmap, layout.filetable_block + layout.filetable_blocks as u64);
-
-        // Backup superblocks and their boundaries
-        Self::mark_block(&mut bitmap, layout.mid_superblock - 1);  // Boundary before mid
-        Self::mark_block(&mut bitmap, layout.mid_superblock);       // Mid superblock
-        Self::mark_block(&mut bitmap, layout.mid_superblock + 1);   // Boundary after mid
-        Self::mark_block(&mut bitmap, layout.last_superblock - 1);  // Boundary before last
-        Self::mark_block(&mut bitmap, layout.last_superblock);      // Last superblock
-
-        // Allocate file table in memory
-        let filetable_size = layout.filetable_blocks as usize * BLOCK_SIZE as usize;
-        let file_table = vec![0u8; filetable_size];
-
-        // Extract data_start_block before moving layout
-        let next_data_block = layout.data_start_block;
-
-        Ok(Self {
-            file,
-            layout,
-            next_data_block,
-            file_count: 0,
-            bitmap,
-            file_table,
-        })
-    }
-
-    fn mark_block(bitmap: &mut [u8], block: u64) {
-        let byte_idx = (block / 8) as usize;
-        let bit_idx = (block % 8) as u8;
-        if byte_idx < bitmap.len() {
-            bitmap[byte_idx] |= 1 << bit_idx;
-        }
-    }
-
-    fn write_block(&mut self, block: u64, data: &[u8]) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Start(block * BLOCK_SIZE as u64))?;
-        self.file.write_all(data)?;
-        Ok(())
-    }
-
-    fn write_boundary(&mut self, block: u64, btype: BoundaryType, seq: u32, prev_end: u64, next_start: u64) -> std::io::Result<()> {
-        let boundary = BoundaryBlock::new(btype, seq, prev_end, next_start);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(&boundary as *const _ as *const u8, BLOCK_SIZE as usize)
-        };
-        self.write_block(block, bytes)
-    }
-
-    fn add_directory(&mut self, name: &str, verbose: bool) -> std::io::Result<()> {
-        if self.file_count >= self.layout.max_files {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Too many files"));
-        }
-
-        // Create directory entry (no data blocks needed)
-        let mut entry = FileEntry::default();
-        entry.set_name(name);
-        entry.size = 0;
-        entry.start_block = 0;
-        entry.blocks = 0;
-        entry.flags = FLAG_DIR;  // Mark as directory
-        entry.data_crc32 = 0;
-        entry.crc32 = file_entry_crc(&entry);
-
-        // Calculate offset into in-memory file table
-        let (table_block, byte_offset) = self.layout.file_entry_offset(self.file_count as usize);
-        let block_in_table = (table_block - self.layout.filetable_block) as usize;
-        let absolute_offset = block_in_table * BLOCK_SIZE as usize + byte_offset;
-
-        // Insert entry into in-memory file table
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &entry as *const _ as *const u8,
-                self.file_table.as_mut_ptr().add(absolute_offset),
-                FILEENTRY_SIZE
-            );
-        }
-
-        if verbose {
-            println!("  {:20} <DIR>", name);
-        }
-
-        self.file_count += 1;
-        Ok(())
-    }
-
-    fn add_file(&mut self, name: &str, data: &[u8], flags: u16, verbose: bool) -> std::io::Result<()> {
-        if self.file_count >= self.layout.max_files {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Too many files"));
-        }
-
-        let num_blocks = blocks_needed(data.len());
-        let start_block = self.next_data_block;
-
-        // Skip over backup superblock boundaries if we hit them
-        let mut actual_start = start_block;
-        if actual_start >= self.layout.mid_superblock - 1 && actual_start <= self.layout.mid_superblock + 1 {
-            actual_start = self.layout.mid_superblock + 2;
-        }
-        if actual_start >= self.layout.last_superblock - 1 {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Disk full"));
-        }
-
-        // Check if we have space
-        if actual_start + num_blocks as u64 >= self.layout.last_superblock - 1 {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Disk full"));
-        }
-
-        // Write data blocks with CRC
-        let mut offset = 0;
-        for i in 0..num_blocks {
-            let mut block = vec![0u8; BLOCK_SIZE as usize];
-            let remaining = data.len().saturating_sub(offset);
-            let copy_len = remaining.min(DATA_PER_BLOCK);
-
-            if copy_len > 0 {
-                block[..copy_len].copy_from_slice(&data[offset..offset + copy_len]);
-            }
-            offset += copy_len;
-
-            // Calculate and append CRC at end of block
-            let block_crc = crc32(&block[..DATA_PER_BLOCK]);
-            block[DATA_PER_BLOCK..DATA_PER_BLOCK + 4].copy_from_slice(&block_crc.to_le_bytes());
-
-            let block_num = actual_start + i as u64;
-            self.write_block(block_num, &block)?;
-            Self::mark_block(&mut self.bitmap, block_num);
-        }
-
-        self.next_data_block = actual_start + num_blocks as u64;
-
-        // Create file entry
-        let mut entry = FileEntry::default();
-        entry.set_name(name);  // Case-sensitive, whitespace preserved
-        entry.size = data.len() as u64;
-        entry.start_block = actual_start;
-        entry.blocks = num_blocks;
-        entry.flags = flags;
-        entry.data_crc32 = crc32(data);
-        entry.crc32 = file_entry_crc(&entry);
-
-        // Calculate offset into in-memory file table
-        let (table_block, byte_offset) = self.layout.file_entry_offset(self.file_count as usize);
-        let block_in_table = (table_block - self.layout.filetable_block) as usize;
-        let absolute_offset = block_in_table * BLOCK_SIZE as usize + byte_offset;
-
-        // Insert entry into in-memory file table
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &entry as *const _ as *const u8,
-                self.file_table.as_mut_ptr().add(absolute_offset),
-                FILEENTRY_SIZE
-            );
-        }
-
-        if verbose {
-            println!("  {:20} {:>8} bytes  {:>4} blocks  @block {}",
-                     name, data.len(), num_blocks, actual_start);
-        }
-
-        self.file_count += 1;
-        Ok(())
-    }
-
-    fn finalize(&mut self, verbose: bool) -> std::io::Result<()> {
-        // Calculate free blocks
-        let used_blocks = self.bitmap.iter()
-            .map(|&b| b.count_ones() as u64)
-            .sum::<u64>();
-        let free_blocks = self.layout.total_blocks - used_blocks;
-
-        // Create superblock
-        let mut sb = Superblock {
-            magic: WFS_MAGIC,
-            version: WFS_VERSION,
-            flags: 0,
-            signature: *WFS_SIGNATURE,
-            block_size: BLOCK_SIZE,
-            _pad0: 0,
-            total_blocks: self.layout.total_blocks,
-            free_blocks,
-            data_start_block: self.layout.data_start_block,
-            bitmap_block: self.layout.bitmap_block,
-            filetable_block: self.layout.filetable_block,
-            bitmap_blocks: self.layout.bitmap_blocks,
-            filetable_blocks: self.layout.filetable_blocks,
-            max_files: self.layout.max_files,
-            root_files: self.file_count,
-            reserved: [0; 112],
-            crc32: 0,
-            _pad1: 0,
-        };
-        sb.crc32 = superblock_crc(&sb);
-
-        // Write superblock to buffer
-        let mut sb_block = vec![0u8; BLOCK_SIZE as usize];
-        unsafe {
-            std::ptr::copy_nonoverlapping(&sb as *const _ as *const u8,
-                                          sb_block.as_mut_ptr(),
-                                          SUPERBLOCK_SIZE);
-        }
-
-        if verbose {
-            println!("\nWriting filesystem structures:");
-        }
-
-        // Write primary superblock
-        self.write_block(0, &sb_block)?;
-        if verbose { println!("  Block 0:      Primary superblock"); }
-
-        // Boundary: Superblock -> Bitmap
-        self.write_boundary(1, BoundaryType::SuperblockToBitmap, 1, 0, self.layout.bitmap_block)?;
-        if verbose { println!("  Block 1:      Boundary (SB->BITMAP)"); }
-
-        // Write bitmap
-        let bitmap_blocks = self.layout.bitmap_blocks as usize;
-        for i in 0..bitmap_blocks {
-            let start = i * BLOCK_SIZE as usize;
-            let end = (start + BLOCK_SIZE as usize).min(self.bitmap.len());
-            let mut block = vec![0u8; BLOCK_SIZE as usize];
-            if end > start {
-                block[..end - start].copy_from_slice(&self.bitmap[start..end]);
-            }
-            self.write_block(self.layout.bitmap_block + i as u64, &block)?;
-        }
-        if verbose {
-            println!("  Block {}-{}:    Bitmap ({} blocks)",
-                     self.layout.bitmap_block,
-                     self.layout.bitmap_block + bitmap_blocks as u64 - 1,
-                     bitmap_blocks);
-        }
-
-        // Boundary: Bitmap -> File table
-        let bitmap_end = self.layout.bitmap_block + self.layout.bitmap_blocks as u64 - 1;
-        let boundary_block = bitmap_end + 1;
-        self.write_boundary(boundary_block, BoundaryType::BitmapToFiletable, 2, bitmap_end, self.layout.filetable_block)?;
-        if verbose { println!("  Block {}:     Boundary (BITMAP->FT)", boundary_block); }
-
-        // Write file table
-        let ft_blocks = self.layout.filetable_blocks as usize;
-        for i in 0..ft_blocks {
-            let start = i * BLOCK_SIZE as usize;
-            let end = start + BLOCK_SIZE as usize;
-            let block_data = self.file_table[start..end].to_vec();
-            self.write_block(self.layout.filetable_block + i as u64, &block_data)?;
-        }
-        if verbose {
-            println!("  Block {}-{}:   File table ({} blocks, {} max files)",
-                     self.layout.filetable_block,
-                     self.layout.filetable_block + ft_blocks as u64 - 1,
-                     ft_blocks,
-                     self.layout.max_files);
-        }
-
-        // Boundary: File table -> Data
-        let ft_end = self.layout.filetable_block + self.layout.filetable_blocks as u64 - 1;
-        let data_boundary = ft_end + 1;
-        self.write_boundary(data_boundary, BoundaryType::FiletableToData, 3, ft_end, self.layout.data_start_block)?;
-        if verbose { println!("  Block {}:    Boundary (FT->DATA)", data_boundary); }
-
-        if verbose {
-            println!("  Block {}+:   Data blocks", self.layout.data_start_block);
-        }
-
-        // Boundary before mid superblock
-        self.write_boundary(self.layout.mid_superblock - 1, BoundaryType::DataToSuperblock, 4,
-                           self.layout.mid_superblock - 2, self.layout.mid_superblock)?;
-        if verbose { println!("  Block {}:   Boundary (DATA->SB)", self.layout.mid_superblock - 1); }
-
-        // Mid superblock
-        self.write_block(self.layout.mid_superblock, &sb_block)?;
-        if verbose { println!("  Block {}:   Backup superblock 1", self.layout.mid_superblock); }
-
-        // Boundary after mid superblock
-        self.write_boundary(self.layout.mid_superblock + 1, BoundaryType::SuperblockToData, 5,
-                           self.layout.mid_superblock, self.layout.mid_superblock + 2)?;
-        if verbose { println!("  Block {}:   Boundary (SB->DATA)", self.layout.mid_superblock + 1); }
-
-        // Boundary before last superblock
-        self.write_boundary(self.layout.last_superblock - 1, BoundaryType::DataToSuperblock, 6,
-                           self.layout.last_superblock - 2, self.layout.last_superblock)?;
-        if verbose { println!("  Block {}:  Boundary (DATA->SB)", self.layout.last_superblock - 1); }
-
-        // Last superblock
-        self.write_block(self.layout.last_superblock, &sb_block)?;
-        if verbose { println!("  Block {}:  Backup superblock 2", self.layout.last_superblock); }
-
-        self.file.sync_all()?;
-        Ok(())
-    }
-}
-
-fn is_executable(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.ends_with(".exe") ||
-    lower.ends_with(".com") ||
-    lower.ends_with(".bin") ||
-    lower.ends_with(".sys")
-}
-
-/// Recursively collect all files and directories from a directory
-/// Returns (relative_path, full_path, is_dir) tuples where relative_path uses / as separator
-/// Directories are collected before their contents to ensure proper order
-fn collect_files_recursive(
-    base_dir: &PathBuf,
-    current_dir: &PathBuf,
-    entries: &mut Vec<(String, PathBuf, bool)>,
-) -> std::io::Result<()> {
-    // First pass: collect files and subdirs separately
-    let mut files_in_dir: Vec<(String, PathBuf)> = Vec::new();
-    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
-
-    for entry in fs::read_dir(current_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-
-        // Calculate relative path from base_dir
-        let relative = path.strip_prefix(base_dir)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Path error"))?;
-
-        // Convert to string with forward slashes
-        let relative_str = relative.to_string_lossy().replace('\\', "/");
-
-        if file_type.is_file() {
-            files_in_dir.push((relative_str, path));
-        } else if file_type.is_dir() {
-            subdirs.push((relative_str, path));
-        }
-    }
-
-    // Add files in this directory first
-    for (name, path) in files_in_dir {
-        entries.push((name, path, false));
-    }
-
-    // Then add subdirectories (directory entry first, then recurse)
-    for (name, path) in subdirs {
-        entries.push((name.clone(), path.clone(), true));  // Directory entry
-        collect_files_recursive(base_dir, &path, entries)?;  // Contents
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// WFS V3 SUPPORT
-// ============================================================================
-
-/// File-backed block device for v3
 struct FileBlockDevice {
-    file: File,
-    next_block: u64,  // For simple allocation
-    total_blocks: u64,
+    file: UnsafeCell<File>,
+    next_block: UnsafeCell<u64>,
 }
 
 impl FileBlockDevice {
-    fn new(file: File, total_blocks: u64) -> Self {
-        Self {
-            file,
-            next_block: 5, // Start after superblocks and initial trees
-            total_blocks,
-        }
+    fn new(path: &PathBuf, size: u64) -> std::io::Result<Self> {
+        // Open file for read+write
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.set_len(size)?;
+        // First 5 blocks are reserved (superblocks, trees)
+        Ok(Self {
+            file: UnsafeCell::new(file),
+            next_block: UnsafeCell::new(5),
+        })
     }
 
     fn write_block_raw(&mut self, block: u64, data: &[u8]) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Start(block * V3_BLOCK_SIZE as u64))?;
-        self.file.write_all(data)?;
-        Ok(())
-    }
-
-    fn read_block_raw(&mut self, block: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Start(block * V3_BLOCK_SIZE as u64))?;
-        self.file.read_exact(buf)?;
-        Ok(())
+        let file = unsafe { &mut *self.file.get() };
+        file.seek(SeekFrom::Start(block * BLOCK_SIZE as u64))?;
+        file.write_all(data)
     }
 }
 
 impl BlockDevice for FileBlockDevice {
     fn read_node(&self, block: u64) -> Result<TreeNode, TreeError> {
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(block * V3_BLOCK_SIZE as u64))
+        let file = unsafe { &mut *self.file.get() };
+        let mut node = TreeNode::default();
+        file.seek(SeekFrom::Start(block * BLOCK_SIZE as u64))
             .map_err(|_| TreeError::IoError)?;
 
-        let mut buf = [0u8; V3_BLOCK_SIZE as usize];
-        file.read_exact(&mut buf).map_err(|_| TreeError::IoError)?;
-
-        // Convert bytes to TreeNode
-        let node = unsafe {
-            std::ptr::read(buf.as_ptr() as *const TreeNode)
+        let node_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut node as *mut TreeNode as *mut u8,
+                BLOCK_SIZE as usize,
+            )
         };
+        file.read_exact(node_bytes).map_err(|_| TreeError::IoError)?;
         Ok(node)
     }
 
     fn write_node(&mut self, block: u64, node: &TreeNode) -> Result<(), TreeError> {
-        self.file.seek(SeekFrom::Start(block * V3_BLOCK_SIZE as u64))
+        let file = unsafe { &mut *self.file.get() };
+        file.seek(SeekFrom::Start(block * BLOCK_SIZE as u64))
             .map_err(|_| TreeError::IoError)?;
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(node as *const _ as *const u8, V3_BLOCK_SIZE as usize)
+        let node_bytes = unsafe {
+            std::slice::from_raw_parts(
+                node as *const TreeNode as *const u8,
+                BLOCK_SIZE as usize,
+            )
         };
-        self.file.write_all(bytes).map_err(|_| TreeError::IoError)?;
+        file.write_all(node_bytes).map_err(|_| TreeError::IoError)?;
         Ok(())
     }
 
     fn sync(&mut self) -> Result<(), TreeError> {
-        self.file.sync_all().map_err(|_| TreeError::IoError)
+        let file = unsafe { &mut *self.file.get() };
+        file.sync_all().map_err(|_| TreeError::IoError)
     }
 }
 
-impl wfs_common::v3::BlockAllocator for FileBlockDevice {
+impl BlockAllocator for FileBlockDevice {
     fn allocate_block(&mut self) -> Result<u64, TreeError> {
-        if self.next_block >= self.total_blocks {
-            return Err(TreeError::NodeFull);
-        }
-        let block = self.next_block;
-        self.next_block += 1;
+        let next_block = unsafe { &mut *self.next_block.get() };
+        let block = *next_block;
+        *next_block += 1;
+
+        // Zero out the new block
+        let zero_block = [0u8; BLOCK_SIZE as usize];
+        self.write_block_raw(block, &zero_block)
+            .map_err(|_| TreeError::IoError)?;
+
         Ok(block)
     }
 
     fn free_block(&mut self, _block: u64) -> Result<(), TreeError> {
-        // For mkfs, we don't need to track frees
+        // For mkfs.wfs, we don't need to track freed blocks since
+        // we're building the filesystem from scratch
         Ok(())
     }
 }
 
-/// Create a v3 filesystem
-fn create_wfs_v3(path: &PathBuf, size: u64, verbose: bool) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    file.set_len(size)?;
+/// Populate WFS filesystem from a source directory
+fn populate_filesystem(
+    device: &mut FileBlockDevice,
+    state: &mut FilesystemState,
+    source_dir: &Path,
+    verbose: bool,
+) -> std::io::Result<()> {
+    let mut file_count = 0;
+    let mut dir_count = 0;
+    let mut skipped_count = 0;
 
-    let total_blocks = size / V3_BLOCK_SIZE as u64;
+    // Helper function to recursively populate
+    fn populate_recursive(
+        device: &mut FileBlockDevice,
+        state: &mut FilesystemState,
+        source_path: &Path,
+        wfs_parent_inode_num: u64,
+        file_count: &mut usize,
+        dir_count: &mut usize,
+        skipped_count: &mut usize,
+        verbose: bool,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(source_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
 
-    if verbose {
-        println!("Creating WFS v3 (CoW) filesystem:");
-        println!("  Total blocks: {}", total_blocks);
+            // Skip special names
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+
+            let metadata = entry.metadata()?;
+
+            if metadata.is_dir() {
+                // Create directory in WFS
+                if let Err(e) = create_directory(device, state, wfs_parent_inode_num, &name_str, verbose) {
+                    eprintln!("Failed to create directory {}: {:?}", name_str, e);
+                    *skipped_count += 1;
+                    continue;
+                }
+
+                *dir_count += 1;
+                if verbose {
+                    println!("  DIR:  {}", name_str);
+                }
+
+                // Get the newly created directory's inode number
+                let dir_inode_num = find_entry_inode(device, state, wfs_parent_inode_num, &name_str)?;
+
+                // Recursively populate subdirectory
+                populate_recursive(device, state, &path, dir_inode_num,
+                                 file_count, dir_count, skipped_count, verbose)?;
+
+            } else if metadata.is_file() {
+                let file_size = metadata.len();
+
+                // Only support small files that fit in inline data
+                if file_size <= INODE_INLINE_SIZE as u64 {
+                    // Read file contents
+                    let mut file_data = Vec::new();
+                    let mut file = File::open(&path)?;
+                    file.read_to_end(&mut file_data)?;
+
+                    // Create file in WFS
+                    if let Err(e) = create_file(device, state, wfs_parent_inode_num,
+                                                &name_str, &file_data, verbose) {
+                        eprintln!("Failed to create file {}: {:?}", name_str, e);
+                        *skipped_count += 1;
+                        continue;
+                    }
+
+                    *file_count += 1;
+                    if verbose {
+                        println!("  FILE: {} ({} bytes)", name_str, file_size);
+                    }
+                } else {
+                    if verbose {
+                        println!("  SKIP: {} ({} bytes, too large)", name_str, file_size);
+                    }
+                    *skipped_count += 1;
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    let mut device = FileBlockDevice::new(file, total_blocks);
+    populate_recursive(device, state, source_dir, ROOT_INODE,
+                      &mut file_count, &mut dir_count, &mut skipped_count, verbose)?;
 
-    // Block layout:
-    // 0: Primary superblock
-    // 1: Backup superblock
-    // 2: Root inode tree node
-    // 3: Free space tree node
-    // 4: Root directory tree node
-    // 5+: Data/tree nodes
+    println!("\nPopulation complete:");
+    println!("  Files:   {}", file_count);
+    println!("  Dirs:    {}", dir_count);
+    println!("  Skipped: {}", skipped_count);
 
-    let root_inode_tree_block = 2u64;
-    let free_tree_block = 3u64;
-    let root_dir_tree_block = 4u64;
-    let data_start = 5u64;
+    Ok(())
+}
 
-    // Create root inode (directory)
-    let mut root_inode = Inode::new_directory(ROOT_INODE);
-    root_inode.extent_root = root_dir_tree_block;
-    root_inode.update_crc();
+/// Find inode number for an entry in a directory
+fn find_entry_inode(
+    device: &mut FileBlockDevice,
+    state: &FilesystemState,
+    parent_inode_num: u64,
+    name: &str,
+) -> std::io::Result<u64> {
+    let dev_ptr = device as *mut FileBlockDevice;
+    let (dev_ref, alloc_ref) = unsafe { (&mut *dev_ptr, &mut *dev_ptr) };
+    let mut ops = TreeOps::new(dev_ref, alloc_ref);
 
-    // Create root inode tree node
-    let mut inode_tree_node = TreeNode::new_leaf(NodeType::Inode, 1);
+    // Get parent inode
+    let parent_inode = InodeOps::lookup(&mut ops, state, parent_inode_num)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Parent not found"))?;
 
-    // Insert root inode into tree
-    // Serialize inode into the tree node data
-    let inode_key_bytes = ROOT_INODE.to_le_bytes();
-    let inode_bytes = unsafe {
-        std::slice::from_raw_parts(&root_inode as *const _ as *const u8,
-            std::mem::size_of::<Inode>())
-    };
+    // Search directory tree
+    let parent_dir_tree = BPlusTree::new(
+        parent_inode.extent_root,
+        NodeType::Directory,
+        state.superblock.root_generation,
+    );
 
-    // Format: [key (8 bytes)][inode (256 bytes)]
-    inode_tree_node.data[0..8].copy_from_slice(&inode_key_bytes);
-    inode_tree_node.data[8..8 + inode_bytes.len()].copy_from_slice(inode_bytes);
-    inode_tree_node.item_count = 1;
+    let entry = DirOps::lookup(&mut ops, &parent_dir_tree, name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Entry not found"))?;
+
+    Ok(entry.inode_num)
+}
+
+/// Create a directory in WFS
+fn create_directory(
+    device: &mut FileBlockDevice,
+    state: &mut FilesystemState,
+    parent_inode_num: u64,
+    name: &str,
+    verbose: bool,
+) -> std::io::Result<()> {
+    let dev_ptr = device as *mut FileBlockDevice;
+    let (dev_ref, alloc_ref) = unsafe { (&mut *dev_ptr, &mut *dev_ptr) };
+    let mut ops = TreeOps::new(dev_ref, alloc_ref);
+
+    // Get parent inode
+    let mut parent_inode = InodeOps::lookup(&mut ops, state, parent_inode_num)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Parent not found"))?;
+
+    // Allocate new inode and directory tree block
+    let inode_num = InodeOps::allocate_inode_num(state);
+    let dir_tree_block = device.allocate_block()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    // Create directory inode
+    let mut dir_inode = Inode::new(inode_num, S_IFDIR | 0o755);
+    dir_inode.extent_root = dir_tree_block;
+    dir_inode.nlink = 2;
+
+    // Create empty directory tree
+    let mut dir_tree_node = TreeNode::new(NodeType::Directory, 0, state.superblock.root_generation);
+    dir_tree_node.update_crc();
+    device.write_node(dir_tree_block, &dir_tree_node)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    // Insert directory inode
+    InodeOps::insert(&mut ops, state, dir_inode)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    // Add entry to parent directory
+    let entry = DirEntry::new(name, inode_num, EntryType::Directory)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Name too long"))?;
+
+    let mut parent_dir_tree = BPlusTree::new(
+        parent_inode.extent_root,
+        NodeType::Directory,
+        state.superblock.root_generation,
+    );
+
+    DirOps::insert(&mut ops, &mut parent_dir_tree, entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    // Update parent inode (CoW may change root)
+    parent_inode.extent_root = parent_dir_tree.root_block;
+    InodeOps::insert(&mut ops, state, parent_inode)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    Ok(())
+}
+
+/// Create a file in WFS with inline data
+fn create_file(
+    device: &mut FileBlockDevice,
+    state: &mut FilesystemState,
+    parent_inode_num: u64,
+    name: &str,
+    data: &[u8],
+    verbose: bool,
+) -> std::io::Result<()> {
+    if data.len() > INODE_INLINE_SIZE {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "File too large"));
+    }
+
+    let dev_ptr = device as *mut FileBlockDevice;
+    let (dev_ref, alloc_ref) = unsafe { (&mut *dev_ptr, &mut *dev_ptr) };
+    let mut ops = TreeOps::new(dev_ref, alloc_ref);
+
+    // Get parent inode
+    let mut parent_inode = InodeOps::lookup(&mut ops, state, parent_inode_num)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Parent not found"))?;
+
+    // Allocate new inode
+    let inode_num = InodeOps::allocate_inode_num(state);
+
+    // Create file inode with inline data
+    let mut file_inode = Inode::new(inode_num, S_IFREG | 0o644);
+    file_inode.size = data.len() as u64;
+    file_inode.inline_size = data.len() as u16;
+    file_inode.inline_data[..data.len()].copy_from_slice(data);
+    file_inode.nlink = 1;
+
+    // Insert file inode
+    InodeOps::insert(&mut ops, state, file_inode)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    // Add entry to parent directory
+    let entry = DirEntry::new(name, inode_num, EntryType::File)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Name too long"))?;
+
+    let mut parent_dir_tree = BPlusTree::new(
+        parent_inode.extent_root,
+        NodeType::Directory,
+        state.superblock.root_generation,
+    );
+
+    DirOps::insert(&mut ops, &mut parent_dir_tree, entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    // Update parent inode (CoW may change root)
+    parent_inode.extent_root = parent_dir_tree.root_block;
+    InodeOps::insert(&mut ops, state, parent_inode)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+
+    Ok(())
+}
+
+fn create_wfs_v1(path: &PathBuf, size: u64, verbose: bool) -> std::io::Result<(FileBlockDevice, FilesystemState)> {
+    let mut device = FileBlockDevice::new(path, size)?;
+    let total_blocks = size / BLOCK_SIZE as u64;
+
+    if verbose {
+        println!("Creating WFS v1 filesystem:");
+        println!("  Total blocks: {}", total_blocks);
+        println!("  Block size: {} bytes", BLOCK_SIZE);
+    }
+
+    // Block allocation:
+    // 0-1: Superblock (primary + backup)
+    // 2: Root inode tree
+    // 3: Free space tree
+    // 4: Root directory tree
+    // 5+: Data blocks
+
+    let root_inode_tree_block = 2;
+    let free_tree_block = 3;
+    let root_dir_tree_block = 4;
+    let data_start = 5;
+    let free_count = total_blocks - data_start;
+
+    // Create empty trees with proper CRCs
+    let mut inode_tree_node = TreeNode::new(NodeType::Inode, 0, 1);
     inode_tree_node.update_crc();
 
-    // Create free space tree node
-    let mut free_tree_node = TreeNode::new_leaf(NodeType::FreeSpace, 1);
-    let free_count = total_blocks.saturating_sub(data_start);
-
-    // Insert free range: key=data_start, value=free_count
-    free_tree_node.data[0..8].copy_from_slice(&data_start.to_le_bytes());
-    free_tree_node.data[8..16].copy_from_slice(&free_count.to_le_bytes());
-    free_tree_node.item_count = 1;
+    let mut free_tree_node = TreeNode::new(NodeType::FreeSpace, 0, 1);
     free_tree_node.update_crc();
 
-    // Create empty root directory tree node
-    let mut dir_tree_node = TreeNode::new_leaf(NodeType::Directory, 1);
-    // Add . and .. entries
-    use wfs_common::v3::dir::{DirEntry, EntryType, dot_entry, dotdot_entry, DIRENTRY_SIZE};
-
-    let dot = dot_entry(ROOT_INODE);
-    let dotdot = dotdot_entry(ROOT_INODE);
-
-    // Insert . entry
-    dir_tree_node.data[0..8].copy_from_slice(&dot.name_hash.to_le_bytes());
-    let dot_bytes = unsafe {
-        std::slice::from_raw_parts(&dot as *const _ as *const u8, DIRENTRY_SIZE)
-    };
-    dir_tree_node.data[8..8 + DIRENTRY_SIZE].copy_from_slice(dot_bytes);
-
-    // Insert .. entry
-    let offset2 = 8 + DIRENTRY_SIZE;
-    dir_tree_node.data[offset2..offset2 + 8].copy_from_slice(&dotdot.name_hash.to_le_bytes());
-    let dotdot_bytes = unsafe {
-        std::slice::from_raw_parts(&dotdot as *const _ as *const u8, DIRENTRY_SIZE)
-    };
-    dir_tree_node.data[offset2 + 8..offset2 + 8 + DIRENTRY_SIZE].copy_from_slice(dotdot_bytes);
-
-    dir_tree_node.item_count = 2;
+    let mut dir_tree_node = TreeNode::new(NodeType::Directory, 0, 1);
     dir_tree_node.update_crc();
 
+    // Create root directory inode
+    let mut root_inode = Inode::new(ROOT_INODE, S_IFDIR | 0o755);
+    root_inode.extent_root = root_dir_tree_block;
+    root_inode.nlink = 2;
+
     // Create superblock
-    let mut superblock = SuperblockV3::new(total_blocks);
+    let mut superblock = Superblock::new(total_blocks);
     superblock.root_tree_block = root_inode_tree_block;
     superblock.free_tree_block = free_tree_block;
     superblock.root_generation = 1;
@@ -655,23 +463,36 @@ fn create_wfs_v3(path: &PathBuf, size: u64, verbose: bool) -> std::io::Result<()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to write dir tree"))?;
 
     // Write superblocks (primary and backup)
-    let mut sb_block = [0u8; V3_BLOCK_SIZE as usize];
+    let mut sb_block = [0u8; BLOCK_SIZE as usize];
     let sb_bytes = unsafe {
         std::slice::from_raw_parts(&superblock as *const _ as *const u8,
-            std::mem::size_of::<SuperblockV3>())
+            std::mem::size_of::<Superblock>())
     };
     sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
 
     device.write_block_raw(0, &sb_block)?;
     device.write_block_raw(1, &sb_block)?;
 
+    // Sync to ensure all writes are flushed before we start using TreeOps
+    device.sync().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Initial sync failed"))?;
+
+    // Create filesystem state
+    let mut state = FilesystemState::new(superblock);
+
+    // Insert root inode into inode tree
+    let dev_ptr = &mut device as *mut FileBlockDevice;
+    let (dev_ref, alloc_ref) = unsafe { (&mut *dev_ptr, &mut *dev_ptr) };
+    let mut ops = TreeOps::new(dev_ref, alloc_ref);
+    InodeOps::insert(&mut ops, &mut state, root_inode)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to insert root inode: {:?}", e)))?;
+
     device.sync().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Sync failed"))?;
 
     if verbose {
-        println!("\nWFS v3 filesystem created successfully!");
+        println!("\nWFS v1 filesystem created successfully!");
     }
 
-    Ok(())
+    Ok((device, state))
 }
 
 fn main() -> std::io::Result<()> {
@@ -686,69 +507,39 @@ fn main() -> std::io::Result<()> {
                                        "Disk size must be at least 1MB"));
     }
 
-    // Dispatch based on version
-    if args.v3 {
-        // Create WFS v3 CoW filesystem
-        println!("Creating WFS v3 (CoW) disk image: {}", args.output.display());
-        println!("  Size: {} bytes ({} blocks)", size, size / V3_BLOCK_SIZE as u64);
+    // Create WFS v1 CoW filesystem
+    println!("Creating WFS v1 (CoW) disk image: {}", args.output.display());
+    println!("  Size: {} bytes ({} blocks)", size, size / BLOCK_SIZE as u64);
 
-        create_wfs_v3(&args.output, size, args.verbose)?;
+    let (mut device, mut state) = create_wfs_v1(&args.output, size, args.verbose)?;
 
-        if args.dir.is_some() {
-            println!("\nNote: v3 directory population not yet implemented.");
-            println!("      Use v2 format or populate files after mounting.");
+    // Add files from directory if specified
+    if let Some(ref dir) = args.dir {
+        if !dir.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                format!("Directory not found: {}", dir.display())));
         }
 
-        println!("\nDone! WFS v3 filesystem created.");
-        return Ok(());
+        println!("\nPopulating filesystem from: {}", dir.display());
+        println!("Note: Only small files (<160 bytes) will be copied.");
+        println!("      Larger files will be skipped.\n");
+
+        populate_filesystem(&mut device, &mut state, dir, args.verbose)?;
+
+        // Write updated superblock
+        let mut sb_block = [0u8; BLOCK_SIZE as usize];
+        let sb_bytes = unsafe {
+            std::slice::from_raw_parts(&state.superblock as *const _ as *const u8,
+                std::mem::size_of::<Superblock>())
+        };
+        sb_block[..sb_bytes.len()].copy_from_slice(sb_bytes);
+        device.write_block_raw(0, &sb_block)?;
+        device.write_block_raw(1, &sb_block)?;
     }
 
-    // Create WFS v2 filesystem (original behavior)
-    let max_files = args.max_files.clamp(MIN_MAX_FILES as u32, MAX_MAX_FILES as u32);
-    let total_blocks = size / BLOCK_SIZE as u64;
+    // Final sync
+    device.sync().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Final sync failed"))?;
 
-    println!("Creating WFS v2 disk image: {}", args.output.display());
-    println!("  Size: {} bytes ({} blocks)", size, total_blocks);
-    println!("  Max files: {}", max_files);
-
-    let layout = DiskLayout::calculate(total_blocks, max_files);
-    println!("  Bitmap: {} blocks @ block {}", layout.bitmap_blocks, layout.bitmap_block);
-    println!("  File table: {} blocks @ block {}", layout.filetable_blocks, layout.filetable_block);
-    println!("  Data starts: block {}", layout.data_start_block);
-    println!("  Backup superblocks: {} and {}", layout.mid_superblock, layout.last_superblock);
-
-    let mut img = WfsImage::create(&args.output, size, max_files)?;
-
-    // Add files from directory if specified (recursively)
-    if let Some(dir) = &args.dir {
-        println!("\nAdding files from: {}", dir.display());
-
-        // Collect all files and directories recursively
-        let mut entries_to_add: Vec<(String, PathBuf, bool)> = Vec::new();
-        collect_files_recursive(dir, dir, &mut entries_to_add)?;
-
-        for (relative_path, full_path, is_dir) in entries_to_add {
-            if is_dir {
-                // Add directory entry
-                img.add_directory(&relative_path, args.verbose)?;
-            } else {
-                // Add file entry
-                let data = fs::read(&full_path)?;
-
-                let mut flags = 0u16;
-                if is_executable(&relative_path) {
-                    flags |= FLAG_EXEC;
-                }
-
-                img.add_file(&relative_path, &data, flags, args.verbose)?;
-            }
-        }
-    }
-
-    img.finalize(args.verbose)?;
-
-    println!("\nDone! {} files written, {} blocks free.",
-             img.file_count,
-             img.layout.total_blocks - img.bitmap.iter().map(|&b| b.count_ones() as u64).sum::<u64>());
+    println!("\nDone! WFS v1 filesystem created.");
     Ok(())
 }

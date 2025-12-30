@@ -140,3 +140,12 @@ debug-input = []
 debug-video = []
 debug-audio = []
 debug-bus = []
+
+# Workspace-wide profile settings
+[profile.dev]
+panic = "abort"
+lto = false
+
+[profile.release]
+panic = "abort"
+lto = false

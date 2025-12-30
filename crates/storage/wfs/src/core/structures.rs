@@ -1,4 +1,4 @@
-//! WFS v3 Core Data Structures
+//! WFS Core Data Structures
 //!
 //! On-disk structures for the Copy-on-Write filesystem.
 
@@ -10,11 +10,11 @@ use crate::crc32;
 // CONSTANTS
 // ============================================================================
 
-/// WFS v3 magic number ("WFS3")
-pub const WFS3_MAGIC: u32 = 0x57465333;
+/// WFS magic number ("WFS")
+pub const WFS_MAGIC: u32 = 0x57465331;
 
 /// Filesystem version
-pub const WFS3_VERSION: u16 = 3;
+pub const WFS_VERSION: u16 = 1;
 
 /// Block size (fixed at 4KB)
 pub const BLOCK_SIZE: u32 = 4096;
@@ -41,8 +41,8 @@ pub const MAX_FILENAME: usize = 255;
 pub const INLINE_DATA_MAX: usize = 160;
 
 // Filesystem signature
-pub const WFS3_SIGNATURE: &[u8; 64] =
-    b"WFS3 CoW FileSystem - Chris Watkins <chris@watkinslabs.com>\0\0\0\0\0";
+pub const WFS_SIGNATURE: &[u8; 64] =
+    b"WFS CoW FileSystem - Chris Watkins <chris@watkinslabs.com>\0\0\0\0\0\0";
 
 // ============================================================================
 // SUPERBLOCK
@@ -54,9 +54,9 @@ pub const WFS3_SIGNATURE: &[u8; 64] =
 /// Updating root_tree_block atomically commits all pending changes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct SuperblockV3 {
+pub struct Superblock {
     // Header (8 bytes)
-    pub magic: u32,                    // "WFS3" (0x57465333)
+    pub magic: u32,                    // "WFS" (0x57465331)
     pub version: u16,                  // Version 3
     pub flags: u16,                    // Mount flags
 
@@ -94,14 +94,14 @@ pub struct SuperblockV3 {
 /// Size of data to CRC (everything before crc32 field)
 pub const SUPERBLOCK_CRC_OFFSET: usize = 248;
 
-impl SuperblockV3 {
+impl Superblock {
     /// Create a new superblock for a disk of given size
     pub fn new(total_blocks: u64) -> Self {
         Self {
-            magic: WFS3_MAGIC,
-            version: WFS3_VERSION,
+            magic: WFS_MAGIC,
+            version: WFS_VERSION,
             flags: 0,
-            signature: *WFS3_SIGNATURE,
+            signature: *WFS_SIGNATURE,
             block_size: BLOCK_SIZE,
             chunk_size: DEFAULT_CHUNK_SIZE,
             total_blocks,
@@ -136,13 +136,13 @@ impl SuperblockV3 {
         self.crc32 == self.calculate_crc()
     }
 
-    /// Check if this is a valid WFS3 superblock
+    /// Check if this is a valid WFS superblock
     pub fn is_valid(&self) -> bool {
-        self.magic == WFS3_MAGIC && self.version == WFS3_VERSION && self.verify_crc()
+        self.magic == WFS_MAGIC && self.version == WFS_VERSION && self.verify_crc()
     }
 }
 
-impl Default for SuperblockV3 {
+impl Default for Superblock {
     fn default() -> Self {
         Self::new(0)
     }
@@ -196,4 +196,4 @@ pub const S_IFMT: u32 = 0o170000;
 // COMPILE-TIME CHECKS
 // ============================================================================
 
-const _: () = assert!(core::mem::size_of::<SuperblockV3>() == SUPERBLOCK_SIZE);
+const _: () = assert!(core::mem::size_of::<Superblock>() == SUPERBLOCK_SIZE);

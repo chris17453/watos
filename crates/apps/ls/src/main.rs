@@ -434,7 +434,7 @@ fn parse_and_display_entries(entries: &[u8], opts: &Options) -> usize {
                 let entry_type = parse_entry_type(line[0]);
 
                 // Find name and size
-                let mut name_start = 2;
+                let name_start = 2;
                 let mut name_end = name_start;
                 while name_end < line.len() && line[name_end] != b' ' {
                     name_end += 1;

@@ -145,11 +145,15 @@ fn to_windows_path(unix_path: &[u8], out: &mut [u8]) -> usize {
 
 #[no_mangle]
 extern "C" fn _start() -> ! {
+    use core::ptr::addr_of_mut;
     static mut ARGS_BUF: [u8; 256] = [0u8; 256];
     static mut CWD_BUF: [u8; 256] = [0u8; 256];
     static mut WIN_BUF: [u8; 256] = [0u8; 256];
 
-    let args_len = unsafe { get_args(&mut ARGS_BUF) };
+    let args_len = unsafe {
+        let buf = &mut *addr_of_mut!(ARGS_BUF);
+        get_args(buf)
+    };
     let args = unsafe { &ARGS_BUF[..args_len] };
 
     let mut opts = Options::new();
@@ -180,7 +184,10 @@ extern "C" fn _start() -> ! {
         }
     }
 
-    let len = unsafe { getcwd(&mut CWD_BUF) };
+    let len = unsafe {
+        let buf = &mut *addr_of_mut!(CWD_BUF);
+        getcwd(buf)
+    };
 
     if len > 0 {
         let cwd = unsafe { &CWD_BUF[..len] };
@@ -189,7 +196,10 @@ extern "C" fn _start() -> ! {
         // For now, -P behaves the same as -L since we don't have that syscall yet
 
         if opts.windows {
-            let win_len = unsafe { to_windows_path(cwd, &mut WIN_BUF) };
+            let win_len = unsafe {
+                let buf = &mut *addr_of_mut!(WIN_BUF);
+                to_windows_path(cwd, buf)
+            };
             write_bytes(unsafe { &WIN_BUF[..win_len] });
         } else {
             write_bytes(cwd);

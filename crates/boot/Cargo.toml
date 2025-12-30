@@ -9,11 +9,3 @@ uefi = "0.23"
 [[bin]]
 name = "bootloader"
 path = "src/main.rs"
-
-[profile.dev]
-panic = "abort"
-lto = false
-
-[profile.release]
-panic = "abort"
-lto = false

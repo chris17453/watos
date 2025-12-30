@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use rust_gwbasic::{Lexer, Parser, Interpreter};
 use rust_gwbasic::platform::{WatosConsole, Console};
+use rust_gwbasic::functions::{WatosDate, WatosTime};
 
 /// Entry point for WATOS executable
 ///
@@ -353,14 +354,22 @@ pub extern "C" fn watos_get_cursor_row() -> u8 {
 
 /// Get current date (year, month, day)
 #[no_mangle]
-pub extern "C" fn watos_get_date() -> (u16, u8, u8) {
-    (2025, 1, 1) // Placeholder
+pub extern "C" fn watos_get_date() -> WatosDate {
+    WatosDate {
+        year: 2025,
+        month: 1,
+        day: 1,
+    }
 }
 
 /// Get current time (hour, minute, second)
 #[no_mangle]
-pub extern "C" fn watos_get_time() -> (u8, u8, u8) {
-    (12, 0, 0) // Placeholder
+pub extern "C" fn watos_get_time() -> WatosTime {
+    WatosTime {
+        hours: 12,
+        minutes: 0,
+        seconds: 0,
+    }
 }
 
 /// Get key without waiting (returns 0 if no key)

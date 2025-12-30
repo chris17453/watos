@@ -129,9 +129,13 @@ fn read_fd(fd: i64, buf: &mut [u8]) -> i64 {
 
 /// Write DOS-style prompt showing current directory (e.g., "C:\>")
 fn write_prompt(console: &mut ConsoleManager) {
+    use core::ptr::addr_of_mut;
     static mut CWD_BUF: [u8; 128] = [0u8; 128];
 
-    let len = unsafe { getcwd(&mut CWD_BUF) };
+    let len = unsafe {
+        let buf = &mut *addr_of_mut!(CWD_BUF);
+        getcwd(buf)
+    };
     if len > 0 {
         let cwd = unsafe { &CWD_BUF[..len] };
         if let Ok(s) = core::str::from_utf8(cwd) {
@@ -210,8 +214,12 @@ fn run_autoexec(console: &mut ConsoleManager, framebuffer: &mut SimpleFramebuffe
     console.render(framebuffer);
 
     // Read the file content
+    use core::ptr::addr_of_mut;
     static mut AUTOEXEC_BUF: [u8; 1024] = [0u8; 1024];
-    let bytes_read = unsafe { read_fd(fd, &mut AUTOEXEC_BUF) };
+    let bytes_read = unsafe {
+        let buf = &mut *addr_of_mut!(AUTOEXEC_BUF);
+        read_fd(fd, buf)
+    };
     close_fd(fd);
 
     if bytes_read <= 0 {
@@ -721,8 +729,12 @@ fn process_command(console: &mut ConsoleManager, cmd: &str) {
         }
         "set" | "env" | "export" => {
             // Show environment variables
+            use core::ptr::addr_of_mut;
             static mut CWD_BUF: [u8; 128] = [0u8; 128];
-            let len = unsafe { getcwd(&mut CWD_BUF) };
+            let len = unsafe {
+                let buf = &mut *addr_of_mut!(CWD_BUF);
+                getcwd(buf)
+            };
 
             console.write_str("CWD=");
             if len > 0 {
