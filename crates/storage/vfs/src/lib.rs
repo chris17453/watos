@@ -39,6 +39,7 @@ pub mod error;
 pub mod pipe;
 pub mod symlink;
 pub mod metadata;
+pub mod permissions;
 
 // Re-export universal path utilities for new code
 // TODO: Migrate VFS path module to use watos-path completely
@@ -51,6 +52,13 @@ pub use path::{Path, PathType, ParsedPath, parse as parse_path, is_drive_letter}
 pub use pipe::{create_pipe, create_pipe_with_capacity, NamedPipe, PIPE_BUF_SIZE};
 pub use symlink::{SymlinkFilesystem, SymlinkTarget, SymlinkResolver, ResolvedPath, ResolveOptions, MAX_SYMLINK_DEPTH};
 pub use metadata::{ExtendedMetadata, ExtendedMetadataFs, FileColor, FileIcon, icon_from_extension, color_from_file};
+pub use permissions::{
+    Credentials, AccessMode, check_permission, can_chmod, can_chown, can_delete,
+    S_IRUSR, S_IWUSR, S_IXUSR, S_IRGRP, S_IWGRP, S_IXGRP, S_IROTH, S_IWOTH, S_IXOTH,
+    S_ISUID, S_ISGID, S_ISVTX, S_IRWXU, S_IRWXG, S_IRWXO,
+    S_IFMT, S_IFREG, S_IFDIR, S_IFLNK, S_IFBLK, S_IFCHR, S_IFIFO, S_IFSOCK,
+    NGROUPS_MAX, format_mode_octal, format_mode_string,
+};
 
 /// Maximum path length
 pub const MAX_PATH: usize = 256;
@@ -108,6 +116,22 @@ pub trait Filesystem: Send + Sync {
 
     /// Get filesystem statistics
     fn statfs(&self) -> VfsResult<FsStats>;
+
+    /// Change file mode (permissions)
+    ///
+    /// Default implementation returns NotSupported for filesystems
+    /// that don't support permission changes.
+    fn chmod(&self, _path: &str, _mode: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// Change file owner and group
+    ///
+    /// Default implementation returns NotSupported for filesystems
+    /// that don't support ownership changes.
+    fn chown(&self, _path: &str, _uid: u32, _gid: u32) -> VfsResult<()> {
+        Err(VfsError::NotSupported)
+    }
 
     // Compatibility methods for legacy code
 
@@ -306,6 +330,18 @@ impl Vfs {
 
         old_fs.rename(&old_rel, &new_rel)
     }
+
+    /// Change file mode (permissions)
+    pub fn chmod(&self, path: &str, mode: u32) -> VfsResult<()> {
+        let (fs, rel_path) = self.resolve(path)?;
+        fs.chmod(&rel_path, mode)
+    }
+
+    /// Change file owner and group
+    pub fn chown(&self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
+        let (fs, rel_path) = self.resolve(path)?;
+        fs.chown(&rel_path, uid, gid)
+    }
 }
 
 impl Default for Vfs {
@@ -384,6 +420,24 @@ pub fn readdir(path: &str) -> VfsResult<Vec<DirEntry>> {
     let vfs = VFS.lock();
     match vfs.as_ref() {
         Some(v) => v.readdir(path),
+        None => Err(VfsError::NotInitialized),
+    }
+}
+
+/// Change file mode (permissions)
+pub fn chmod(path: &str, mode: u32) -> VfsResult<()> {
+    let vfs = VFS.lock();
+    match vfs.as_ref() {
+        Some(v) => v.chmod(path, mode),
+        None => Err(VfsError::NotInitialized),
+    }
+}
+
+/// Change file owner and group
+pub fn chown(path: &str, uid: u32, gid: u32) -> VfsResult<()> {
+    let vfs = VFS.lock();
+    match vfs.as_ref() {
+        Some(v) => v.chown(path, uid, gid),
         None => Err(VfsError::NotInitialized),
     }
 }

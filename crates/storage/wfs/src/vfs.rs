@@ -157,6 +157,41 @@ impl<D: BlockDevice + Send + Sync + 'static> WfsInner<D> {
         Err(VfsError::NotFound)
     }
 
+    /// Write a file entry back to disk
+    fn write_file_entry(&mut self, index: usize, entry: &FileEntry) -> VfsResult<()> {
+        let entries_per_block = ENTRIES_PER_BLOCK;
+        let filetable_start = self.superblock.filetable_block;
+
+        let block_idx = index / entries_per_block;
+        let entry_idx = index % entries_per_block;
+        let block_num = filetable_start + block_idx as u64;
+
+        // Read the entire block
+        let mut block_buf = [0u8; 4096];
+        for i in 0..8u64 {
+            let sector = block_num * 8 + i;
+            if self.device.read_sectors(sector, &mut block_buf[i as usize * 512..(i as usize + 1) * 512]).is_err() {
+                return Err(VfsError::IoError);
+            }
+        }
+
+        // Update the entry in the buffer
+        let offset = entry_idx * 128; // FILEENTRY_SIZE
+        unsafe {
+            core::ptr::write(block_buf[offset..].as_mut_ptr() as *mut FileEntry, *entry);
+        }
+
+        // Write the block back
+        for i in 0..8u64 {
+            let sector = block_num * 8 + i;
+            if self.device.write_sectors(sector, &block_buf[i as usize * 512..(i as usize + 1) * 512]).is_err() {
+                return Err(VfsError::IoError);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Read file data
     fn read_file_data(&mut self, entry: &FileEntry, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if offset >= entry.size {
@@ -266,6 +301,15 @@ impl<D: BlockDevice + Send + Sync + 'static> Filesystem for WfsFilesystem<D> {
 
         let (_index, entry) = inner.find_file(path)?;
 
+        // Use stored mode, or derive from readonly flag if mode is 0 (legacy)
+        let mode = if entry.mode != 0 {
+            entry.mode
+        } else if entry.is_readonly() {
+            0o444
+        } else {
+            0o644
+        };
+
         Ok(FileStat {
             file_type: if entry.is_directory() {
                 FileType::Directory
@@ -276,9 +320,9 @@ impl<D: BlockDevice + Send + Sync + 'static> Filesystem for WfsFilesystem<D> {
             nlink: 1,
             inode: entry.start_block,
             dev: 0,
-            mode: if entry.is_readonly() { 0o444 } else { 0o644 },
-            uid: 0,
-            gid: 0,
+            mode,
+            uid: entry.uid,
+            gid: entry.gid,
             blksize: BLOCK_SIZE,
             blocks: entry.blocks as u64,
             atime: 0,
@@ -459,6 +503,45 @@ impl<D: BlockDevice + Send + Sync + 'static> Filesystem for WfsFilesystem<D> {
             free_inodes: inner.superblock.max_files as u64 - inner.superblock.root_files as u64,
             max_name_len: 56,
         })
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> VfsResult<()> {
+        let mut inner = self.inner.lock();
+
+        let path = path.trim_start_matches('/').trim_start_matches('\\');
+        if path.is_empty() {
+            return Err(VfsError::PermissionDenied); // Can't chmod root
+        }
+
+        let (index, mut entry) = inner.find_file(path)?;
+
+        // Update mode (only permission bits, preserve file type)
+        entry.mode = mode & 0o7777;
+
+        // Write back the entry
+        inner.write_file_entry(index, &entry)?;
+
+        Ok(())
+    }
+
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
+        let mut inner = self.inner.lock();
+
+        let path = path.trim_start_matches('/').trim_start_matches('\\');
+        if path.is_empty() {
+            return Err(VfsError::PermissionDenied); // Can't chown root
+        }
+
+        let (index, mut entry) = inner.find_file(path)?;
+
+        // Update ownership
+        entry.uid = uid;
+        entry.gid = gid;
+
+        // Write back the entry
+        inner.write_file_entry(index, &entry)?;
+
+        Ok(())
     }
 }
 

@@ -1291,6 +1291,13 @@ mod syscall {
     pub const SYS_GETUID: u64 = 122;
     pub const SYS_GETGID: u64 = 123;
     pub const SYS_SETGID: u64 = 124;
+    pub const SYS_GETEUID: u64 = 126;
+    pub const SYS_GETEGID: u64 = 127;
+
+    // Permission operations
+    pub const SYS_CHMOD: u64 = 140;
+    pub const SYS_CHOWN: u64 = 141;
+    pub const SYS_ACCESS: u64 = 142;
 
     // Console session management
     pub const SYS_SESSION_CREATE: u64 = 130;
@@ -2622,11 +2629,160 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_SETGID => {
             // arg1 = GID to set
             let gid = arg1 as u32;
-            
+
             if watos_process::set_current_gid(gid) {
                 0
             } else {
                 u64::MAX
+            }
+        }
+
+        syscall::SYS_GETEUID => {
+            // Returns effective UID (same as UID for now - no setuid support)
+            watos_process::get_current_uid() as u64
+        }
+
+        syscall::SYS_GETEGID => {
+            // Returns effective GID (same as GID for now - no setgid support)
+            watos_process::get_current_gid() as u64
+        }
+
+        syscall::SYS_CHMOD => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = mode
+            // Returns 0 on success, u64::MAX on error
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let mode = arg3 as u32;
+
+            if path_ptr.is_null() || path_len == 0 || path_len > 256 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory
+            let mut path_buf = [0u8; 256];
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_ptr, path_buf.as_mut_ptr(), path_len);
+            }
+
+            let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+                Ok(s) => s,
+                Err(_) => return u64::MAX,
+            };
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            let result = watos_vfs::chmod(path_str, mode);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            match result {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+
+        syscall::SYS_CHOWN => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = uid
+            // r10 = gid
+            // Returns 0 on success, u64::MAX on error
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let uid = arg3 as u32;
+            let gid = unsafe { SAVED_SYSCALL_REGS.r10 as u32 };
+
+            if path_ptr.is_null() || path_len == 0 || path_len > 256 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory
+            let mut path_buf = [0u8; 256];
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_ptr, path_buf.as_mut_ptr(), path_len);
+            }
+
+            let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+                Ok(s) => s,
+                Err(_) => return u64::MAX,
+            };
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            let result = watos_vfs::chown(path_str, uid, gid);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            match result {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+
+        syscall::SYS_ACCESS => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = access mode (F_OK=0, R_OK=4, W_OK=2, X_OK=1)
+            // Returns 0 if access allowed, u64::MAX if denied
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let _access_mode = arg3 as u32;
+
+            if path_ptr.is_null() || path_len == 0 || path_len > 256 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory
+            let mut path_buf = [0u8; 256];
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_ptr, path_buf.as_mut_ptr(), path_len);
+            }
+
+            let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+                Ok(s) => s,
+                Err(_) => return u64::MAX,
+            };
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            // For now, just check if path exists using stat
+            // Full permission checking will be added in VFS layer
+            let result = watos_vfs::stat(path_str);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            match result {
+                Ok(_) => 0, // File exists
+                Err(_) => u64::MAX,
             }
         }
 

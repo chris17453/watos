@@ -294,7 +294,11 @@ pub struct FileEntry {
     pub modified: u64,               // 8 bytes  - Modification timestamp (reserved)
     pub crc32: u32,                  // 4 bytes  - CRC of entry
     pub data_crc32: u32,             // 4 bytes  - CRC of file data
-    pub reserved: [u8; 24],          // 24 bytes - Future use
+    // Permission fields (previously in reserved)
+    pub mode: u32,                   // 4 bytes  - Unix permission bits (rwxrwxrwx)
+    pub uid: u32,                    // 4 bytes  - Owner user ID
+    pub gid: u32,                    // 4 bytes  - Owner group ID
+    pub reserved: [u8; 12],          // 12 bytes - Future use
 }
 
 pub const FILEENTRY_SIZE: usize = 128;
@@ -313,7 +317,10 @@ impl Default for FileEntry {
             modified: 0,
             crc32: 0,
             data_crc32: 0,
-            reserved: [0; 24],
+            mode: 0o644,  // Default: rw-r--r--
+            uid: 0,
+            gid: 0,
+            reserved: [0; 12],
         }
     }
 }
