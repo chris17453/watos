@@ -54,6 +54,12 @@ Cargo.lock
 *.lib
 *.dylib
 
+# Executables (should be built, not stored)
+*.EXE
+*.exe
+/rootfs/**/*.EXE
+/rootfs/**/*.exe
+
 # Logs
 *.log
 /ai-temp/logs/
