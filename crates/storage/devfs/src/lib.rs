@@ -244,4 +244,14 @@ impl Filesystem for DevFs {
             max_name_len: 255,
         })
     }
+
+    fn chmod(&self, _path: &str, _mode: u32) -> VfsResult<()> {
+        // devfs is a virtual filesystem - doesn't support permissions
+        Err(VfsError::NotSupported)
+    }
+
+    fn chown(&self, _path: &str, _uid: u32, _gid: u32) -> VfsResult<()> {
+        // devfs is a virtual filesystem - doesn't support ownership
+        Err(VfsError::NotSupported)
+    }
 }
