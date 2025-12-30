@@ -114,10 +114,14 @@ if [ "$VERBOSE" = true ]; then
     CARGO_FLAGS="$CARGO_FLAGS --verbose"
 fi
 
+# Common RUSTFLAGS to suppress unused variable warnings and mutable static references
+COMMON_RUSTFLAGS="-A unused_variables -A dead_code -A static_mut_refs -A unused_imports"
+
 # Step 1: Build kernel (main package at root)
 log "Building kernel (target: x86_64-unknown-none)..."
 cd "$PROJECT_ROOT"
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS --target x86_64-unknown-none -p watos 2>&1; then
+KERNEL_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/src/linker.ld -C relocation-model=static"
+if RUSTFLAGS="$KERNEL_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS --target x86_64-unknown-none -p watos 2>&1; then
     success "Kernel build complete"
 else
     error "Kernel build failed"
@@ -155,7 +159,7 @@ success "Kernel binary extracted: kernel.bin ($(du -h "$PROJECT_ROOT/kernel.bin"
 # Step 3: Build bootloader
 log "Building UEFI bootloader (target: x86_64-unknown-uefi)..."
 cd "$PROJECT_ROOT"
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS --target x86_64-unknown-uefi -p bootloader --manifest-path crates/boot/Cargo.toml 2>&1; then
+if RUSTFLAGS="$COMMON_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS --target x86_64-unknown-uefi -p bootloader --manifest-path crates/boot/Cargo.toml 2>&1; then
     success "Bootloader build complete"
 else
     error "Bootloader build failed"
@@ -209,7 +213,7 @@ log "Building GWBASIC for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/gwbasic"
 
 # Build the library
-if CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
+if RUSTFLAGS="$COMMON_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
     --features watos \
@@ -220,7 +224,7 @@ else
 fi
 
 # Build the executable binary with linker script for proper load address (0x400000)
-GWBASIC_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/gwbasic/linker.ld -C relocation-model=static"
+GWBASIC_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/gwbasic/linker.ld -C relocation-model=static"
 if RUSTFLAGS="$GWBASIC_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
@@ -235,11 +239,13 @@ if RUSTFLAGS="$GWBASIC_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo 
     fi
 
     if [ -f "$GWBASIC_BIN" ]; then
-        # Copy to rootfs root (mkfs_wfs doesn't support subdirs yet)
-        cp "$GWBASIC_BIN" "$PROJECT_ROOT/rootfs/GWBASIC.EXE"
+        # Copy to system apps directory
+        mkdir -p "$PROJECT_ROOT/rootfs/apps/system"
+        cp "$GWBASIC_BIN" "$PROJECT_ROOT/rootfs/apps/system/gwbasic"
         # Also copy to uefi_test for FAT filesystem boot
-        cp "$GWBASIC_BIN" "$PROJECT_ROOT/uefi_test/GWBASIC.EXE"
-        success "GWBASIC binary built and copied to rootfs and uefi_test ($(du -h "$GWBASIC_BIN" | cut -f1))"
+        mkdir -p "$PROJECT_ROOT/uefi_test/apps/system"
+        cp "$GWBASIC_BIN" "$PROJECT_ROOT/uefi_test/apps/system/gwbasic"
+        success "gwbasic binary built and copied to apps/system ($(du -h "$GWBASIC_BIN" | cut -f1))"
     fi
 else
     echo -e "${YELLOW}[WARN]${NC} GWBASIC binary build failed (optional)"
@@ -255,7 +261,7 @@ log "Building echo for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/echo"
 
 # Build with linker script for proper load address (0x1000000 = 16MB, avoids kernel at 0x100000)
-ECHO_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/echo/src/linker.ld -C relocation-model=static"
+ECHO_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/echo/src/linker.ld -C relocation-model=static"
 if RUSTFLAGS="$ECHO_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
@@ -282,7 +288,7 @@ log "Building date for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/date"
 
 # Build with linker script for proper load address (0x1000000 = 16MB, avoids kernel at 0x100000)
-DATE_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/date/src/linker.ld -C relocation-model=static"
+DATE_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/date/src/linker.ld -C relocation-model=static"
 if RUSTFLAGS="$DATE_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --no-default-features \
@@ -308,7 +314,7 @@ cd "$PROJECT_ROOT"
 log "Building clear for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/clear"
 
-CLEAR_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+CLEAR_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$CLEAR_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin clear 2>&1; then
@@ -333,7 +339,7 @@ cd "$PROJECT_ROOT"
 log "Building uname for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/uname"
 
-UNAME_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+UNAME_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$UNAME_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin uname 2>&1; then
@@ -358,7 +364,7 @@ cd "$PROJECT_ROOT"
 log "Building uptime for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/uptime"
 
-UPTIME_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+UPTIME_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$UPTIME_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin uptime 2>&1; then
@@ -383,7 +389,7 @@ cd "$PROJECT_ROOT"
 log "Building ps for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/ps"
 
-PS_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+PS_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$PS_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin ps 2>&1; then
@@ -408,7 +414,7 @@ cd "$PROJECT_ROOT"
 log "Building drives for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/drives"
 
-DRIVES_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+DRIVES_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$DRIVES_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin drives 2>&1; then
@@ -433,7 +439,7 @@ cd "$PROJECT_ROOT"
 log "Building ls for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/ls"
 
-LS_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+LS_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$LS_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin ls 2>&1; then
@@ -458,7 +464,7 @@ cd "$PROJECT_ROOT"
 log "Building mem for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/mem"
 
-MEM_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+MEM_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$MEM_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin mem 2>&1; then
@@ -483,7 +489,7 @@ cd "$PROJECT_ROOT"
 log "Building pwd for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/pwd"
 
-PWD_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+PWD_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$PWD_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin pwd 2>&1; then
@@ -508,7 +514,7 @@ cd "$PROJECT_ROOT"
 log "Building cd for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/cd"
 
-CD_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+CD_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$CD_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin cd 2>&1; then
@@ -533,7 +539,7 @@ cd "$PROJECT_ROOT"
 log "Building mkdir for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/mkdir"
 
-MKDIR_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+MKDIR_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
 if RUSTFLAGS="$MKDIR_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin mkdir 2>&1; then
@@ -583,7 +589,7 @@ for app_dir in "$PROJECT_ROOT/crates/apps"/*; do
         log "Building $app_name for WATOS..."
         cd "$app_dir"
 
-        APP_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
+        APP_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/watos-app.ld -C relocation-model=static"
         if RUSTFLAGS="$APP_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
             --target x86_64-unknown-none \
             --bin "$app_name" 2>&1; then
@@ -611,7 +617,7 @@ log "Building console (TERM.EXE) for WATOS..."
 cd "$PROJECT_ROOT/crates/apps/console"
 
 # Build with linker script for proper load address (0x400000)
-CONSOLE_RUSTFLAGS="-C link-arg=-T$PROJECT_ROOT/crates/apps/console/linker.ld -C relocation-model=static"
+CONSOLE_RUSTFLAGS="$COMMON_RUSTFLAGS -C link-arg=-T$PROJECT_ROOT/crates/apps/console/linker.ld -C relocation-model=static"
 if RUSTFLAGS="$CONSOLE_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo build $CARGO_FLAGS \
     --target x86_64-unknown-none \
     --bin console 2>&1; then
@@ -624,13 +630,13 @@ if RUSTFLAGS="$CONSOLE_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo 
     fi
 
     if [ -f "$CONSOLE_BIN" ]; then
-        # Create SYSTEM folder for system apps
-        mkdir -p "$PROJECT_ROOT/rootfs/SYSTEM"
-        mkdir -p "$PROJECT_ROOT/uefi_test/SYSTEM"
-        # Copy as TERM.EXE - the terminal emulator (autostart)
-        cp "$CONSOLE_BIN" "$PROJECT_ROOT/rootfs/SYSTEM/TERM.EXE"
-        cp "$CONSOLE_BIN" "$PROJECT_ROOT/uefi_test/SYSTEM/TERM.EXE"
-        success "Console (SYSTEM/TERM.EXE) built and copied to rootfs and uefi_test ($(du -h "$CONSOLE_BIN" | cut -f1))"
+        # Create system folder for system apps
+        mkdir -p "$PROJECT_ROOT/rootfs/system"
+        mkdir -p "$PROJECT_ROOT/uefi_test/system"
+        # Copy as term - the terminal emulator (autostart)
+        cp "$CONSOLE_BIN" "$PROJECT_ROOT/rootfs/system/term"
+        cp "$CONSOLE_BIN" "$PROJECT_ROOT/uefi_test/system/term"
+        success "Console (system/term) built and copied to rootfs and uefi_test ($(du -h "$CONSOLE_BIN" | cut -f1))"
     fi
 else
     echo -e "${YELLOW}[WARN]${NC} Console binary build failed (optional)"
@@ -689,8 +695,9 @@ if [ -f "$MKFS_WFS" ]; then
     [ -f "$PROJECT_ROOT/rootfs/CONFIG.SYS" ] || echo "REM WATOS Configuration" > "$PROJECT_ROOT/rootfs/CONFIG.SYS"
     [ -f "$PROJECT_ROOT/rootfs/AUTOEXEC.BAT" ] || echo "@ECHO WATOS Ready" > "$PROJECT_ROOT/rootfs/AUTOEXEC.BAT"
 
+    # Create WFS disk image (CoW filesystem with B+ trees - supports millions of files)
     "$MKFS_WFS" -o "$PROJECT_ROOT/output/watos.img" -s 64M -d "$PROJECT_ROOT/rootfs"
-    success "WFS disk image created: output/watos.img"
+    success "WFS disk image created: output/watos.img (populated from rootfs)"
 fi
 
 END_TIME=$(date +%s)
@@ -714,11 +721,11 @@ fi
 
 echo ""
 echo "Built Applications:"
-if [ -f "$PROJECT_ROOT/rootfs/SYSTEM/TERM.EXE" ]; then
-    echo "  - SYSTEM/TERM.EXE  (Terminal emulator - autostart)"
+if [ -f "$PROJECT_ROOT/rootfs/system/term" ]; then
+    echo "  - system/term         (Terminal emulator - autostart)"
 fi
-if [ -f "$PROJECT_ROOT/rootfs/GWBASIC.EXE" ]; then
-    echo "  - GWBASIC.EXE      (GWBASIC interpreter)"
+if [ -f "$PROJECT_ROOT/rootfs/apps/system/gwbasic" ]; then
+    echo "  - apps/system/gwbasic (GWBASIC interpreter)"
 fi
 if [ -f "$PROJECT_ROOT/rootfs/ECHO.EXE" ]; then
     echo "  - ECHO.EXE         (Echo utility)"
@@ -732,12 +739,12 @@ for app_file in "$PROJECT_ROOT/rootfs"/*.EXE; do
         fi
     fi
 done
-# Show SYSTEM folder apps
-for app_file in "$PROJECT_ROOT/rootfs/SYSTEM"/*.EXE; do
+# Show system folder apps
+for app_file in "$PROJECT_ROOT/rootfs/system"/*; do
     if [ -f "$app_file" ]; then
         app_filename=$(basename "$app_file")
-        if [ "$app_filename" != "TERM.EXE" ]; then
-            echo "  - SYSTEM/$app_filename"
+        if [ "$app_filename" != "term" ]; then
+            echo "  - system/$app_filename"
         fi
     fi
 done
