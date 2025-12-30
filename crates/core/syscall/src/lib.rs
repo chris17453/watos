@@ -88,6 +88,11 @@ pub mod numbers {
     pub const SYS_MKFIFO: u32 = 88;        // Create named pipe (FIFO)
     pub const SYS_STATFS: u32 = 89;        // Get filesystem statistics
 
+    // Permission operations
+    pub const SYS_CHMOD: u32 = 140;        // Change file mode (path, mode)
+    pub const SYS_CHOWN: u32 = 141;        // Change file owner (path, uid, gid)
+    pub const SYS_ACCESS: u32 = 142;       // Check file access (path, mode)
+
     // Process execution
     pub const SYS_EXEC: u32 = 80;          // Execute program (replace current process)
     pub const SYS_SPAWN: u32 = 81;         // Spawn new process
@@ -113,6 +118,10 @@ pub mod numbers {
     pub const SYS_GETGID: u32 = 123;       // Get current group ID
     pub const SYS_SETGID: u32 = 124;       // Set current group ID
     pub const SYS_GET_USER_INFO: u32 = 125; // Get user information by UID
+    pub const SYS_GETEUID: u32 = 126;      // Get effective user ID
+    pub const SYS_GETEGID: u32 = 127;      // Get effective group ID
+    pub const SYS_SETEUID: u32 = 128;      // Set effective user ID
+    pub const SYS_SETEGID: u32 = 129;      // Set effective group ID
     
     // Console session management
     pub const SYS_SESSION_CREATE: u32 = 130; // Create new console session

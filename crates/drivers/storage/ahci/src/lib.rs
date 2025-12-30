@@ -334,7 +334,7 @@ impl AhciDriver {
 
     /// Get disk info via IDENTIFY command
     pub fn identify(&mut self) -> Result<DiskInfo, DriverError> {
-        let mut buffer = [0u8; 512];
+        let buffer = [0u8; 512];
 
         self.issue_command(ATA_CMD_IDENTIFY, 0, 1, buffer.as_ptr() as u64, false)?;
 

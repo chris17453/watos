@@ -10,10 +10,3 @@ path = "src/main.rs"
 [dependencies]
 watos-syscall = { path = "../../core/syscall" }
 
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = "z"
-lto = true

@@ -61,16 +61,16 @@ impl BlockAllocator for MockBlockDevice {
 
 #[test]
 fn test_superblock_new() {
-    let sb = SuperblockV3::new(1000);
-    assert_eq!(sb.magic, WFS3_MAGIC);
-    assert_eq!(sb.version, WFS3_VERSION);
+    let sb = Superblock::new(1000);
+    assert_eq!(sb.magic, WFS_MAGIC);
+    assert_eq!(sb.version, WFS_VERSION);
     assert_eq!(sb.total_blocks, 1000);
     assert_eq!(sb.block_size, BLOCK_SIZE);
 }
 
 #[test]
 fn test_superblock_crc() {
-    let mut sb = SuperblockV3::new(1000);
+    let mut sb = Superblock::new(1000);
     sb.update_crc();
     assert!(sb.verify_crc());
 
@@ -85,7 +85,7 @@ fn test_superblock_crc() {
 
 #[test]
 fn test_superblock_is_valid() {
-    let mut sb = SuperblockV3::new(1000);
+    let mut sb = Superblock::new(1000);
     sb.update_crc();
     assert!(sb.is_valid());
 
@@ -97,7 +97,7 @@ fn test_superblock_is_valid() {
 
 #[test]
 fn test_superblock_size() {
-    assert_eq!(std::mem::size_of::<SuperblockV3>(), SUPERBLOCK_SIZE);
+    assert_eq!(std::mem::size_of::<Superblock>(), SUPERBLOCK_SIZE);
 }
 
 // ============================================================================
@@ -726,7 +726,7 @@ fn test_transaction_abort() {
 
 #[test]
 fn test_filesystem_state_new() {
-    let sb = SuperblockV3::new(1000);
+    let sb = Superblock::new(1000);
     let state = FilesystemState::new(sb);
 
     assert!(!state.has_active_transaction());

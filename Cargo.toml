@@ -23,6 +23,9 @@ watos-console = { path = "crates/sys/console" }
 # Virtual terminal subsystem
 watos-vt = { path = "crates/sys/vt" }
 
+# Readline
+watos-readline = { path = "crates/sys/readline" }
+
 # Drivers
 watos-driver-traits = { path = "crates/drivers/traits" }
 watos-driver-pci = { path = "crates/drivers/bus/pci" }
@@ -81,6 +84,7 @@ members = [
     # System services
     "crates/sys/console",
     "crates/sys/process",
+    "crates/sys/readline",
     "crates/sys/runtime",
     "crates/sys/terminal",
     "crates/sys/users",
@@ -136,3 +140,12 @@ debug-input = []
 debug-video = []
 debug-audio = []
 debug-bus = []
+
+# Workspace-wide profile settings
+[profile.dev]
+panic = "abort"
+lto = false
+
+[profile.release]
+panic = "abort"
+lto = false

@@ -41,7 +41,7 @@ pub struct BootInfo {
     pub framebuffer_pitch: u32,    // Bytes per scanline
     pub framebuffer_bpp: u32,      // Bits per pixel
     pub pixel_format: u32,         // 0=RGB, 1=BGR
-    pub init_app_addr: u64,        // Address of loaded init app (TERM.EXE)
+    pub init_app_addr: u64,        // Address of loaded init app (term)
     pub init_app_size: u64,        // Size of init app in bytes
     pub app_count: u32,            // Number of preloaded apps
     pub _pad: u32,                 // Padding for alignment
@@ -110,14 +110,14 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     writeln!(system_table.stdout(), "Allocated kernel memory at 0x{:x}", kernel_addr)
         .unwrap();
 
-    // Load SYSTEM/TERM.EXE from the boot filesystem
+    // Load system/term from the boot filesystem
     let (init_app_addr, init_app_size) = load_init_app(&mut system_table);
 
     if init_app_addr != 0 {
-        writeln!(system_table.stdout(), "Loaded SYSTEM/TERM.EXE at 0x{:x} ({} bytes)",
+        writeln!(system_table.stdout(), "Loaded system/term at 0x{:x} ({} bytes)",
                  init_app_addr, init_app_size).unwrap();
     } else {
-        writeln!(system_table.stdout(), "Warning: SYSTEM/TERM.EXE not found").unwrap();
+        writeln!(system_table.stdout(), "Warning: system/term not found").unwrap();
     }
 
     // Load apps from /apps/system
@@ -179,7 +179,7 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     kernel_entry();
 }
 
-/// Load SYSTEM/TERM.EXE from the boot filesystem
+/// Load system/term from the boot filesystem
 fn load_init_app(system_table: &mut SystemTable<Boot>) -> (u64, u64) {
     // Get the filesystem handle
     let fs_handle = match system_table
@@ -204,8 +204,8 @@ fn load_init_app(system_table: &mut SystemTable<Boot>) -> (u64, u64) {
         Err(_) => return (0, 0),
     };
 
-    // Open SYSTEM directory
-    let system_dir_handle = match root.open(cstr16!("SYSTEM"), FileMode::Read, FileAttribute::empty()) {
+    // Open system directory
+    let system_dir_handle = match root.open(cstr16!("system"), FileMode::Read, FileAttribute::empty()) {
         Ok(h) => h,
         Err(_) => return (0, 0),
     };
@@ -215,8 +215,8 @@ fn load_init_app(system_table: &mut SystemTable<Boot>) -> (u64, u64) {
         _ => return (0, 0),
     };
 
-    // Open TERM.EXE
-    let term_handle = match system_dir.open(cstr16!("TERM.EXE"), FileMode::Read, FileAttribute::empty()) {
+    // Open term
+    let term_handle = match system_dir.open(cstr16!("term"), FileMode::Read, FileAttribute::empty()) {
         Ok(h) => h,
         Err(_) => return (0, 0),
     };
@@ -267,7 +267,7 @@ fn load_system_apps(system_table: &mut SystemTable<Boot>) -> (u32, [PreloadedApp
     let mut apps = [PreloadedApp::empty(); MAX_PRELOADED_APPS];
     let mut count = 0u32;
 
-    // Starting address for system apps (after TERM.EXE at 0x600000, give it 256KB)
+    // Starting address for system apps (after term at 0x600000, give it 256KB)
     let mut next_addr: u64 = 0x700000;
 
     // Get the filesystem handle

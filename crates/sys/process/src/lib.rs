@@ -411,37 +411,42 @@ pub fn resume_parent() -> ! {
             loop { core::arch::asm!("hlt"); }
         }
 
-        let ctx = PARENT_CONTEXT;
-        PARENT_CONTEXT.valid = false;
-        CURRENT_PROCESS = Some(ctx.parent_pid);
+        // Extract values we need before switching CR3
+        let parent_pid = PARENT_CONTEXT.parent_pid;
+        let parent_pml4 = PARENT_CONTEXT.parent_pml4;
 
         debug_serial(b"[PROCESS] Resuming parent PID=");
-        debug_hex(ctx.parent_pid as u64);
+        debug_hex(parent_pid as u64);
         debug_serial(b" RIP=");
-        debug_hex(ctx.rip);
+        debug_hex(PARENT_CONTEXT.rip);
         debug_serial(b" RSP=");
-        debug_hex(ctx.rsp);
+        debug_hex(PARENT_CONTEXT.rsp);
         debug_serial(b" PML4=");
-        debug_hex(ctx.parent_pml4);
+        debug_hex(parent_pml4);
         debug_serial(b"\r\n");
 
-        // Restore parent's kernel stack for interrupts
+        PARENT_CONTEXT.valid = false;
+        CURRENT_PROCESS = Some(parent_pid);
+
+        // Calculate parent's kernel stack
         const KERNEL_STACK_SIZE: usize = 0x10000;
-        let kernel_stack_base = 0x280000 + (ctx.parent_pid as usize * KERNEL_STACK_SIZE);
+        let kernel_stack_base = 0x280000 + (parent_pid as usize * KERNEL_STACK_SIZE);
         let kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
         watos_arch::tss::set_kernel_stack(kernel_stack_top as u64);
 
-        // Switch back to parent's page table
-        watos_mem::paging::load_cr3(ctx.parent_pml4);
-
         let user_ds = watos_arch::gdt::selectors::USER_DATA as u64;
 
-        // Build IRETQ frame on stack
-        // We must do this carefully to avoid running out of registers
-        // Stack frame (from top): SS, RSP, RFLAGS, CS, RIP
+        // CRITICAL: Switch to parent's kernel stack AND page table, THEN build IRETQ frame
+        // We must do this atomically to avoid stack/page table mismatch
         core::arch::asm!(
-            // Save ctx pointer in r15 for later access
-            "mov r15, {ctx_ptr}",
+            // Load ctx pointer from global (mapped in all page tables)
+            "lea r15, [rip + {parent_ctx}]",
+
+            // Switch to parent's kernel stack BEFORE changing CR3
+            "mov rsp, {kernel_stack}",
+
+            // NOW switch to parent's page table
+            "mov cr3, {parent_pml4}",
 
             // Set up segments
             "mov ax, {ds:x}",
@@ -450,7 +455,7 @@ pub fn resume_parent() -> ! {
             "mov fs, ax",
             "mov gs, ax",
 
-            // Build IRETQ frame
+            // Build IRETQ frame on parent's kernel stack
             "push qword ptr [r15 + {off_ss}]",      // SS
             "push qword ptr [r15 + {off_rsp}]",     // RSP
             "push qword ptr [r15 + {off_rflags}]",  // RFLAGS
@@ -479,7 +484,9 @@ pub fn resume_parent() -> ! {
             // Return to user mode
             "iretq",
 
-            ctx_ptr = in(reg) &ctx,
+            parent_ctx = sym PARENT_CONTEXT,
+            kernel_stack = in(reg) kernel_stack_top,
+            parent_pml4 = in(reg) parent_pml4,
             ds = in(reg) user_ds as u16,
             off_ss = const core::mem::offset_of!(SavedContext, ss),
             off_rsp = const core::mem::offset_of!(SavedContext, rsp),

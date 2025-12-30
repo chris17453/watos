@@ -1,0 +1,16 @@
+[package]
+name = "watos-readline"
+version = "0.1.0"
+edition = "2021"
+description = "Readline library for WATOS shell with vi/emacs modes and tab completion"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+watos-syscall = { path = "../../core/syscall" }
+
+[features]
+default = ["emacs", "vi"]
+emacs = []
+vi = []

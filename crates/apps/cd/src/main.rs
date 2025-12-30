@@ -81,10 +81,14 @@ fn getcwd(buf: &mut [u8]) -> usize {
 
 #[no_mangle]
 extern "C" fn _start() -> ! {
+    use core::ptr::addr_of_mut;
     static mut ARGS_BUF: [u8; 256] = [0u8; 256];
     static mut CWD_BUF: [u8; 256] = [0u8; 256];
 
-    let args_len = unsafe { get_args(&mut ARGS_BUF) };
+    let args_len = unsafe {
+        let buf = &mut *addr_of_mut!(ARGS_BUF);
+        get_args(buf)
+    };
     let args = unsafe { &ARGS_BUF[..args_len] };
 
     // Parse path from args (skip "cd" command itself)
@@ -108,7 +112,10 @@ extern "C" fn _start() -> ! {
 
     if path.is_empty() {
         // No argument - print current directory
-        let len = unsafe { getcwd(&mut CWD_BUF) };
+        let len = unsafe {
+            let buf = &mut *addr_of_mut!(CWD_BUF);
+            getcwd(buf)
+        };
         if len > 0 {
             write_bytes(unsafe { &CWD_BUF[..len] });
             write_str("\r\n");

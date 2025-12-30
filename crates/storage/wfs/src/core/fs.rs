@@ -6,7 +6,7 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use super::structures::{SuperblockV3, ROOT_INODE, WFS3_MAGIC};
+use super::structures::{Superblock, ROOT_INODE, WFS_MAGIC};
 use super::node::{TreeNode, NodeType};
 use super::inode::{Inode, INODE_SIZE};
 use super::dir::DirEntry;
@@ -22,7 +22,7 @@ use super::transaction::{Transaction, TransactionError};
 #[derive(Clone, Debug)]
 pub struct FilesystemState {
     /// Current superblock
-    pub superblock: SuperblockV3,
+    pub superblock: Superblock,
     /// Inode tree
     pub inode_tree: BPlusTree,
     /// Free space tree
@@ -35,7 +35,7 @@ pub struct FilesystemState {
 
 impl FilesystemState {
     /// Create a new filesystem state from a superblock
-    pub fn new(superblock: SuperblockV3) -> Self {
+    pub fn new(superblock: Superblock) -> Self {
         let inode_tree = BPlusTree::new(
             superblock.root_tree_block,
             NodeType::Inode,
@@ -166,11 +166,11 @@ pub trait FilesystemOps: BlockDevice + BlockAllocator {
     }
 
     /// Write a superblock to disk
-    fn write_superblock(&mut self, block: u64, sb: &SuperblockV3) -> Result<(), TransactionError> {
+    fn write_superblock(&mut self, block: u64, sb: &Superblock) -> Result<(), TransactionError> {
         // Convert superblock to node (same size as block)
         let mut node = TreeNode::default();
         let sb_bytes = unsafe {
-            core::slice::from_raw_parts(sb as *const _ as *const u8, core::mem::size_of::<SuperblockV3>())
+            core::slice::from_raw_parts(sb as *const _ as *const u8, core::mem::size_of::<Superblock>())
         };
         node.data[..sb_bytes.len()].copy_from_slice(sb_bytes);
 
@@ -178,14 +178,14 @@ pub trait FilesystemOps: BlockDevice + BlockAllocator {
     }
 
     /// Read a superblock from disk
-    fn read_superblock(&self, block: u64) -> Result<SuperblockV3, TransactionError> {
+    fn read_superblock(&self, block: u64) -> Result<Superblock, TransactionError> {
         let node = self.read_node(block).map_err(|_| TransactionError::IoError)?;
 
         let sb = unsafe {
-            core::ptr::read(node.data.as_ptr() as *const SuperblockV3)
+            core::ptr::read(node.data.as_ptr() as *const Superblock)
         };
 
-        if sb.magic != WFS3_MAGIC {
+        if sb.magic != WFS_MAGIC {
             return Err(TransactionError::IoError);
         }
 
@@ -859,7 +859,7 @@ pub fn init_filesystem<D: BlockDevice + BlockAllocator>(
     total_blocks: u64,
 ) -> Result<FilesystemState, TreeError> {
     // Create superblock
-    let mut superblock = SuperblockV3::new(total_blocks);
+    let mut superblock = Superblock::new(total_blocks);
 
     // Allocate blocks for initial structures
     // Block 0: Primary superblock
@@ -932,7 +932,7 @@ pub fn init_filesystem<D: BlockDevice + BlockAllocator>(
     // Write superblocks (primary and backup)
     let mut sb_node = TreeNode::default();
     let sb_bytes = unsafe {
-        core::slice::from_raw_parts(&superblock as *const _ as *const u8, core::mem::size_of::<SuperblockV3>())
+        core::slice::from_raw_parts(&superblock as *const _ as *const u8, core::mem::size_of::<Superblock>())
     };
     sb_node.data[..sb_bytes.len()].copy_from_slice(sb_bytes);
     device.write_node(0, &sb_node)?;

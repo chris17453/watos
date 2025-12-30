@@ -20,7 +20,7 @@ use spin::Mutex;
 use watos_driver_traits::{Driver, DriverState};
 use watos_driver_traits::block::{BlockDevice, BlockDeviceExt};
 use watos_driver_ahci::AhciDriver;
-use wfs_common::{Superblock, FileEntry, WFS_MAGIC, BLOCK_SIZE, ENTRIES_PER_BLOCK, FLAG_DIR};
+use wfs_common::{Superblock, WFS_MAGIC, BLOCK_SIZE};
 
 // VFS and FAT filesystem
 use alloc::boxed::Box;
@@ -414,7 +414,7 @@ fn change_dir(path: &[u8]) -> u64 {
 
         // Build the full path to validate
         static mut NEW_PATH_BUF: [u8; 260] = [0u8; 260];
-        let mut new_path_len: usize = 0;
+        let mut new_path_len: usize;
 
         // Absolute path (starts with \ or /)
         if path[0] == b'\\' || path[0] == b'/' {
@@ -778,77 +778,10 @@ fn wfs_readdir(_path: &[u8], buf: &mut [u8]) -> usize {
 
 /// Create a directory in WFS
 /// Returns true on success
-fn wfs_mkdir(path: &[u8]) -> bool {
-    let sb = unsafe {
-        match WFS_SUPERBLOCK.as_ref() {
-            Some(s) => s,
-            None => return false,
-        }
-    };
-
-    let mut driver_guard = DISK_DRIVER.lock();
-    let driver = match driver_guard.as_mut() {
-        Some(d) => d,
-        None => return false,
-    };
-
-    // Extract the directory name from path (last component)
-    let name = if let Some(pos) = path.iter().rposition(|&c| c == b'\\' || c == b'/') {
-        &path[pos + 1..]
-    } else {
-        path
-    };
-
-    if name.is_empty() || name.len() > 55 {
-        return false;
-    }
-
-    // Find a free entry in the file table
-    let mut sector_buf = [0u8; 4096]; // One block
-
-    for block_idx in 0..sb.filetable_blocks {
-        let block_num = sb.filetable_block + block_idx as u64;
-
-        // Read the block
-        if driver.read_sectors(block_num * 8, &mut sector_buf).is_err() {
-            continue;
-        }
-
-        // Look for a free entry (name[0] == 0)
-        for i in 0..ENTRIES_PER_BLOCK {
-            let entry_ptr = sector_buf.as_mut_ptr().wrapping_add(i * 128);
-            let entry = unsafe { &mut *(entry_ptr as *mut FileEntry) };
-
-            if entry.name[0] == 0 {
-                // Found a free entry - set it up as a directory
-                entry.name[..name.len()].copy_from_slice(name);
-                entry.name[name.len()] = 0;
-                entry.flags = FLAG_DIR;
-                entry.size = 0;
-                entry.start_block = 0;
-                entry.blocks = 0;
-
-                unsafe {
-                    watos_arch::serial_write(b"[WFS] Creating directory: ");
-                    watos_arch::serial_write(name);
-                    watos_arch::serial_write(b"\r\n");
-                }
-
-                // Write the block back
-                if driver.write_sectors(block_num * 8, &sector_buf).is_ok() {
-                    // Update superblock root_files count
-                    unsafe {
-                        if let Some(ref mut sb) = WFS_SUPERBLOCK {
-                            sb.root_files += 1;
-                        }
-                    }
-                    return true;
-                }
-                return false;
-            }
-        }
-    }
-
+/// TODO: Reimplement using WFS v1 B+tree API or VFS layer
+fn wfs_mkdir(_path: &[u8]) -> bool {
+    // WFS v1 uses B+tree structure, not flat file table
+    // Direct manipulation should go through VFS layer
     false
 }
 
@@ -1291,6 +1224,13 @@ mod syscall {
     pub const SYS_GETUID: u64 = 122;
     pub const SYS_GETGID: u64 = 123;
     pub const SYS_SETGID: u64 = 124;
+    pub const SYS_GETEUID: u64 = 126;
+    pub const SYS_GETEGID: u64 = 127;
+
+    // Permission operations
+    pub const SYS_CHMOD: u64 = 140;
+    pub const SYS_CHOWN: u64 = 141;
+    pub const SYS_ACCESS: u64 = 142;
 
     // Console session management
     pub const SYS_SESSION_CREATE: u64 = 130;
@@ -1500,7 +1440,9 @@ extern "C" fn handle_syscall_inner(num: u64, arg1: u64, arg2: u64, arg3: u64, re
 
             // Read into kernel buffer
             let bytes_read = unsafe {
-                let kernel_buf = &mut SYSCALL_READ_BUF[..user_buf_len];
+                use core::ptr::addr_of_mut;
+                let buf = &mut *addr_of_mut!(SYSCALL_READ_BUF);
+                let kernel_buf = &mut buf[..user_buf_len];
                 let result = fd_read(fd, kernel_buf);
                 if result < 0 { 0usize } else { result as usize }
             };
@@ -1581,8 +1523,16 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_EXIT => {
             // Check if there's a parent process to return to
             if watos_process::has_parent_context() {
-                // Free the current child process before resuming parent
+                // CRITICAL: Switch to kernel page table BEFORE freeing child process
+                // The child's page table will be deallocated when we free the process,
+                // so we must not be using it (CR3) at that point!
+                let kernel_pml4 = watos_process::get_kernel_pml4();
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+
+                // Now safe to free the current child process
                 watos_process::free_current_process();
+
+                // Resume parent (this will switch to parent's page table)
                 watos_process::resume_parent(); // Never returns
             }
             // No parent - top-level process exiting, halt
@@ -1646,8 +1596,11 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
 
                 // Read in kernel space using static buffer, then copy to user
                 let result = unsafe {
-                    let max_chunk = buf_size.min(SYSCALL_READ_BUF.len());
-                    let result = fd_read(fd, &mut SYSCALL_READ_BUF[..max_chunk]);
+                    use core::ptr::{addr_of, addr_of_mut};
+                    let buf_ref = &*addr_of!(SYSCALL_READ_BUF);
+                    let max_chunk = buf_size.min(buf_ref.len());
+                    let buf = &mut *addr_of_mut!(SYSCALL_READ_BUF);
+                    let result = fd_read(fd, &mut buf[..max_chunk]);
                     result
                 };
 
@@ -2622,11 +2575,160 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         syscall::SYS_SETGID => {
             // arg1 = GID to set
             let gid = arg1 as u32;
-            
+
             if watos_process::set_current_gid(gid) {
                 0
             } else {
                 u64::MAX
+            }
+        }
+
+        syscall::SYS_GETEUID => {
+            // Returns effective UID (same as UID for now - no setuid support)
+            watos_process::get_current_uid() as u64
+        }
+
+        syscall::SYS_GETEGID => {
+            // Returns effective GID (same as GID for now - no setgid support)
+            watos_process::get_current_gid() as u64
+        }
+
+        syscall::SYS_CHMOD => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = mode
+            // Returns 0 on success, u64::MAX on error
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let mode = arg3 as u32;
+
+            if path_ptr.is_null() || path_len == 0 || path_len > 256 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory
+            let mut path_buf = [0u8; 256];
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_ptr, path_buf.as_mut_ptr(), path_len);
+            }
+
+            let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+                Ok(s) => s,
+                Err(_) => return u64::MAX,
+            };
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            let result = watos_vfs::chmod(path_str, mode);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            match result {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+
+        syscall::SYS_CHOWN => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = uid
+            // r10 = gid
+            // Returns 0 on success, u64::MAX on error
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let uid = arg3 as u32;
+            let gid = unsafe { SAVED_SYSCALL_REGS.r10 as u32 };
+
+            if path_ptr.is_null() || path_len == 0 || path_len > 256 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory
+            let mut path_buf = [0u8; 256];
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_ptr, path_buf.as_mut_ptr(), path_len);
+            }
+
+            let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+                Ok(s) => s,
+                Err(_) => return u64::MAX,
+            };
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            let result = watos_vfs::chown(path_str, uid, gid);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            match result {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+
+        syscall::SYS_ACCESS => {
+            // arg1 = path pointer
+            // arg2 = path length
+            // arg3 = access mode (F_OK=0, R_OK=4, W_OK=2, X_OK=1)
+            // Returns 0 if access allowed, u64::MAX if denied
+            let path_ptr = arg1 as *const u8;
+            let path_len = arg2 as usize;
+            let _access_mode = arg3 as u32;
+
+            if path_ptr.is_null() || path_len == 0 || path_len > 256 {
+                return u64::MAX;
+            }
+
+            // Copy path from user memory
+            let mut path_buf = [0u8; 256];
+            unsafe {
+                core::ptr::copy_nonoverlapping(path_ptr, path_buf.as_mut_ptr(), path_len);
+            }
+
+            let path_str = match core::str::from_utf8(&path_buf[..path_len]) {
+                Ok(s) => s,
+                Err(_) => return u64::MAX,
+            };
+
+            // Switch to kernel page table for disk access
+            let user_cr3 = watos_mem::paging::get_cr3();
+            let kernel_pml4 = watos_process::get_kernel_pml4();
+
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(kernel_pml4); }
+            }
+
+            // For now, just check if path exists using stat
+            // Full permission checking will be added in VFS layer
+            let result = watos_vfs::stat(path_str);
+
+            // Restore user page table
+            if kernel_pml4 != 0 && user_cr3 != kernel_pml4 {
+                unsafe { watos_mem::paging::load_cr3(user_cr3); }
+            }
+
+            match result {
+                Ok(_) => 0, // File exists
+                Err(_) => u64::MAX,
             }
         }
 

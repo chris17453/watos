@@ -3,8 +3,11 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 use watos_syscall::numbers as syscall;
+use watos_readline::{Readline, EditMode, ShellCompleter, ReadlineError};
 
 #[inline(always)]
 unsafe fn syscall0(num: u32) -> u64 {
@@ -82,43 +85,34 @@ fn write_str(s: &str) {
     }
 }
 
-fn read_line(buf: &mut [u8]) -> usize {
-    let mut pos = 0;
-    loop {
-        let key = loop {
-            let k = unsafe { syscall0(syscall::SYS_GETKEY) as u8 };
-            if k != 0 {
-                break k;
-            }
-            for _ in 0..10000 { core::hint::spin_loop(); }
-        };
-
-        if key == b'\n' || key == b'\r' {
-            write_str("\r\n");
-            break;
-        } else if key == 0x08 || key == 0x7F {
-            if pos > 0 {
-                pos -= 1;
-                write_str("\x08 \x08");
-            }
-        } else if key >= 0x20 && key < 0x7F && pos < buf.len() {
-            buf[pos] = key;
-            pos += 1;
-            let echo = [key];
-            unsafe {
-                syscall3(syscall::SYS_WRITE, 1, echo.as_ptr() as u64, 1);
-            }
-        }
-    }
-    pos
-}
-
 fn exit(code: i32) -> ! {
     unsafe {
         syscall1(syscall::SYS_EXIT, code as u64);
     }
     loop {}
 }
+
+// ============================================================================
+// Global Allocator (via syscalls)
+// ============================================================================
+
+use core::alloc::{GlobalAlloc, Layout};
+use alloc::boxed::Box;
+
+struct SyscallAllocator;
+
+unsafe impl GlobalAlloc for SyscallAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        syscall1(syscall::SYS_MALLOC, layout.size() as u64) as *mut u8
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = syscall3(syscall::SYS_FREE, ptr as u64, layout.size() as u64, 0);
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: SyscallAllocator = SyscallAllocator;
 
 /// Expand variables in command line ($VAR, ${VAR}, ~)
 /// Returns the length of the expanded command
@@ -226,37 +220,42 @@ fn expand_variables(cmd: &[u8], output: &mut [u8]) -> usize {
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     write_str("\r\n");
-    write_str("WATOS Shell v0.1\r\n");
+    write_str("WATOS Shell v0.2\r\n");
     write_str("Type 'help' for available commands\r\n");
+    write_str("Use Tab for completion, Up/Down for history\r\n");
     write_str("\r\n");
 
-    let mut cmd_buf = [0u8; 128];
+    // Initialize readline with shell completer
+    let mut readline = Readline::new();
+    readline.add_completer(Box::new(ShellCompleter::new()));
+    readline.set_mode(EditMode::Emacs); // Default to emacs mode
 
     loop {
-        write_str("$ ");
-        let len = read_line(&mut cmd_buf);
+        // Read line with full editing support
+        let line = match readline.readline("$ ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl-C: just continue to next prompt
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                // Ctrl-D on empty line: exit
+                write_str("exit\r\n");
+                exit(0);
+            }
+            Err(_) => continue,
+        };
 
-        if len == 0 {
+        // Trim the line
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        // Trim leading/trailing whitespace
-        let mut start = 0;
-        let mut end = len;
-        while start < end && cmd_buf[start] == b' ' {
-            start += 1;
-        }
-        while end > start && cmd_buf[end - 1] == b' ' {
-            end -= 1;
-        }
-
-        if start >= end {
-            continue; // Empty or whitespace-only
-        }
-
         // Expand variables ($VAR, ${VAR}, ~)
+        let cmd_bytes = trimmed.as_bytes();
         let mut expanded_buf = [0u8; 256];
-        let expanded_len = expand_variables(&cmd_buf[start..end], &mut expanded_buf);
+        let expanded_len = expand_variables(cmd_bytes, &mut expanded_buf);
         let cmd = &expanded_buf[..expanded_len];
 
         // Built-in commands
@@ -276,6 +275,8 @@ pub extern "C" fn _start() -> ! {
             write_str("  unset VAR    - Unset environment variable\r\n");
             write_str("  env          - List environment variables\r\n");
             write_str("  set          - List environment variables\r\n");
+            write_str("  set -o vi    - Switch to vi editing mode\r\n");
+            write_str("  set -o emacs - Switch to emacs editing mode\r\n");
             write_str("\r\n");
         } else if cmd == b"exit" {
             write_str("Goodbye!\r\n");
@@ -327,6 +328,12 @@ pub extern "C" fn _start() -> ! {
             if result != 0 {
                 write_str("unset: failed to unset variable\r\n");
             }
+        } else if cmd == b"set -o vi" {
+            readline.set_mode(EditMode::Vi);
+            write_str("Switched to vi editing mode\r\n");
+        } else if cmd == b"set -o emacs" {
+            readline.set_mode(EditMode::Emacs);
+            write_str("Switched to emacs editing mode\r\n");
         } else if cmd == b"env" || cmd == b"set" {
             // List all environment variables
             static mut ENV_BUF: [u8; 4096] = [0u8; 4096];

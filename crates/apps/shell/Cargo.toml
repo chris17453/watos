@@ -5,12 +5,9 @@ edition = "2021"
 
 [dependencies]
 watos-syscall = { path = "../../core/syscall" }
+watos-readline = { path = "../../sys/readline" }
 
 [[bin]]
 name = "shell"
 path = "src/main.rs"
 
-[profile.release]
-panic = "abort"
-opt-level = "z"
-lto = true

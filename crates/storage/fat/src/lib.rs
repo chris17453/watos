@@ -465,6 +465,16 @@ impl<D: BlockDevice + Send + Sync + 'static> Filesystem for FatFilesystem<D> {
             max_name_len: 255,
         })
     }
+
+    fn chmod(&self, _path: &str, _mode: u32) -> VfsResult<()> {
+        // FAT filesystem doesn't support Unix permissions
+        Err(VfsError::NotSupported)
+    }
+
+    fn chown(&self, _path: &str, _uid: u32, _gid: u32) -> VfsResult<()> {
+        // FAT filesystem doesn't support Unix ownership
+        Err(VfsError::NotSupported)
+    }
 }
 
 /// File handle with shared access to filesystem state

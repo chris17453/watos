@@ -1,1 +1,1 @@
-@echo WATOS Loaded
+@ECHO WATOS Ready

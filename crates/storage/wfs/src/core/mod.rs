@@ -26,7 +26,7 @@ mod tests;
 // Re-export commonly used items
 pub use structures::*;
 pub use node::{TreeNode, NodeType};
-pub use inode::Inode;
+pub use inode::{Inode, INODE_IMMUTABLE, INODE_APPEND, INODE_NOATIME, INODE_SHARED, INODE_INLINE, INODE_DELETED};
 pub use dir::DirEntry;
 pub use extent::Extent;
 pub use freespace::FreeRange;

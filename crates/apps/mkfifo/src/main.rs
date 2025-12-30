@@ -77,9 +77,13 @@ fn mkfifo(path: &[u8]) -> u64 {
 
 #[no_mangle]
 extern "C" fn _start() -> ! {
+    use core::ptr::addr_of_mut;
     static mut ARGS_BUF: [u8; 512] = [0u8; 512];
 
-    let args_len = unsafe { get_args(&mut ARGS_BUF) };
+    let args_len = unsafe {
+        let buf = &mut *addr_of_mut!(ARGS_BUF);
+        get_args(buf)
+    };
     let args = unsafe { &ARGS_BUF[..args_len] };
 
     let mut i = 0;

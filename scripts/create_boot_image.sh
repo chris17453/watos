@@ -82,17 +82,17 @@ if [ -d "$SOURCE_DIR/apps" ]; then
     log "  - Copied apps/system/ directory"
 fi
 
-# Copy SYSTEM directory if it exists (contains TERM.EXE)
-if [ -d "$SOURCE_DIR/SYSTEM" ]; then
-    mmd -i "$IMAGE_FILE" ::/SYSTEM 2>/dev/null || true
+# Copy system directory if it exists (contains term)
+if [ -d "$SOURCE_DIR/system" ]; then
+    mmd -i "$IMAGE_FILE" ::/system 2>/dev/null || true
 
-    # Copy all SYSTEM apps
-    for app in "$SOURCE_DIR/SYSTEM"/*; do
+    # Copy all system apps
+    for app in "$SOURCE_DIR/system"/*; do
         if [ -f "$app" ]; then
-            mcopy -i "$IMAGE_FILE" "$app" ::/SYSTEM/
+            mcopy -i "$IMAGE_FILE" "$app" ::/system/
         fi
     done
-    log "  - Copied SYSTEM/ directory"
+    log "  - Copied system/ directory"
 fi
 
 # Copy AUTOEXEC.CMD if it exists
