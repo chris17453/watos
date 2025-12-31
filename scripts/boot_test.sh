@@ -196,9 +196,9 @@ if [ -n "$STARTUP_CMD" ]; then
     mmd -i "$AUTOEXEC_IMG" ::/apps 2>/dev/null || true
     mmd -i "$AUTOEXEC_IMG" ::/apps/system 2>/dev/null || true
 
-    # Copy TERM.EXE
-    if [ -f "$PROJECT_ROOT/uefi_test/SYSTEM/TERM.EXE" ]; then
-        mcopy -i "$AUTOEXEC_IMG" "$PROJECT_ROOT/uefi_test/SYSTEM/TERM.EXE" ::/SYSTEM/TERM.EXE 2>/dev/null || true
+    # Copy term (console app)
+    if [ -f "$PROJECT_ROOT/uefi_test/system/term" ]; then
+        mcopy -i "$AUTOEXEC_IMG" "$PROJECT_ROOT/uefi_test/system/term" ::/system/term 2>/dev/null || true
     fi
 
     # Copy apps

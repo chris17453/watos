@@ -230,6 +230,18 @@ impl AhciDriver {
     }
 
     fn init_port(&mut self) {
+        unsafe {
+            watos_arch::serial_write(b"[AHCI init_port] port=");
+            watos_arch::serial_hex(self.port as u64);
+            watos_arch::serial_write(b" cmd_list=");
+            watos_arch::serial_hex(self.cmd_list);
+            watos_arch::serial_write(b" fis_base=");
+            watos_arch::serial_hex(self.fis_base);
+            watos_arch::serial_write(b" cmd_table=");
+            watos_arch::serial_hex(self.cmd_table);
+            watos_arch::serial_write(b"\r\n");
+        }
+
         // Stop command engine
         let cmd = self.read_port(PORT_CMD);
         self.write_port(PORT_CMD, cmd & !(PORT_CMD_ST | PORT_CMD_FRE));
@@ -285,6 +297,15 @@ impl AhciDriver {
             (*cmd_header).flags = flags;
             (*cmd_header).prdtl = 1;
             (*cmd_header).prdbc = 0;
+            (*cmd_header).ctba = self.cmd_table;  // Ensure this is set!
+
+            watos_arch::serial_write(b"            [issue_command] CommandHeader: flags=");
+            watos_arch::serial_hex((*cmd_header).flags as u64);
+            watos_arch::serial_write(b" prdtl=");
+            watos_arch::serial_hex((*cmd_header).prdtl as u64);
+            watos_arch::serial_write(b" ctba=");
+            watos_arch::serial_hex((*cmd_header).ctba);
+            watos_arch::serial_write(b"\r\n");
         }
 
         let cmd_table = self.cmd_table as *mut CommandTable;
@@ -309,24 +330,106 @@ impl AhciDriver {
 
             (*cmd_table).prdt[0].dba = buffer_addr;
             (*cmd_table).prdt[0].dbc = ((count as u32 * 512) - 1) | (1 << 31);
+
+            // Debug
+            watos_arch::serial_write(b"            [issue_command] PRDT: dba=");
+            watos_arch::serial_hex((*cmd_table).prdt[0].dba);
+            watos_arch::serial_write(b" dbc=");
+            watos_arch::serial_hex((*cmd_table).prdt[0].dbc as u64);
+            watos_arch::serial_write(b"\r\n");
+            watos_arch::serial_write(b"            [issue_command] FIS: cmd=");
+            watos_arch::serial_hex((*fis).command as u64);
+            watos_arch::serial_write(b" lba=");
+            watos_arch::serial_hex(lba);
+            watos_arch::serial_write(b" count=");
+            watos_arch::serial_hex(count as u64);
+            watos_arch::serial_write(b"\r\n");
         }
 
         self.write_port(PORT_IS, 0xFFFFFFFF);
+
+        let port_cmd = self.read_port(PORT_CMD);
+        let port_clb = self.read_port(PORT_CLB);
+        let port_fb = self.read_port(PORT_FB);
+
+        unsafe {
+            watos_arch::serial_write(b"            [issue_command] PORT_CMD=");
+            watos_arch::serial_hex(port_cmd as u64);
+            watos_arch::serial_write(b" (FRE=");
+            watos_arch::serial_hex((port_cmd & PORT_CMD_FRE) as u64);
+            watos_arch::serial_write(b" ST=");
+            watos_arch::serial_hex((port_cmd & PORT_CMD_ST) as u64);
+            watos_arch::serial_write(b")\r\n");
+            watos_arch::serial_write(b"            [issue_command] PORT_CLB=");
+            watos_arch::serial_hex(port_clb as u64);
+            watos_arch::serial_write(b" (expected ");
+            watos_arch::serial_hex(self.cmd_list);
+            watos_arch::serial_write(b")\r\n");
+            watos_arch::serial_write(b"            [issue_command] PORT_FB=");
+            watos_arch::serial_hex(port_fb as u64);
+            watos_arch::serial_write(b" (expected ");
+            watos_arch::serial_hex(self.fis_base);
+            watos_arch::serial_write(b")\r\n");
+            watos_arch::serial_write(b"            [issue_command] Issuing command to PORT_CI\r\n");
+        }
+
         self.write_port(PORT_CI, 1);
 
+        unsafe {
+            watos_arch::serial_write(b"            [issue_command] Command issued, waiting...\r\n");
+        }
+
         // Wait for completion
-        for _ in 0..10000000 {
+        let mut iterations = 0;
+        for i in 0..10000000 {
+            iterations = i;
+
+            if i % 1000000 == 0 && i > 0 {
+                let ci = self.read_port(PORT_CI);
+                let tfd = self.read_port(PORT_TFD);
+                let is_reg = self.read_port(PORT_IS);
+                unsafe {
+                    watos_arch::serial_write(b"            [issue_command] Still waiting, i=");
+                    watos_arch::serial_hex(i);
+                    watos_arch::serial_write(b" CI=");
+                    watos_arch::serial_hex(ci as u64);
+                    watos_arch::serial_write(b" TFD=");
+                    watos_arch::serial_hex(tfd as u64);
+                    watos_arch::serial_write(b" IS=");
+                    watos_arch::serial_hex(is_reg as u64);
+                    watos_arch::serial_write(b"\r\n");
+                }
+            }
+
             if self.read_port(PORT_CI) & 1 == 0 {
+                unsafe {
+                    watos_arch::serial_write(b"            [issue_command] Complete after ");
+                    watos_arch::serial_hex(i);
+                    watos_arch::serial_write(b" iterations\r\n");
+                }
+
                 let tfd = self.read_port(PORT_TFD);
                 if (tfd & 0x01) != 0 {
+                    unsafe {
+                        watos_arch::serial_write(b"            [issue_command] TFD error bit set\r\n");
+                    }
                     return Err(DriverError::IoError);
                 }
                 return Ok(());
             }
 
             if (self.read_port(PORT_TFD) & 0x01) != 0 {
+                unsafe {
+                    watos_arch::serial_write(b"            [issue_command] TFD error during wait\r\n");
+                }
                 return Err(DriverError::IoError);
             }
+        }
+
+        unsafe {
+            watos_arch::serial_write(b"            [issue_command] TIMEOUT after ");
+            watos_arch::serial_hex(iterations);
+            watos_arch::serial_write(b" iterations\r\n");
         }
 
         Err(DriverError::Timeout)
@@ -433,6 +536,19 @@ impl BlockDevice for AhciDriver {
     }
 
     fn read_sectors(&mut self, start: u64, buffer: &mut [u8]) -> Result<usize, DriverError> {
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3);
+
+            watos_arch::serial_write(b"          [AHCI] read_sectors start=");
+            watos_arch::serial_hex(start);
+            watos_arch::serial_write(b" len=");
+            watos_arch::serial_hex(buffer.len() as u64);
+            watos_arch::serial_write(b" CR3=");
+            watos_arch::serial_hex(cr3);
+            watos_arch::serial_write(b"\r\n");
+        }
+
         if self.state != DriverState::Active {
             return Err(DriverError::InvalidState);
         }
@@ -443,7 +559,24 @@ impl BlockDevice for AhciDriver {
         }
 
         let absolute_lba = start + self.lba_offset;
-        self.issue_command(ATA_CMD_READ_DMA_EXT, absolute_lba, sectors as u16, buffer.as_ptr() as u64, false)?;
+
+        let buffer_addr = buffer.as_ptr() as u64;
+
+        unsafe {
+            watos_arch::serial_write(b"          [AHCI] Issuing DMA read, lba=");
+            watos_arch::serial_hex(absolute_lba);
+            watos_arch::serial_write(b" sectors=");
+            watos_arch::serial_hex(sectors as u64);
+            watos_arch::serial_write(b" buf_addr=");
+            watos_arch::serial_hex(buffer_addr);
+            watos_arch::serial_write(b"\r\n");
+        }
+
+        self.issue_command(ATA_CMD_READ_DMA_EXT, absolute_lba, sectors as u16, buffer_addr, false)?;
+
+        unsafe {
+            watos_arch::serial_write(b"          [AHCI] DMA read complete\r\n");
+        }
 
         Ok(sectors * self.sector_size)
     }

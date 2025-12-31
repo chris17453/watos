@@ -2,7 +2,7 @@
 //!
 //! Provides platform-agnostic print macros that work in both std and no_std.
 
-// External syscall for WATOS console write
+/// External syscall for WATOS console write
 #[cfg(not(feature = "std"))]
 extern "C" {
     pub fn watos_console_write(buf: *const u8, len: usize);

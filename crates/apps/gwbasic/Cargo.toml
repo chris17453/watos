@@ -32,3 +32,8 @@ minifb = { version = "0.25", optional = true }
 libm = "0.2"
 watos-syscall = { path = "../../core/syscall", features = ["no-std"], optional = true }
 
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1

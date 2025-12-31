@@ -676,8 +676,9 @@ fn init_vfs() -> bool {
     }
 
     // Try all AHCI ports to find a valid FAT filesystem for C:
-    // Port 0 = QEMU virtual FAT (invalid BPB), Port 2 = real FAT disk image
-    for port in 0..4u8 {
+    // Port 0 = UEFI boot disk (uefi_boot.img - has apps)
+    // Scan ports in normal order
+    for port in [0u8, 1, 2, 3].iter().copied() {
         unsafe {
             watos_arch::serial_write(b"[KERNEL] Trying AHCI port ");
             watos_arch::serial_hex(port as u64);
@@ -952,13 +953,44 @@ fn fd_read(fd: i64, buf: &mut [u8]) -> i64 {
     if fd < 3 || fd >= MAX_FDS as i64 {
         return -1;
     }
+
+    unsafe {
+        watos_arch::serial_write(b"  [fd_read] Acquiring FD_TABLE lock...\r\n");
+    }
+
     let mut table = FD_TABLE.lock();
+
+    unsafe {
+        watos_arch::serial_write(b"  [fd_read] Lock acquired, calling file.read()...\r\n");
+    }
+
     if let Some(ref mut file) = table[fd as usize] {
-        match file.read(buf) {
-            Ok(n) => n as i64,
-            Err(_) => -1,
+        let result = file.read(buf);
+
+        unsafe {
+            watos_arch::serial_write(b"  [fd_read] file.read() returned, processing result...\r\n");
+        }
+
+        match result {
+            Ok(n) => {
+                unsafe {
+                    watos_arch::serial_write(b"  [fd_read] Success, ");
+                    watos_arch::serial_hex(n as u64);
+                    watos_arch::serial_write(b" bytes\r\n");
+                }
+                n as i64
+            },
+            Err(_) => {
+                unsafe {
+                    watos_arch::serial_write(b"  [fd_read] Error\r\n");
+                }
+                -1
+            }
         }
     } else {
+        unsafe {
+            watos_arch::serial_write(b"  [fd_read] FD not open\r\n");
+        }
         -1 // Not open
     }
 }
@@ -1165,8 +1197,10 @@ mod syscall {
     pub const SYS_EXIT: u64 = 6;
 
     // System
+    pub const SYS_SLEEP: u64 = 11;
     pub const SYS_MALLOC: u64 = 14;
     pub const SYS_FREE: u64 = 15;
+    pub const SYS_PUTCHAR: u64 = 16;
 
     // Console handle management
     pub const SYS_CONSOLE_OUT: u64 = 21;   // Get stdout handle (returns 1)
@@ -1761,10 +1795,29 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             }
             let full_path_str = core::str::from_utf8(&full_path_buf[..pos]).unwrap_or("");
 
+            // Build system path: C:/system/<name>
+            let mut system_path_buf = [0u8; 128];
+            let system_prefix = b"C:/system/";
+            let mut sys_pos = 0;
+            for &b in system_prefix {
+                if sys_pos < system_path_buf.len() {
+                    system_path_buf[sys_pos] = b;
+                    sys_pos += 1;
+                }
+            }
+            for &b in program_name {
+                if sys_pos < system_path_buf.len() {
+                    system_path_buf[sys_pos] = b;
+                    sys_pos += 1;
+                }
+            }
+            let system_path_str = core::str::from_utf8(&system_path_buf[..sys_pos]).unwrap_or("");
+
             // Try multiple paths to find the executable
             let paths = [
-                program_str,      // Try as-is (e.g., "/apps/system/shell")
-                full_path_str,    // Try C:/apps/system/<name>
+                program_str,       // Try as-is (e.g., "/apps/system/shell")
+                system_path_str,   // Try C:/system/<name> (for term, etc.)
+                full_path_str,     // Try C:/apps/system/<name>
             ];
 
             // Switch to kernel page table for disk access
@@ -1796,9 +1849,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 let fd = handle_sys_open(path.as_bytes(), 0); // 0 = read mode
                 if fd != u64::MAX {
                     unsafe {
-                        watos_arch::serial_write(b"[KERNEL] File opened, fd=");
-                        watos_arch::serial_hex(fd);
-                        watos_arch::serial_write(b"\r\n");
+                        watos_arch::serial_write(b"[KERNEL] File opened, allocating buffer...\r\n");
                     }
 
                     // Read file using Vec
@@ -1806,21 +1857,65 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                     const CHUNK_SIZE: usize = 4096;
                     let mut read_buf = [0u8; CHUNK_SIZE];
 
+                    unsafe {
+                        watos_arch::serial_write(b"[KERNEL] Starting read loop...\r\n");
+                    }
+
+                    let mut iteration = 0;
                     loop {
+                        unsafe {
+                            watos_arch::serial_write(b"[KERNEL] Calling fd_read #");
+                            watos_arch::serial_hex(iteration + 1);
+                            watos_arch::serial_write(b"...\r\n");
+                        }
                         let chunk_read = fd_read(fd as i64, &mut read_buf);
+                        iteration += 1;
+                        unsafe {
+                            watos_arch::serial_write(b"[KERNEL] fd_read returned ");
+                            watos_arch::serial_hex(chunk_read as u64);
+                            watos_arch::serial_write(b"\r\n");
+                        }
+
                         if chunk_read <= 0 {
+                            unsafe {
+                                watos_arch::serial_write(b"[KERNEL] EOF after ");
+                                watos_arch::serial_hex(iteration);
+                                watos_arch::serial_write(b" reads\r\n");
+                            }
                             break;
+                        }
+
+                        unsafe {
+                            watos_arch::serial_write(b"[KERNEL] Extending buffer, current size=");
+                            watos_arch::serial_hex(file_contents.len() as u64);
+                            watos_arch::serial_write(b"\r\n");
                         }
 
                         file_contents.extend_from_slice(&read_buf[..chunk_read as usize]);
 
+                        unsafe {
+                            watos_arch::serial_write(b"[KERNEL] Extended to ");
+                            watos_arch::serial_hex(file_contents.len() as u64);
+                            watos_arch::serial_write(b"\r\n");
+                        }
+
                         // Safety limit: max 1MB per executable
                         if file_contents.len() >= 1024 * 1024 {
                             unsafe {
-                                watos_arch::serial_write(b"[KERNEL] File too large\r\n");
+                                watos_arch::serial_write(b"[KERNEL] Hit 1MB limit after ");
+                                watos_arch::serial_hex(iteration);
+                                watos_arch::serial_write(b" reads, size=");
+                                watos_arch::serial_hex(file_contents.len() as u64);
+                                watos_arch::serial_write(b"\r\n");
                             }
                             break;
                         }
+                    }
+
+                    unsafe {
+                        watos_arch::serial_write(b"[KERNEL] Read complete, total=");
+                        watos_arch::serial_hex(file_contents.len() as u64);
+                        watos_arch::serial_write(b"\r\n");
                     }
 
                     fd_close(fd as i64);
@@ -2879,6 +2974,25 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
 
                 env_list.len() as u64
             }
+        }
+
+        syscall::SYS_PUTCHAR => {
+            // arg1 = character to write
+            let ch = (arg1 & 0xFF) as u8;
+            let buf = [ch];
+            // Write to stdout (fd 1)
+            console_write(&buf);
+            0
+        }
+
+        syscall::SYS_SLEEP => {
+            // arg1 = milliseconds to sleep
+            // For now, just do a simple delay loop
+            let ms = arg1 as usize;
+            for _ in 0..(ms * 1000) {
+                core::hint::spin_loop();
+            }
+            0
         }
 
         _ => {

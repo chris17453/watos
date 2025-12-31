@@ -21,24 +21,6 @@ thread_local! {
 #[cfg(not(feature = "std"))]
 static mut RNG_STATE: u64 = 12345;
 
-/// FFI-safe date structure
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct WatosDate {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-}
-
-/// FFI-safe time structure
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct WatosTime {
-    pub hours: u8,
-    pub minutes: u8,
-    pub seconds: u8,
-}
-
 /// Math functions
 pub fn abs_fn(val: Value) -> Result<Value> {
     Ok(Value::Double(val.as_double()?.abs()))
@@ -472,8 +454,8 @@ pub fn date_fn() -> Result<Value> {
 
     #[cfg(not(feature = "std"))]
     {
-        let date = unsafe { watos_get_date() };
-        Ok(Value::String(format!("{:02}-{:02}-{:04}", date.month, date.day, date.year)))
+        let (year, month, day) = unsafe { watos_get_date() };
+        Ok(Value::String(format!("{:02}-{:02}-{:04}", month, day, year)))
     }
 }
 
@@ -493,8 +475,8 @@ pub fn time_fn() -> Result<Value> {
 
     #[cfg(not(feature = "std"))]
     {
-        let time = unsafe { watos_get_time() };
-        Ok(Value::String(format!("{:02}:{:02}:{:02}", time.hours, time.minutes, time.seconds)))
+        let (hours, minutes, seconds) = unsafe { watos_get_time() };
+        Ok(Value::String(format!("{:02}:{:02}:{:02}", hours, minutes, seconds)))
     }
 }
 
@@ -684,8 +666,8 @@ extern "C" {
     fn watos_console_read(buf: *mut u8, len: usize) -> usize;
     fn watos_get_free_memory() -> usize;
     fn watos_get_key_no_wait() -> u8;
-    fn watos_get_date() -> WatosDate;
-    fn watos_get_time() -> WatosTime;
+    fn watos_get_date() -> (u16, u8, u8);
+    fn watos_get_time() -> (u8, u8, u8);
     fn watos_get_cursor_row() -> u8;
     fn watos_get_cursor_col() -> u8;
     fn watos_get_pixel(x: i32, y: i32) -> u8;

@@ -57,15 +57,44 @@ impl<D: BlockDevice> FatInner<D> {
         let sector = self.cluster_to_sector(cluster);
         let sectors = self.sectors_per_cluster;
 
+        unsafe {
+            watos_arch::serial_write(b"        [read_cluster] cluster=");
+            watos_arch::serial_hex(cluster as u64);
+            watos_arch::serial_write(b" sector=");
+            watos_arch::serial_hex(sector);
+            watos_arch::serial_write(b" count=");
+            watos_arch::serial_hex(sectors as u64);
+            watos_arch::serial_write(b"\r\n");
+        }
+
         for i in 0..sectors {
+            unsafe {
+                watos_arch::serial_write(b"        [read_cluster] Reading sector ");
+                watos_arch::serial_hex(sector + i as u64);
+                watos_arch::serial_write(b"...\r\n");
+            }
+
             let offset = (i * self.sector_size) as usize;
             let end = offset + self.sector_size as usize;
             if end > buffer.len() {
                 break;
             }
+
+            unsafe {
+                watos_arch::serial_write(b"        [read_cluster] Calling device.read_sectors...\r\n");
+            }
+
             self.device
                 .read_sectors(sector + i as u64, &mut buffer[offset..end])
                 .map_err(|_| VfsError::IoError)?;
+
+            unsafe {
+                watos_arch::serial_write(b"        [read_cluster] Sector read OK\r\n");
+            }
+        }
+
+        unsafe {
+            watos_arch::serial_write(b"        [read_cluster] All sectors read\r\n");
         }
 
         Ok(())
@@ -215,40 +244,110 @@ impl<D: BlockDevice> FatInner<D> {
         Ok(entries)
     }
 
-    /// Read file data from clusters
-    fn read_file_data(
+    /// Read file data from clusters with caching
+    fn read_file_data_cached(
         &mut self,
         start_cluster: u32,
         file_size: u64,
         position: u64,
         buffer: &mut [u8],
-    ) -> VfsResult<usize> {
+        cached_cluster: u32,
+        cached_position: u64,
+    ) -> VfsResult<(usize, u32, u64)> {
         if position >= file_size {
-            return Ok(0);
+            return Ok((0, cached_cluster, cached_position));
         }
 
         let cluster_size = self.cluster_size() as u64;
         let bytes_to_read = core::cmp::min(buffer.len() as u64, file_size - position) as usize;
 
         // Find the cluster containing the current position
-        let cluster_index = position / cluster_size;
-        let mut current_cluster = start_cluster;
+        let target_cluster_index = position / cluster_size;
+        let target_cluster_pos = target_cluster_index * cluster_size;
+
+        // Use cached cluster if we're reading sequentially forward
+        let (mut current_cluster, start_index) = if cached_position <= position
+            && cached_cluster >= 2
+            && cached_position / cluster_size <= target_cluster_index {
+            // Start from cached position
+            unsafe {
+                watos_arch::serial_write(b"      [FAT] Using cache, start_index=");
+                watos_arch::serial_hex(cached_position / cluster_size);
+                watos_arch::serial_write(b" target=");
+                watos_arch::serial_hex(target_cluster_index);
+                watos_arch::serial_write(b"\r\n");
+            }
+            (cached_cluster, cached_position / cluster_size)
+        } else {
+            // Start from beginning
+            unsafe {
+                watos_arch::serial_write(b"      [FAT] Cache miss, walking from start, target=");
+                watos_arch::serial_hex(target_cluster_index);
+                watos_arch::serial_write(b"\r\n");
+            }
+            (start_cluster, 0)
+        };
 
         // Walk the cluster chain to find the right cluster
-        for _ in 0..cluster_index {
+        let mut walk_count = 0;
+        for _ in start_index..target_cluster_index {
+            walk_count += 1;
+            if walk_count > 10000 {
+                // Infinite loop protection
+                unsafe {
+                    watos_arch::serial_write(b"      [FAT] INFINITE LOOP DETECTED\r\n");
+                }
+                return Err(VfsError::IoError);
+            }
             match self.next_cluster(current_cluster)? {
                 Some(next) => current_cluster = next,
-                None => return Ok(0), // Unexpected end of chain
+                None => return Ok((0, cached_cluster, cached_position)), // Unexpected end of chain
             }
+        }
+
+        unsafe {
+            watos_arch::serial_write(b"      [FAT] Walked ");
+            watos_arch::serial_hex(walk_count);
+            watos_arch::serial_write(b" clusters, current=");
+            watos_arch::serial_hex(current_cluster as u64);
+            watos_arch::serial_write(b"\r\n");
         }
 
         // Read data
         let mut bytes_read = 0;
         let mut offset_in_cluster = (position % cluster_size) as usize;
-        let mut cluster_buf = alloc::vec![0u8; cluster_size as usize];
 
+        // Use stack buffer for DMA instead of heap Vec
+        // Stack is guaranteed to be identity-mapped for DMA
+        let mut cluster_buf = [0u8; 4096];
+
+        unsafe {
+            watos_arch::serial_write(b"      [FAT] Using stack buffer at ");
+            watos_arch::serial_hex(cluster_buf.as_ptr() as u64);
+            watos_arch::serial_write(b"\r\n");
+        }
+
+        let mut read_count = 0;
         while bytes_read < bytes_to_read && current_cluster >= 2 {
-            self.read_cluster(current_cluster, &mut cluster_buf)?;
+            read_count += 1;
+            if read_count > 100 {
+                unsafe {
+                    watos_arch::serial_write(b"      [FAT] Too many cluster reads!\r\n");
+                }
+                return Err(VfsError::IoError);
+            }
+
+            unsafe {
+                watos_arch::serial_write(b"      [FAT] Reading cluster ");
+                watos_arch::serial_hex(current_cluster as u64);
+                watos_arch::serial_write(b"\r\n");
+            }
+
+            self.read_cluster(current_cluster, &mut cluster_buf[..cluster_size as usize])?;
+
+            unsafe {
+                watos_arch::serial_write(b"      [FAT] Cluster read done\r\n");
+            }
 
             let available = cluster_size as usize - offset_in_cluster;
             let to_copy = core::cmp::min(available, bytes_to_read - bytes_read);
@@ -266,7 +365,10 @@ impl<D: BlockDevice> FatInner<D> {
             }
         }
 
-        Ok(bytes_read)
+        // Return bytes read, final cluster, and position of that cluster
+        let final_pos = position + bytes_read as u64;
+        let final_cluster_pos = (final_pos / cluster_size) * cluster_size;
+        Ok((bytes_read, current_cluster, final_cluster_pos))
     }
 }
 
@@ -495,6 +597,10 @@ struct FatFileHandle<D: BlockDevice + Send + Sync + 'static> {
     can_write: bool,
     /// File attributes
     attributes: u8,
+    /// Cached current cluster (to avoid re-walking chain)
+    current_cluster: u32,
+    /// Position that current_cluster corresponds to
+    cluster_position: u64,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static> FatFileHandle<D> {
@@ -505,15 +611,18 @@ impl<D: BlockDevice + Send + Sync + 'static> FatFileHandle<D> {
         can_read: bool,
         can_write: bool,
     ) -> Self {
+        let start = entry.first_cluster();
         FatFileHandle {
             inner,
-            start_cluster: entry.first_cluster(),
+            start_cluster: start,
             file_size: entry.file_size as u64,
             position: 0,
             cluster_size,
             can_read,
             can_write,
             attributes: entry.attributes,
+            current_cluster: start,
+            cluster_position: 0,
         }
     }
 }
@@ -528,15 +637,40 @@ impl<D: BlockDevice + Send + Sync + 'static> FileOperations for FatFileHandle<D>
             return Ok(0);
         }
 
+        unsafe {
+            watos_arch::serial_write(b"    [FAT] Acquiring inner lock, pos=");
+            watos_arch::serial_hex(self.position);
+            watos_arch::serial_write(b" cached_cluster=");
+            watos_arch::serial_hex(self.current_cluster as u64);
+            watos_arch::serial_write(b" cached_pos=");
+            watos_arch::serial_hex(self.cluster_position);
+            watos_arch::serial_write(b"\r\n");
+        }
+
         let mut inner = self.inner.lock();
-        let bytes_read = inner.read_file_data(
+
+        unsafe {
+            watos_arch::serial_write(b"    [FAT] Inner lock acquired, calling read_file_data_cached...\r\n");
+        }
+
+        let (bytes_read, new_cluster, new_cluster_pos) = inner.read_file_data_cached(
             self.start_cluster,
             self.file_size,
             self.position,
             buffer,
+            self.current_cluster,
+            self.cluster_position,
         )?;
 
+        unsafe {
+            watos_arch::serial_write(b"    [FAT] read_file_data_cached returned ");
+            watos_arch::serial_hex(bytes_read as u64);
+            watos_arch::serial_write(b" bytes\r\n");
+        }
+
         self.position += bytes_read as u64;
+        self.current_cluster = new_cluster;
+        self.cluster_position = new_cluster_pos;
         Ok(bytes_read)
     }
 
@@ -571,6 +705,11 @@ impl<D: BlockDevice + Send + Sync + 'static> FileOperations for FatFileHandle<D>
 
         // Clamp to file size
         self.position = new_pos.min(self.file_size);
+
+        // Reset cluster cache on seek (will be recalculated on next read)
+        self.current_cluster = self.start_cluster;
+        self.cluster_position = 0;
+
         Ok(self.position)
     }
 
