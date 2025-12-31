@@ -138,6 +138,11 @@ pub mod numbers {
     pub const SYS_GETENV: u32 = 137;         // Get environment variable (key_ptr, key_len, buf_ptr, buf_len) -> actual_len
     pub const SYS_UNSETENV: u32 = 138;       // Unset environment variable (key_ptr, key_len)
     pub const SYS_LISTENV: u32 = 139;        // List environment variables (buf_ptr, buf_len) -> num_vars
+
+    // Keyboard configuration
+    pub const SYS_SET_KEYMAP: u32 = 150;     // Load keyboard layout from buffer (data_ptr, data_len)
+    pub const SYS_SET_CODEPAGE: u32 = 151;   // Load code page from buffer (data_ptr, data_len)
+    pub const SYS_GET_CODEPAGE: u32 = 152;   // Get current code page ID
 }
 
 /// Raw syscall interface - performs INT 0x80

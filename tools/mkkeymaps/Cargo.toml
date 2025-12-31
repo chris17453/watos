@@ -1,0 +1,11 @@
+[package]
+name = "mkkeymaps"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS keyboard map compiler - generates binary keymap files"
+
+[[bin]]
+name = "mkkeymaps"
+path = "src/main.rs"
+
+[dependencies]

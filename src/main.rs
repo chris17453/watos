@@ -856,42 +856,9 @@ fn console_read(buf: &mut [u8]) -> usize {
 // Keyboard Scancode to ASCII Conversion
 // ============================================================================
 
-/// Convert PS/2 scancode to ASCII character (US keyboard layout)
+/// Convert PS/2 scancode to ASCII character using the keyboard driver
 fn scancode_to_ascii(scancode: u8) -> u8 {
-    // Ignore key release events (scancode >= 0x80)
-    if scancode >= 0x80 {
-        return 0;
-    }
-
-    // TODO: Handle shift, ctrl, alt modifiers properly
-    // For now, simple unshifted ASCII mapping
-    match scancode {
-        0x1E => b'a', 0x30 => b'b', 0x2E => b'c', 0x20 => b'd',
-        0x12 => b'e', 0x21 => b'f', 0x22 => b'g', 0x23 => b'h',
-        0x17 => b'i', 0x24 => b'j', 0x25 => b'k', 0x26 => b'l',
-        0x32 => b'm', 0x31 => b'n', 0x18 => b'o', 0x19 => b'p',
-        0x10 => b'q', 0x13 => b'r', 0x1F => b's', 0x14 => b't',
-        0x16 => b'u', 0x2F => b'v', 0x11 => b'w', 0x2D => b'x',
-        0x15 => b'y', 0x2C => b'z',
-
-        // Numbers
-        0x0B => b'0', 0x02 => b'1', 0x03 => b'2', 0x04 => b'3',
-        0x05 => b'4', 0x06 => b'5', 0x07 => b'6', 0x08 => b'7',
-        0x09 => b'8', 0x0A => b'9',
-
-        // Special keys
-        0x1C => b'\n',  // Enter
-        0x39 => b' ',   // Space
-        0x0E => 0x08,   // Backspace
-        0x0F => b'\t',  // Tab
-        0x1A => b'[', 0x1B => b']',
-        0x27 => b';', 0x28 => b'\'',
-        0x29 => b'`', 0x2B => b'\\',
-        0x33 => b',', 0x34 => b'.', 0x35 => b'/',
-        0x0C => b'-', 0x0D => b'=',
-
-        _ => 0,  // Unknown or modifier key
-    }
+    watos_driver_keyboard::process_scancode(scancode)
 }
 
 // ============================================================================
@@ -1279,6 +1246,11 @@ mod syscall {
     pub const SYS_GETENV: u64 = 137;
     pub const SYS_UNSETENV: u64 = 138;
     pub const SYS_LISTENV: u64 = 139;
+
+    // Keyboard configuration
+    pub const SYS_SET_KEYMAP: u64 = 150;
+    pub const SYS_SET_CODEPAGE: u64 = 151;
+    pub const SYS_GET_CODEPAGE: u64 = 152;
 }
 
 /// Syscall handler - naked function called from IDT
@@ -2976,12 +2948,80 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             }
         }
 
+        syscall::SYS_SET_KEYMAP => {
+            // arg1 = keymap data pointer, arg2 = data length
+            // Keymap file format: KMAP + version + name + 3x256 byte maps
+            let data_ptr = arg1 as *const u8;
+            let data_len = arg2 as usize;
+
+            if data_ptr.is_null() || data_len < 776 {
+                return 1; // Error: invalid parameters
+            }
+
+            unsafe {
+                let data = core::slice::from_raw_parts(data_ptr, data_len);
+
+                // Parse and validate the keymap
+                match watos_driver_keyboard::load_keymap(data) {
+                    Ok(()) => {
+                        watos_arch::serial_write(b"[KERNEL] Keymap loaded successfully\r\n");
+                        0 // Success
+                    }
+                    Err(msg) => {
+                        watos_arch::serial_write(b"[KERNEL] Keymap load failed: ");
+                        watos_arch::serial_write(msg.as_bytes());
+                        watos_arch::serial_write(b"\r\n");
+                        2 // Error
+                    }
+                }
+            }
+        }
+
+        syscall::SYS_SET_CODEPAGE => {
+            // arg1 = codepage data pointer, arg2 = data length
+            // Codepage file format: CPAG + version + ID + name + 256x4 byte map
+            let data_ptr = arg1 as *const u8;
+            let data_len = arg2 as usize;
+
+            if data_ptr.is_null() || data_len < 1032 {
+                return 1; // Error: invalid parameters
+            }
+
+            unsafe {
+                let data = core::slice::from_raw_parts(data_ptr, data_len);
+
+                // Parse and validate the codepage
+                match watos_driver_keyboard::load_codepage(data) {
+                    Ok(()) => {
+                        watos_arch::serial_write(b"[KERNEL] Codepage loaded successfully\r\n");
+                        0 // Success
+                    }
+                    Err(msg) => {
+                        watos_arch::serial_write(b"[KERNEL] Codepage load failed: ");
+                        watos_arch::serial_write(msg.as_bytes());
+                        watos_arch::serial_write(b"\r\n");
+                        2 // Error
+                    }
+                }
+            }
+        }
+
+        syscall::SYS_GET_CODEPAGE => {
+            // Returns current code page ID
+            watos_driver_keyboard::get_codepage() as u64
+        }
+
         syscall::SYS_PUTCHAR => {
             // arg1 = character to write
             let ch = (arg1 & 0xFF) as u8;
             let buf = [ch];
-            // Write to stdout (fd 1)
-            console_write(&buf);
+
+            // Write the same way as SYS_WRITE to stdout
+            unsafe {
+                watos_arch::serial_write(&buf);
+            }
+            watos_vt::vt_write_active(&buf);
+
             0
         }
 

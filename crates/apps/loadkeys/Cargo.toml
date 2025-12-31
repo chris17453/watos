@@ -1,0 +1,12 @@
+[package]
+name = "watos-loadkeys"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "loadkeys"
+path = "src/main.rs"
+
+[dependencies]
+watos-runtime = { path = "../../sys/runtime" }
+watos-syscall = { path = "../../core/syscall" }

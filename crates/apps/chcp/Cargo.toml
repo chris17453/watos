@@ -1,0 +1,12 @@
+[package]
+name = "watos-chcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "chcp"
+path = "src/main.rs"
+
+[dependencies]
+watos-runtime = { path = "../../sys/runtime" }
+watos-syscall = { path = "../../core/syscall" }

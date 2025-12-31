@@ -30,6 +30,7 @@ watos-readline = { path = "crates/sys/readline" }
 watos-driver-traits = { path = "crates/drivers/traits" }
 watos-driver-pci = { path = "crates/drivers/bus/pci" }
 watos-driver-ahci = { path = "crates/drivers/storage/ahci" }
+watos-driver-keyboard = { path = "crates/drivers/input/keyboard" }
 watos-driver-video = { path = "crates/drivers/video" }
 
 # Filesystem
@@ -122,8 +123,10 @@ members = [
     "crates/apps/mem",
     "crates/apps/login",
     "crates/apps/shell",
+    "crates/apps/loadkeys",
+    "crates/apps/chcp",
 ]
-exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs"]
+exclude = ["junk", "tools/exe-tester", "tools/mkfs.wfs", "tools/mkkeymaps", "tools/mkcodepages"]
 
 [workspace.dependencies]
 uefi = "0.25"

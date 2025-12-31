@@ -1,0 +1,11 @@
+[package]
+name = "mkcodepages"
+version = "0.1.0"
+edition = "2021"
+description = "WATOS code page compiler - generates binary code page files"
+
+[[bin]]
+name = "mkcodepages"
+path = "src/main.rs"
+
+[dependencies]

@@ -204,6 +204,60 @@ if [ ! -f "$MKFS_WFS" ]; then
     cd "$PROJECT_ROOT"
 fi
 
+# Step 6.5: Build keyboard assets (keymaps and codepages)
+log "Building keyboard assets..."
+
+# Build mkkeymaps tool (host tool)
+MKKEYMAPS="$PROJECT_ROOT/output/mkkeymaps"
+if [ ! -f "$MKKEYMAPS" ] || [ "$CLEAN_BUILD" = true ]; then
+    log "Building mkkeymaps tool..."
+    cd "$PROJECT_ROOT/tools/mkkeymaps"
+    if cargo build --release --target x86_64-unknown-linux-gnu 2>&1; then
+        mkdir -p "$PROJECT_ROOT/output"
+        cp target/x86_64-unknown-linux-gnu/release/mkkeymaps "$MKKEYMAPS"
+        success "mkkeymaps built"
+    else
+        echo -e "${YELLOW}[WARN]${NC} mkkeymaps build failed"
+    fi
+    cd "$PROJECT_ROOT"
+fi
+
+# Build mkcodepages tool (host tool)
+MKCODEPAGES="$PROJECT_ROOT/output/mkcodepages"
+if [ ! -f "$MKCODEPAGES" ] || [ "$CLEAN_BUILD" = true ]; then
+    log "Building mkcodepages tool..."
+    cd "$PROJECT_ROOT/tools/mkcodepages"
+    if cargo build --release --target x86_64-unknown-linux-gnu 2>&1; then
+        mkdir -p "$PROJECT_ROOT/output"
+        cp target/x86_64-unknown-linux-gnu/release/mkcodepages "$MKCODEPAGES"
+        success "mkcodepages built"
+    else
+        echo -e "${YELLOW}[WARN]${NC} mkcodepages build failed"
+    fi
+    cd "$PROJECT_ROOT"
+fi
+
+# Run the tools to generate keyboard assets
+if [ -f "$MKKEYMAPS" ]; then
+    log "Generating keyboard maps..."
+    cd "$PROJECT_ROOT"
+    if "$MKKEYMAPS"; then
+        success "Keyboard maps generated"
+    else
+        echo -e "${YELLOW}[WARN]${NC} Failed to generate keyboard maps"
+    fi
+fi
+
+if [ -f "$MKCODEPAGES" ]; then
+    log "Generating code pages..."
+    cd "$PROJECT_ROOT"
+    if "$MKCODEPAGES"; then
+        success "Code pages generated"
+    else
+        echo -e "${YELLOW}[WARN]${NC} Failed to generate code pages"
+    fi
+fi
+
 # Step 7: Build WATOS native applications
 log "Building WATOS native applications..."
 mkdir -p "$PROJECT_ROOT/rootfs/BIN"
