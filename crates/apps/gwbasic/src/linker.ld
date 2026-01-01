@@ -3,8 +3,8 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Applications load at 16MB - outside kernel's identity-mapped region (0-8MB) */
-    . = 0x1000000;
+    /* All apps load at 0x400000 - proper virtual memory (each process has own page table) */
+    . = 0x400000;
 
     /* Code section */
     .text : {

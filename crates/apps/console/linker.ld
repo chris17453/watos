@@ -1,11 +1,11 @@
 /* Linker script for WATOS user programs */
-/* Load at 0x1000000 (16MB) - outside kernel's identity-mapped region */
+/* Load at 0x400000 - all apps use same virtual address (proper virtual memory) */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x1000000;
+    . = 0x400000;
 
     .text : {
         *(.text .text.*)

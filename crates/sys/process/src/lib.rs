@@ -202,14 +202,17 @@ static mut NEXT_PID: u32 = 1;
 static mut CURRENT_PROCESS: Option<u32> = None;
 static mut KERNEL_PML4: u64 = 0;
 
-// Process memory layout (per process):
-//   base + 0x000000: Code/data (up to 1MB)
-//   base + 0x100000: Heap (1MB)
-//   base + 0x1F0000: Stack (64KB, grows down from base + 0x200000)
-// Total: 2MB per process, with 1.5MB gap before next process's code
-const PROCESS_MEM_BASE: u64 = 0x1000000;
-const PROCESS_MEM_SIZE: u64 = 0x400000;  // 4MB spacing between processes
-const PROCESS_STACK_SIZE: u64 = 0x100000; // 1MB stack
+// Virtual memory layout (SAME for all processes - each has own page table):
+//   0x400000: Code/data (loaded from ELF)
+//   0x800000: Heap start
+//   0xF00000: Stack (1MB, grows down from 0x1000000)
+//
+// Each process maps these virtual addresses to DIFFERENT physical pages.
+// This is proper virtual memory - all apps use same virtual addresses.
+const PROCESS_CODE_BASE: u64 = 0x400000;   // Where ELF loads (linker script)
+const PROCESS_HEAP_BASE: u64 = 0x800000;   // Heap starts here
+const PROCESS_STACK_TOP: u64 = 0x1000000;  // Stack grows down from here
+const PROCESS_STACK_SIZE: u64 = 0x100000;  // 1MB stack
 
 static mut KERNEL_RSP: u64 = 0;
 static mut KERNEL_RBP: u64 = 0;
@@ -512,11 +515,10 @@ pub fn resume_parent() -> ! {
     }
 }
 
-fn allocate_process_memory(pid: u32) -> (u64, u64, u64) {
-    let base = PROCESS_MEM_BASE + (pid as u64 - 1) * PROCESS_MEM_SIZE;
-    let stack_top = base + PROCESS_MEM_SIZE;
-    let heap_base = base + 0x80000;
-    (base, stack_top, heap_base)
+fn allocate_process_memory(_pid: u32) -> (u64, u64, u64) {
+    // All processes use the SAME virtual addresses - proper virtual memory!
+    // Each process has its own page table mapping these to different physical pages.
+    (PROCESS_CODE_BASE, PROCESS_STACK_TOP, PROCESS_HEAP_BASE)
 }
 
 /// Load and execute an ELF64 binary

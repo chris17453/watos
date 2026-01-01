@@ -1,12 +1,12 @@
 /* WATOS Application Linker Script
- * Base address at 16MB to avoid kernel conflict at 1MB
+ * All apps load at 0x400000 - proper virtual memory
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x1000000;  /* 16MB - safe from kernel at 0x100000 */
+    . = 0x400000;  /* All processes use same virtual address */
 
     .text.boot : {
         *(.text.boot)

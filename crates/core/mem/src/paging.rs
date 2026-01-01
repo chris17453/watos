@@ -153,26 +153,31 @@ impl ProcessPageTable {
     /// NOTE: Currently includes USER flag for shared kernel/user memory (like heap).
     /// This allows user processes to use kernel-allocated memory (SYS_MALLOC).
     fn map_kernel_space(&mut self) {
-        // Include USER flag so user code can access kernel heap (for SYS_MALLOC)
-        let kernel_flags = flags::PRESENT | flags::WRITABLE | flags::GLOBAL | flags::USER;
+        // Kernel-only flags for high canonical mappings
         let kernel_only_flags = flags::PRESENT | flags::WRITABLE | flags::GLOBAL;
 
-        // Map first 8MB (4 x 2MB pages) using huge pages
-        // This covers kernel code (0x100000), heap, app data, and kernel stacks (0x280000+)
+        // Map ONLY what the kernel needs for interrupt handling:
+        // - 0x000000-0x200000: Kernel code, boot structures (2MB large page)
+        // - High canonical: Kernel heap, AHCI DMA, etc. (kernel accesses via high addresses)
+        //
+        // DO NOT identity-map 0x200000+ because:
+        // - User apps load at virtual addresses like 0x400000
+        // - Each process has its own page table mapping those to fresh physical pages
+        // - Identity mapping would conflict and cause the app to access kernel memory!
+
+        // First 2MB: kernel code (identity mapped for interrupt handlers)
+        self.map_large_page(0, 0, kernel_only_flags);
+
+        // High canonical mappings for kernel to access physical memory during syscalls
+        // Maps physical 0-8MB to 0xFFFF_8000_0000_0000+
         for i in 0..4 {
             let phys_addr = (i as u64) * LARGE_PAGE_SIZE as u64;
-
-            // Identity mapping for kernel and user access
-            self.map_large_page(phys_addr, phys_addr, kernel_flags);
-
-            // High canonical mapping for proper kernel space (kernel only)
             let high_virt = KERNEL_SPACE_START + phys_addr;
             self.map_large_page(high_virt, phys_addr, kernel_only_flags);
         }
 
-        // NOTE: Do NOT map 16MB+ here - that's where user processes are loaded.
-        // Kernel accesses to physical pages during syscalls use the KERNEL page table
-        // (we switch to it before exec/loading), not the user page table.
+        // User applications will be mapped at their virtual addresses (e.g., 0x400000)
+        // by the ELF loader, with fresh physical pages allocated for each process.
     }
 
     /// Map a 2MB large page
