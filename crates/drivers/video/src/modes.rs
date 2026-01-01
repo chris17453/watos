@@ -31,6 +31,28 @@ pub const TEXT_132X50: VideoMode = VideoMode {
     format: PixelFormat::Indexed,
 };
 
+/// CGA/EGA legacy modes (for GWBASIC SCREEN compatibility)
+pub const CGA_320X200X4: VideoMode = VideoMode {
+    width: 320,
+    height: 200,
+    bpp: 4,
+    format: PixelFormat::Indexed,
+};
+
+pub const EGA_640X200X16: VideoMode = VideoMode {
+    width: 640,
+    height: 200,
+    bpp: 4,
+    format: PixelFormat::Indexed,
+};
+
+pub const VGA_640X480X16: VideoMode = VideoMode {
+    width: 640,
+    height: 480,
+    bpp: 4,
+    format: PixelFormat::Indexed,
+};
+
 /// Standard VGA graphics modes
 pub const VGA_MODE_13H: VideoMode = VideoMode {
     width: 320,
@@ -162,6 +184,10 @@ pub const ALL_MODES: &[VideoMode] = &[
     TEXT_80X50,
     TEXT_132X25,
     TEXT_132X50,
+    // CGA/EGA legacy modes
+    CGA_320X200X4,
+    EGA_640X200X16,
+    VGA_640X480X16,
     // VGA graphics modes
     VGA_MODE_13H,
     VGA_MODE_12H,

@@ -3,6 +3,7 @@
 //! Professional keyboard driver with support for:
 //! - Multiple keyboard layouts (US, UK, DE, FR, etc.)
 //! - Code page support (CP437, CP850, CP1252, UTF-8)
+//! - Dynamic keymap/codepage loading from files
 //! - Full modifier key support (Shift, Ctrl, Alt, AltGr, Caps Lock)
 //! - Proper key state tracking
 
@@ -97,29 +98,88 @@ pub mod scancodes {
     pub const RELEASE: u8 = 0x80;
 }
 
+/// Dynamic keyboard layout storage
+/// Maps scancodes (0-255) to Unicode codepoints (chars)
+struct DynamicKeymap {
+    /// Whether a custom keymap is loaded
+    loaded: bool,
+    /// Layout name (max 32 chars)
+    name: [u8; 32],
+    name_len: usize,
+    /// Normal (unshifted) map: scancode -> char (0 = no mapping)
+    normal: [u32; 256],
+    /// Shifted map: scancode -> char
+    shift: [u32; 256],
+    /// AltGr map: scancode -> char
+    altgr: [u32; 256],
+}
+
+impl DynamicKeymap {
+    const fn new() -> Self {
+        Self {
+            loaded: false,
+            name: [0; 32],
+            name_len: 0,
+            normal: [0; 256],
+            shift: [0; 256],
+            altgr: [0; 256],
+        }
+    }
+}
+
+/// Dynamic code page storage
+/// Maps byte values (0-255) to Unicode codepoints
+struct DynamicCodepage {
+    /// Whether a custom codepage is loaded
+    loaded: bool,
+    /// Code page ID
+    id: u16,
+    /// Name (max 32 chars)
+    name: [u8; 32],
+    name_len: usize,
+    /// Byte to unicode map
+    to_unicode: [u32; 256],
+}
+
+impl DynamicCodepage {
+    const fn new() -> Self {
+        Self {
+            loaded: false,
+            id: 437,
+            name: [0; 32],
+            name_len: 0,
+            to_unicode: [0; 256],
+        }
+    }
+}
+
 /// Keyboard driver configuration
 pub struct KeyboardDriver {
     state: Mutex<KeyboardState>,
     layout: Mutex<KeyboardLayout_>,
     codepage: Mutex<CodePage_>,
+    dynamic_keymap: Mutex<DynamicKeymap>,
+    dynamic_codepage: Mutex<DynamicCodepage>,
 }
 
-/// Dynamic keyboard layout enum
+/// Built-in keyboard layout enum
 #[derive(Clone, Copy)]
 enum KeyboardLayout_ {
     US,
     UK,
     DE,
     FR,
+    Custom, // Use dynamic keymap
 }
 
-/// Dynamic code page enum
+/// Built-in code page enum
 #[derive(Clone, Copy)]
 enum CodePage_ {
     CP437,
     CP850,
     CP1252,
     UTF8,
+    Custom, // Use dynamic codepage
 }
 
 impl KeyboardDriver {
@@ -128,27 +188,31 @@ impl KeyboardDriver {
             state: Mutex::new(KeyboardState::new()),
             layout: Mutex::new(KeyboardLayout_::US),
             codepage: Mutex::new(CodePage_::CP437),
+            dynamic_keymap: Mutex::new(DynamicKeymap::new()),
+            dynamic_codepage: Mutex::new(DynamicCodepage::new()),
         }
     }
 
-    /// Set the keyboard layout
+    /// Set the keyboard layout by name
     pub fn set_layout(&self, layout: &str) {
         let mut l = self.layout.lock();
         *l = match layout {
             "UK" | "uk" => KeyboardLayout_::UK,
             "DE" | "de" => KeyboardLayout_::DE,
             "FR" | "fr" => KeyboardLayout_::FR,
+            "CUSTOM" | "custom" => KeyboardLayout_::Custom,
             _ => KeyboardLayout_::US,
         };
     }
 
-    /// Set the code page
+    /// Set the code page by ID
     pub fn set_codepage(&self, codepage: u16) {
         let mut cp = self.codepage.lock();
         *cp = match codepage {
             850 => CodePage_::CP850,
             1252 => CodePage_::CP1252,
             65001 => CodePage_::UTF8,
+            0 => CodePage_::Custom, // Special value for custom
             _ => CodePage_::CP437,  // Default to CP437
         };
     }
@@ -160,6 +224,7 @@ impl KeyboardDriver {
             KeyboardLayout_::UK => "UK",
             KeyboardLayout_::DE => "DE",
             KeyboardLayout_::FR => "FR",
+            KeyboardLayout_::Custom => "CUSTOM",
         }
     }
 
@@ -170,7 +235,130 @@ impl KeyboardDriver {
             CodePage_::CP850 => 850,
             CodePage_::CP1252 => 1252,
             CodePage_::UTF8 => 65001,
+            CodePage_::Custom => self.dynamic_codepage.lock().id,
         }
+    }
+
+    /// Load a dynamic keymap from binary data
+    /// Format: KMAP (4 bytes) + version (1) + name_len (1) + name +
+    ///         normal_map (256 bytes) + shift_map (256 bytes) + altgr_map (256 bytes)
+    pub fn load_keymap(&self, data: &[u8]) -> Result<(), &'static str> {
+        if data.len() < 6 {
+            return Err("Data too short");
+        }
+
+        // Verify magic
+        if &data[0..4] != b"KMAP" {
+            return Err("Invalid magic");
+        }
+
+        // Check version
+        if data[4] != 1 {
+            return Err("Unsupported version");
+        }
+
+        let name_len = data[5] as usize;
+        if name_len > 32 {
+            return Err("Name too long");
+        }
+
+        let expected_len = 6 + name_len + 768;
+        if data.len() < expected_len {
+            return Err("Data too short for maps");
+        }
+
+        let mut keymap = self.dynamic_keymap.lock();
+
+        // Copy name
+        keymap.name_len = name_len;
+        for i in 0..name_len {
+            keymap.name[i] = data[6 + i];
+        }
+
+        // Extract the three 256-byte maps
+        let offset = 6 + name_len;
+
+        // Parse maps - each byte in the file represents a character
+        // 0 = no mapping, otherwise treat as Latin-1/ASCII code
+        for i in 0..256 {
+            let normal_byte = data[offset + i];
+            let shift_byte = data[offset + 256 + i];
+            let altgr_byte = data[offset + 512 + i];
+
+            // Map bytes to unicode codepoints (simple 1:1 for Latin-1)
+            keymap.normal[i] = if normal_byte == 0 { 0 } else { normal_byte as u32 };
+            keymap.shift[i] = if shift_byte == 0 { 0 } else { shift_byte as u32 };
+            keymap.altgr[i] = if altgr_byte == 0 { 0 } else { altgr_byte as u32 };
+        }
+
+        keymap.loaded = true;
+
+        // Switch to custom layout
+        *self.layout.lock() = KeyboardLayout_::Custom;
+
+        Ok(())
+    }
+
+    /// Load a dynamic codepage from binary data
+    /// Format: CPAG (4 bytes) + version (1) + id (2 LE) + name_len (1) + name +
+    ///         byte_to_unicode (256 * 4 bytes UTF-32 LE)
+    pub fn load_codepage(&self, data: &[u8]) -> Result<(), &'static str> {
+        if data.len() < 8 {
+            return Err("Data too short");
+        }
+
+        // Verify magic
+        if &data[0..4] != b"CPAG" {
+            return Err("Invalid magic");
+        }
+
+        // Check version
+        if data[4] != 1 {
+            return Err("Unsupported version");
+        }
+
+        // Extract code page ID (little-endian)
+        let cp_id = u16::from_le_bytes([data[5], data[6]]);
+        let name_len = data[7] as usize;
+
+        if name_len > 32 {
+            return Err("Name too long");
+        }
+
+        let expected_len = 8 + name_len + 1024;
+        if data.len() < expected_len {
+            return Err("Data too short for character map");
+        }
+
+        let mut codepage = self.dynamic_codepage.lock();
+
+        codepage.id = cp_id;
+        codepage.name_len = name_len;
+
+        // Copy name
+        for i in 0..name_len {
+            codepage.name[i] = data[8 + i];
+        }
+
+        // Extract the 256 * 4 byte character map (UTF-32 LE)
+        let offset = 8 + name_len;
+        for i in 0..256 {
+            let base = offset + i * 4;
+            let codepoint = u32::from_le_bytes([
+                data[base],
+                data[base + 1],
+                data[base + 2],
+                data[base + 3],
+            ]);
+            codepage.to_unicode[i] = codepoint;
+        }
+
+        codepage.loaded = true;
+
+        // Switch to custom codepage
+        *self.codepage.lock() = CodePage_::Custom;
+
+        Ok(())
     }
 
     /// Process a raw PS/2 scancode
@@ -316,6 +504,22 @@ impl KeyboardDriver {
                     layout.scancode_to_char(scancode)
                 }
             }
+            KeyboardLayout_::Custom => {
+                let keymap = self.dynamic_keymap.lock();
+                if !keymap.loaded {
+                    return None;
+                }
+                let codepoint = if shift {
+                    keymap.shift[scancode as usize]
+                } else {
+                    keymap.normal[scancode as usize]
+                };
+                if codepoint == 0 {
+                    None
+                } else {
+                    char::from_u32(codepoint)
+                }
+            }
         }
     }
 
@@ -323,6 +527,18 @@ impl KeyboardDriver {
         match layout {
             KeyboardLayout_::DE => LayoutDE.scancode_to_char_altgr(scancode),
             KeyboardLayout_::FR => LayoutFR.scancode_to_char_altgr(scancode),
+            KeyboardLayout_::Custom => {
+                let keymap = self.dynamic_keymap.lock();
+                if !keymap.loaded {
+                    return None;
+                }
+                let codepoint = keymap.altgr[scancode as usize];
+                if codepoint == 0 {
+                    None
+                } else {
+                    char::from_u32(codepoint)
+                }
+            }
             _ => None,  // US and UK don't typically use AltGr
         }
     }
@@ -333,6 +549,26 @@ impl KeyboardDriver {
             CodePage_::CP850 => CodePage850.from_unicode(ch),
             CodePage_::CP1252 => CodePage1252.from_unicode(ch),
             CodePage_::UTF8 => CodePageUTF8.from_unicode(ch),
+            CodePage_::Custom => {
+                // For custom codepage, we need reverse lookup
+                // Simple implementation: search for the character
+                let cp = self.dynamic_codepage.lock();
+                if !cp.loaded {
+                    return None;
+                }
+                let target = ch as u32;
+                for i in 0..256 {
+                    if cp.to_unicode[i] == target {
+                        return Some(i as u8);
+                    }
+                }
+                // ASCII fallback
+                if target <= 127 {
+                    Some(target as u8)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -388,70 +624,11 @@ pub fn reset_state() {
 /// Load keymap from binary data
 /// Format: KMAP (4 bytes) + version (1) + name_len (1) + name + normal_map (256) + shift_map (256) + altgr_map (256)
 pub fn load_keymap(data: &[u8]) -> Result<(), &'static str> {
-    if data.len() < 6 {
-        return Err("Data too short");
-    }
-
-    // Verify magic
-    if &data[0..4] != b"KMAP" {
-        return Err("Invalid magic");
-    }
-
-    // Check version
-    if data[4] != 1 {
-        return Err("Unsupported version");
-    }
-
-    let name_len = data[5] as usize;
-    if data.len() < 6 + name_len + 768 {
-        return Err("Data too short for maps");
-    }
-
-    // Extract the three 256-byte maps
-    let offset = 6 + name_len;
-    let normal_map = &data[offset..offset + 256];
-    let shift_map = &data[offset + 256..offset + 512];
-    let altgr_map = &data[offset + 512..offset + 768];
-
-    // TODO: Actually load these maps into the keyboard driver
-    // For now, the driver uses hard-coded layouts
-    // We'd need to refactor the driver to use dynamic maps
-
-    Ok(())
+    KEYBOARD.load_keymap(data)
 }
 
 /// Load codepage from binary data
 /// Format: CPAG (4 bytes) + version (1) + id (2 le) + name_len (1) + name + byte_to_unicode_map (256 * 4 bytes UTF-32 LE)
 pub fn load_codepage(data: &[u8]) -> Result<(), &'static str> {
-    if data.len() < 8 {
-        return Err("Data too short");
-    }
-
-    // Verify magic
-    if &data[0..4] != b"CPAG" {
-        return Err("Invalid magic");
-    }
-
-    // Check version
-    if data[4] != 1 {
-        return Err("Unsupported version");
-    }
-
-    // Extract code page ID
-    let cp_id = u16::from_le_bytes([data[5], data[6]]);
-    let name_len = data[7] as usize;
-
-    if data.len() < 8 + name_len + 1024 {
-        return Err("Data too short for character map");
-    }
-
-    // Extract the 256 * 4 byte character map
-    let offset = 8 + name_len;
-    let _char_map = &data[offset..offset + 1024];
-
-    // TODO: Actually load this character map into the keyboard driver
-    // For now, the driver uses hard-coded code pages
-    // We'd need to refactor the driver to use dynamic code page maps
-
-    Ok(())
+    KEYBOARD.load_codepage(data)
 }

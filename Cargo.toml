@@ -135,9 +135,13 @@ spin = "0.5.2"
 
 [features]
 default = []
-# Debug features - passed down to driver traits
-debug-all = []
-debug-storage = []
+# Kernel debug - verbose kernel logging (fd_read, exec, syscalls)
+debug-kernel = []
+# VFS debug - verbose filesystem/VFS logging
+debug-vfs = []
+# Debug features - passed down to driver traits (FAT, AHCI, etc.)
+debug-all = ["debug-kernel", "debug-vfs", "debug-storage"]
+debug-storage = ["watos-fat/debug", "watos-driver-ahci/debug"]
 debug-network = []
 debug-input = []
 debug-video = []

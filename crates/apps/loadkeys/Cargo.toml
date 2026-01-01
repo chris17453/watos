@@ -8,5 +8,4 @@ name = "loadkeys"
 path = "src/main.rs"
 
 [dependencies]
-watos-runtime = { path = "../../sys/runtime" }
 watos-syscall = { path = "../../core/syscall" }

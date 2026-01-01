@@ -12,6 +12,36 @@
 
 extern crate alloc;
 
+// Kernel debug macro - only outputs when 'debug-kernel' feature is enabled
+#[cfg(feature = "debug-kernel")]
+macro_rules! kernel_debug {
+    ($($arg:tt)*) => {{
+        unsafe {
+            $($arg)*
+        }
+    }};
+}
+
+#[cfg(not(feature = "debug-kernel"))]
+macro_rules! kernel_debug {
+    ($($arg:tt)*) => {};
+}
+
+// VFS debug macro - only outputs when 'debug-vfs' feature is enabled
+#[cfg(feature = "debug-vfs")]
+macro_rules! vfs_debug {
+    ($($arg:tt)*) => {{
+        unsafe {
+            $($arg)*
+        }
+    }};
+}
+
+#[cfg(not(feature = "debug-vfs"))]
+macro_rules! vfs_debug {
+    ($($arg:tt)*) => {};
+}
+
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 use spin::Mutex;
@@ -921,26 +951,26 @@ fn fd_read(fd: i64, buf: &mut [u8]) -> i64 {
         return -1;
     }
 
-    unsafe {
+    kernel_debug! {
         watos_arch::serial_write(b"  [fd_read] Acquiring FD_TABLE lock...\r\n");
     }
 
     let mut table = FD_TABLE.lock();
 
-    unsafe {
+    kernel_debug! {
         watos_arch::serial_write(b"  [fd_read] Lock acquired, calling file.read()...\r\n");
     }
 
     if let Some(ref mut file) = table[fd as usize] {
         let result = file.read(buf);
 
-        unsafe {
+        kernel_debug! {
             watos_arch::serial_write(b"  [fd_read] file.read() returned, processing result...\r\n");
         }
 
         match result {
             Ok(n) => {
-                unsafe {
+                kernel_debug! {
                     watos_arch::serial_write(b"  [fd_read] Success, ");
                     watos_arch::serial_hex(n as u64);
                     watos_arch::serial_write(b" bytes\r\n");
@@ -948,14 +978,14 @@ fn fd_read(fd: i64, buf: &mut [u8]) -> i64 {
                 n as i64
             },
             Err(_) => {
-                unsafe {
+                kernel_debug! {
                     watos_arch::serial_write(b"  [fd_read] Error\r\n");
                 }
                 -1
             }
         }
     } else {
-        unsafe {
+        kernel_debug! {
             watos_arch::serial_write(b"  [fd_read] FD not open\r\n");
         }
         -1 // Not open
@@ -1170,6 +1200,7 @@ mod syscall {
     pub const SYS_PUTCHAR: u64 = 16;
 
     // Console handle management
+    pub const SYS_CONSOLE_IN: u64 = 20;    // Get stdin handle (returns 0)
     pub const SYS_CONSOLE_OUT: u64 = 21;   // Get stdout handle (returns 1)
     pub const SYS_CONSOLE_ERR: u64 = 22;   // Get stderr handle (returns 2)
 
@@ -1194,6 +1225,14 @@ mod syscall {
     pub const SYS_VGA_SET_ACTIVE_SESSION: u64 = 39;
     pub const SYS_VGA_GET_SESSION_INFO: u64 = 40;
     pub const SYS_VGA_ENUMERATE_MODES: u64 = 41;
+
+    // GFX Graphics (GWBASIC SCREEN commands)
+    pub const SYS_GFX_PSET: u64 = 40;      // Set pixel
+    pub const SYS_GFX_LINE: u64 = 41;      // Draw line
+    pub const SYS_GFX_CIRCLE: u64 = 42;    // Draw circle
+    pub const SYS_GFX_CLS: u64 = 43;       // Clear graphics screen
+    pub const SYS_GFX_MODE: u64 = 44;      // Set graphics mode
+    pub const SYS_GFX_DISPLAY: u64 = 45;   // Display graphics buffer
 
     // Process management
     pub const SYS_GETPID: u64 = 12;
@@ -1644,6 +1683,11 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             }
         }
 
+        syscall::SYS_CONSOLE_IN => {
+            // Return stdin file descriptor
+            0
+        }
+
         syscall::SYS_CONSOLE_OUT => {
             // Return stdout file descriptor
             1
@@ -1811,8 +1855,8 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                     continue;
                 }
 
-                unsafe {
-                    watos_arch::serial_write(b"[KERNEL] Trying to load: ");
+                vfs_debug! {
+                    watos_arch::serial_write(b"[VFS] Trying to load: ");
                     watos_arch::serial_write(path.as_bytes());
                     watos_arch::serial_write(b"\r\n");
                 }
@@ -1820,8 +1864,8 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                 // Try to open and read the file from VFS
                 let fd = handle_sys_open(path.as_bytes(), 0); // 0 = read mode
                 if fd != u64::MAX {
-                    unsafe {
-                        watos_arch::serial_write(b"[KERNEL] File opened, allocating buffer...\r\n");
+                    vfs_debug! {
+                        watos_arch::serial_write(b"[VFS] File opened, allocating buffer...\r\n");
                     }
 
                     // Read file using Vec
@@ -1829,27 +1873,27 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                     const CHUNK_SIZE: usize = 4096;
                     let mut read_buf = [0u8; CHUNK_SIZE];
 
-                    unsafe {
+                    kernel_debug! {
                         watos_arch::serial_write(b"[KERNEL] Starting read loop...\r\n");
                     }
 
                     let mut iteration = 0;
                     loop {
-                        unsafe {
+                        kernel_debug! {
                             watos_arch::serial_write(b"[KERNEL] Calling fd_read #");
                             watos_arch::serial_hex(iteration + 1);
                             watos_arch::serial_write(b"...\r\n");
                         }
                         let chunk_read = fd_read(fd as i64, &mut read_buf);
                         iteration += 1;
-                        unsafe {
+                        kernel_debug! {
                             watos_arch::serial_write(b"[KERNEL] fd_read returned ");
                             watos_arch::serial_hex(chunk_read as u64);
                             watos_arch::serial_write(b"\r\n");
                         }
 
                         if chunk_read <= 0 {
-                            unsafe {
+                            kernel_debug! {
                                 watos_arch::serial_write(b"[KERNEL] EOF after ");
                                 watos_arch::serial_hex(iteration);
                                 watos_arch::serial_write(b" reads\r\n");
@@ -1857,7 +1901,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                             break;
                         }
 
-                        unsafe {
+                        kernel_debug! {
                             watos_arch::serial_write(b"[KERNEL] Extending buffer, current size=");
                             watos_arch::serial_hex(file_contents.len() as u64);
                             watos_arch::serial_write(b"\r\n");
@@ -1865,7 +1909,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
 
                         file_contents.extend_from_slice(&read_buf[..chunk_read as usize]);
 
-                        unsafe {
+                        kernel_debug! {
                             watos_arch::serial_write(b"[KERNEL] Extended to ");
                             watos_arch::serial_hex(file_contents.len() as u64);
                             watos_arch::serial_write(b"\r\n");
@@ -1873,7 +1917,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
 
                         // Safety limit: max 1MB per executable
                         if file_contents.len() >= 1024 * 1024 {
-                            unsafe {
+                            kernel_debug! {
                                 watos_arch::serial_write(b"[KERNEL] Hit 1MB limit after ");
                                 watos_arch::serial_hex(iteration);
                                 watos_arch::serial_write(b" reads, size=");
@@ -1884,7 +1928,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                         }
                     }
 
-                    unsafe {
+                    kernel_debug! {
                         watos_arch::serial_write(b"[KERNEL] Read complete, total=");
                         watos_arch::serial_hex(file_contents.len() as u64);
                         watos_arch::serial_write(b"\r\n");
@@ -1893,7 +1937,7 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
                     fd_close(fd as i64);
 
                     if !file_contents.is_empty() {
-                        unsafe {
+                        kernel_debug! {
                             watos_arch::serial_write(b"[KERNEL] Loaded ");
                             watos_arch::serial_hex(file_contents.len() as u64);
                             watos_arch::serial_write(b" bytes from ");
@@ -3031,6 +3075,120 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             let ms = arg1 as usize;
             for _ in 0..(ms * 1000) {
                 core::hint::spin_loop();
+            }
+            0
+        }
+
+        // GFX Graphics Syscalls (for GWBASIC and other apps)
+        syscall::SYS_GFX_PSET => {
+            // arg1 = x, arg2 = y, arg3 = color
+            let x = arg1 as u32;
+            let y = arg2 as u32;
+            let color = arg3 as u32;
+            watos_driver_video::set_pixel(x, y, color);
+            0
+        }
+
+        syscall::SYS_GFX_LINE => {
+            // arg1 = x1, arg2 = y1, arg3 = x2, r10 = y2, r8 = color
+            // Bresenham's line algorithm in kernel for performance
+            let x1 = arg1 as i32;
+            let y1 = arg2 as i32;
+            let x2 = arg3 as i32;
+            // r10 and r8 are passed but we need to access them via inline asm
+            // For simplicity, pack y2 and color in a different way or use saved regs
+            // Actually, the syscall handler saves r10/r8, let's access from SAVED_SYSCALL_REGS
+            let (y2, color) = unsafe {
+                let regs = &SAVED_SYSCALL_REGS;
+                (regs.r10 as i32, regs.r8 as u32)
+            };
+
+            // Bresenham's line algorithm
+            let mut x = x1;
+            let mut y = y1;
+            let dx = (x2 - x1).abs();
+            let dy = -(y2 - y1).abs();
+            let sx = if x1 < x2 { 1 } else { -1 };
+            let sy = if y1 < y2 { 1 } else { -1 };
+            let mut err = dx + dy;
+
+            loop {
+                watos_driver_video::set_pixel(x as u32, y as u32, color);
+                if x == x2 && y == y2 { break; }
+                let e2 = 2 * err;
+                if e2 >= dy {
+                    if x == x2 { break; }
+                    err += dy;
+                    x += sx;
+                }
+                if e2 <= dx {
+                    if y == y2 { break; }
+                    err += dx;
+                    y += sy;
+                }
+            }
+            0
+        }
+
+        syscall::SYS_GFX_CIRCLE => {
+            // arg1 = cx, arg2 = cy, arg3 = radius, r10 = color
+            let cx = arg1 as i32;
+            let cy = arg2 as i32;
+            let radius = arg3 as i32;
+            let color = unsafe { SAVED_SYSCALL_REGS.r10 as u32 };
+
+            // Midpoint circle algorithm
+            let mut x = radius;
+            let mut y = 0i32;
+            let mut err = 0i32;
+
+            while x >= y {
+                watos_driver_video::set_pixel((cx + x) as u32, (cy + y) as u32, color);
+                watos_driver_video::set_pixel((cx + y) as u32, (cy + x) as u32, color);
+                watos_driver_video::set_pixel((cx - y) as u32, (cy + x) as u32, color);
+                watos_driver_video::set_pixel((cx - x) as u32, (cy + y) as u32, color);
+                watos_driver_video::set_pixel((cx - x) as u32, (cy - y) as u32, color);
+                watos_driver_video::set_pixel((cx - y) as u32, (cy - x) as u32, color);
+                watos_driver_video::set_pixel((cx + y) as u32, (cy - x) as u32, color);
+                watos_driver_video::set_pixel((cx + x) as u32, (cy - y) as u32, color);
+
+                y += 1;
+                err += 1 + 2 * y;
+                if 2 * (err - x) + 1 > 0 {
+                    x -= 1;
+                    err += 1 - 2 * x;
+                }
+            }
+            0
+        }
+
+        syscall::SYS_GFX_CLS => {
+            // Clear graphics screen to black
+            watos_driver_video::clear(0);
+            0
+        }
+
+        syscall::SYS_GFX_MODE => {
+            // arg1 = mode number (BASIC SCREEN modes)
+            // Mode 0 = text, 1 = 320x200, 2 = 640x200, 3 = 640x480, 4 = 800x600
+            let mode = arg1 as u8;
+            let video_mode = match mode {
+                1 => watos_driver_video::modes::CGA_320X200X4,
+                2 => watos_driver_video::modes::EGA_640X200X16,
+                3 => watos_driver_video::modes::VGA_640X480X16,
+                4 => watos_driver_video::modes::SVGA_800X600X32,
+                _ => watos_driver_video::modes::TEXT_80X25,
+            };
+            match watos_driver_video::set_mode(video_mode) {
+                Ok(_) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+
+        syscall::SYS_GFX_DISPLAY => {
+            // Flip/display the graphics buffer
+            if let Some(session_id) = watos_driver_video::get_active_session() {
+                watos_driver_video::session_flip(session_id);
             }
             0
         }

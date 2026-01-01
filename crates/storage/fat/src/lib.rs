@@ -29,6 +29,21 @@ use watos_driver_traits::block::BlockDevice;
 pub use bpb::{BiosParameterBlock, FatType};
 pub use dir::{FatDirEntry, DirEntryIterator};
 
+// Debug macro - only outputs when 'debug' feature is enabled
+#[cfg(feature = "debug")]
+macro_rules! fat_debug {
+    ($($arg:tt)*) => {{
+        unsafe {
+            $($arg)*
+        }
+    }};
+}
+
+#[cfg(not(feature = "debug"))]
+macro_rules! fat_debug {
+    ($($arg:tt)*) => {};
+}
+
 /// Shared inner state for FAT filesystem
 /// This is wrapped in Arc<Mutex<>> so both the filesystem and file handles can access it
 struct FatInner<D: BlockDevice> {
@@ -57,7 +72,7 @@ impl<D: BlockDevice> FatInner<D> {
         let sector = self.cluster_to_sector(cluster);
         let sectors = self.sectors_per_cluster;
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"        [read_cluster] cluster=");
             watos_arch::serial_hex(cluster as u64);
             watos_arch::serial_write(b" sector=");
@@ -68,7 +83,7 @@ impl<D: BlockDevice> FatInner<D> {
         }
 
         for i in 0..sectors {
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"        [read_cluster] Reading sector ");
                 watos_arch::serial_hex(sector + i as u64);
                 watos_arch::serial_write(b"...\r\n");
@@ -80,7 +95,7 @@ impl<D: BlockDevice> FatInner<D> {
                 break;
             }
 
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"        [read_cluster] Calling device.read_sectors...\r\n");
             }
 
@@ -88,12 +103,12 @@ impl<D: BlockDevice> FatInner<D> {
                 .read_sectors(sector + i as u64, &mut buffer[offset..end])
                 .map_err(|_| VfsError::IoError)?;
 
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"        [read_cluster] Sector read OK\r\n");
             }
         }
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"        [read_cluster] All sectors read\r\n");
         }
 
@@ -270,7 +285,7 @@ impl<D: BlockDevice> FatInner<D> {
             && cached_cluster >= 2
             && cached_position / cluster_size <= target_cluster_index {
             // Start from cached position
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"      [FAT] Using cache, start_index=");
                 watos_arch::serial_hex(cached_position / cluster_size);
                 watos_arch::serial_write(b" target=");
@@ -280,7 +295,7 @@ impl<D: BlockDevice> FatInner<D> {
             (cached_cluster, cached_position / cluster_size)
         } else {
             // Start from beginning
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"      [FAT] Cache miss, walking from start, target=");
                 watos_arch::serial_hex(target_cluster_index);
                 watos_arch::serial_write(b"\r\n");
@@ -294,7 +309,7 @@ impl<D: BlockDevice> FatInner<D> {
             walk_count += 1;
             if walk_count > 10000 {
                 // Infinite loop protection
-                unsafe {
+                fat_debug! {
                     watos_arch::serial_write(b"      [FAT] INFINITE LOOP DETECTED\r\n");
                 }
                 return Err(VfsError::IoError);
@@ -305,7 +320,7 @@ impl<D: BlockDevice> FatInner<D> {
             }
         }
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"      [FAT] Walked ");
             watos_arch::serial_hex(walk_count);
             watos_arch::serial_write(b" clusters, current=");
@@ -321,7 +336,7 @@ impl<D: BlockDevice> FatInner<D> {
         // Stack is guaranteed to be identity-mapped for DMA
         let mut cluster_buf = [0u8; 4096];
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"      [FAT] Using stack buffer at ");
             watos_arch::serial_hex(cluster_buf.as_ptr() as u64);
             watos_arch::serial_write(b"\r\n");
@@ -331,13 +346,13 @@ impl<D: BlockDevice> FatInner<D> {
         while bytes_read < bytes_to_read && current_cluster >= 2 {
             read_count += 1;
             if read_count > 100 {
-                unsafe {
+                fat_debug! {
                     watos_arch::serial_write(b"      [FAT] Too many cluster reads!\r\n");
                 }
                 return Err(VfsError::IoError);
             }
 
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"      [FAT] Reading cluster ");
                 watos_arch::serial_hex(current_cluster as u64);
                 watos_arch::serial_write(b"\r\n");
@@ -345,7 +360,7 @@ impl<D: BlockDevice> FatInner<D> {
 
             self.read_cluster(current_cluster, &mut cluster_buf[..cluster_size as usize])?;
 
-            unsafe {
+            fat_debug! {
                 watos_arch::serial_write(b"      [FAT] Cluster read done\r\n");
             }
 
@@ -637,7 +652,7 @@ impl<D: BlockDevice + Send + Sync + 'static> FileOperations for FatFileHandle<D>
             return Ok(0);
         }
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"    [FAT] Acquiring inner lock, pos=");
             watos_arch::serial_hex(self.position);
             watos_arch::serial_write(b" cached_cluster=");
@@ -649,7 +664,7 @@ impl<D: BlockDevice + Send + Sync + 'static> FileOperations for FatFileHandle<D>
 
         let mut inner = self.inner.lock();
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"    [FAT] Inner lock acquired, calling read_file_data_cached...\r\n");
         }
 
@@ -662,7 +677,7 @@ impl<D: BlockDevice + Send + Sync + 'static> FileOperations for FatFileHandle<D>
             self.cluster_position,
         )?;
 
-        unsafe {
+        fat_debug! {
             watos_arch::serial_write(b"    [FAT] read_file_data_cached returned ");
             watos_arch::serial_hex(bytes_read as u64);
             watos_arch::serial_write(b" bytes\r\n");

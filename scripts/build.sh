@@ -258,6 +258,18 @@ if [ -f "$MKCODEPAGES" ]; then
     fi
 fi
 
+# Copy system resources (keymaps, codepages) to uefi_test
+log "Copying system resources to uefi_test..."
+mkdir -p "$PROJECT_ROOT/uefi_test/system"
+if [ -d "$PROJECT_ROOT/rootfs/system/keymaps" ]; then
+    cp -r "$PROJECT_ROOT/rootfs/system/keymaps" "$PROJECT_ROOT/uefi_test/system/"
+    success "Keymaps copied to uefi_test"
+fi
+if [ -d "$PROJECT_ROOT/rootfs/system/codepages" ]; then
+    cp -r "$PROJECT_ROOT/rootfs/system/codepages" "$PROJECT_ROOT/uefi_test/system/"
+    success "Codepages copied to uefi_test"
+fi
+
 # Step 7: Build WATOS native applications
 log "Building WATOS native applications..."
 mkdir -p "$PROJECT_ROOT/rootfs/BIN"
@@ -300,6 +312,31 @@ if RUSTFLAGS="$GWBASIC_RUSTFLAGS" CARGO_TARGET_DIR="$PROJECT_ROOT/target" cargo 
         mkdir -p "$PROJECT_ROOT/uefi_test/apps/system"
         cp "$GWBASIC_BIN" "$PROJECT_ROOT/uefi_test/apps/system/gwbasic"
         success "gwbasic binary built and copied to apps/system ($(du -h "$GWBASIC_BIN" | cut -f1))"
+
+        # Copy BASIC examples to rootfs and uefi_test
+        log "Copying BASIC examples..."
+        mkdir -p "$PROJECT_ROOT/rootfs/basic"
+        mkdir -p "$PROJECT_ROOT/uefi_test/basic"
+
+        if [ -d "$PROJECT_ROOT/crates/apps/gwbasic/examples" ]; then
+            for bas_file in "$PROJECT_ROOT/crates/apps/gwbasic/examples"/*.bas; do
+                if [ -f "$bas_file" ]; then
+                    # Convert to uppercase for DOS-style naming
+                    bas_name=$(basename "$bas_file" | tr '[:lower:]' '[:upper:]')
+                    cp "$bas_file" "$PROJECT_ROOT/rootfs/basic/$bas_name"
+                    cp "$bas_file" "$PROJECT_ROOT/uefi_test/basic/$bas_name"
+                fi
+            done
+
+            # Also copy README if present
+            if [ -f "$PROJECT_ROOT/crates/apps/gwbasic/examples/README.md" ]; then
+                cp "$PROJECT_ROOT/crates/apps/gwbasic/examples/README.md" "$PROJECT_ROOT/rootfs/basic/"
+                cp "$PROJECT_ROOT/crates/apps/gwbasic/examples/README.md" "$PROJECT_ROOT/uefi_test/basic/"
+            fi
+
+            example_count=$(ls -1 "$PROJECT_ROOT/rootfs/basic"/*.BAS 2>/dev/null | wc -l)
+            success "Copied $example_count BASIC examples to /basic/"
+        fi
     fi
 else
     echo -e "${YELLOW}[WARN]${NC} GWBASIC binary build failed (optional)"

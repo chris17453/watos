@@ -369,6 +369,8 @@ impl Graphics for WatosGraphics {
         let (w, h) = match mode {
             1 => (320, 200),
             2 => (640, 200),
+            3 => (640, 480),
+            4 => (800, 600),
             _ => (80, 25),
         };
         self.width = w;
