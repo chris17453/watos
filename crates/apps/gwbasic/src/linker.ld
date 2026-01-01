@@ -3,8 +3,8 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* Applications load at 2MB (kernel is at 1MB) */
-    . = 0x200000;
+    /* Applications load at 16MB - outside kernel's identity-mapped region (0-8MB) */
+    . = 0x1000000;
 
     /* Code section */
     .text : {

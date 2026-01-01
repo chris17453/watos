@@ -1,11 +1,11 @@
 /* Linker script for WATOS user programs */
-/* Load at 0x400000 (4MB) - after kernel at 0x100000 */
+/* Load at 0x1000000 (16MB) - outside kernel's identity-mapped region (0-8MB) */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x400000;
+    . = 0x1000000;
 
     .text : {
         *(.text .text.*)
