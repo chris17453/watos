@@ -5,27 +5,21 @@
 //! - 4KB and 2MB page support
 //! - User/kernel space separation
 //!
-//! # Memory Layout
-//!
-//! ```text
-//! 0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF : User space (lower half)
-//! 0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF : Kernel space (higher half)
-//! ```
+//! Uses constants from `layout.rs` - no magic numbers here.
 
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 
-/// Page size (4KB)
-pub const PAGE_SIZE: usize = 0x1000;
+use crate::layout::{
+    PAGE_SIZE, LARGE_PAGE_SIZE, KERNEL_HIGH_BASE,
+    PHYS_IDENTITY_MAP_END, VIRT_USER_MAX,
+};
 
-/// Large page size (2MB)
-pub const LARGE_PAGE_SIZE: usize = 0x200000;
+/// Re-export page size for backwards compatibility
+pub use crate::layout::PAGE_SIZE as PAGE_SIZE_CONST;
 
-/// Kernel space starts at -2GB (canonical high address)
-pub const KERNEL_SPACE_START: u64 = 0xFFFF_FFFF_8000_0000;
-
-/// User space maximum (lower 128TB in canonical addressing)
-pub const USER_SPACE_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+/// Re-export large page size for backwards compatibility
+pub use crate::layout::LARGE_PAGE_SIZE as LARGE_PAGE_SIZE_CONST;
 
 /// Page table entry flags
 pub mod flags {
@@ -142,42 +136,33 @@ impl ProcessPageTable {
 
     /// Map kernel space into this page table
     ///
-    /// Maps kernel memory regions to:
-    /// 1. Identity mapping (virt = phys) for kernel code/data access
-    /// 2. High canonical addresses for proper kernel space
+    /// Maps kernel memory regions using constants from layout.rs:
+    /// 1. Identity mapping (virt = phys) for kernel code/data (0 to PHYS_IDENTITY_MAP_END)
+    /// 2. High canonical addresses (KERNEL_HIGH_BASE) for syscall access
     ///
-    /// Covers:
-    /// - First 8MB: kernel code, heap, bootloader data, kernel stacks
-    /// - 16MB-48MB: physical page allocator region (for kernel access during syscalls)
+    /// Identity-mapped region includes:
+    /// - Kernel code, boot data, kernel stacks, kernel heap, AHCI DMA
     ///
-    /// NOTE: Currently includes USER flag for shared kernel/user memory (like heap).
-    /// This allows user processes to use kernel-allocated memory (SYS_MALLOC).
+    /// User applications are mapped separately at VIRT_USER_CODE (0x400000+)
     fn map_kernel_space(&mut self) {
-        // Kernel-only flags for high canonical mappings
-        let kernel_only_flags = flags::PRESENT | flags::WRITABLE | flags::GLOBAL;
+        // Kernel-only flags (NOT user accessible from Ring 3)
+        let kernel_flags = flags::PRESENT | flags::WRITABLE | flags::GLOBAL;
 
-        // Map ONLY what the kernel needs for interrupt handling:
-        // - 0x000000-0x200000: Kernel code, boot structures (2MB large page)
-        // - High canonical: Kernel heap, AHCI DMA, etc. (kernel accesses via high addresses)
-        //
-        // DO NOT identity-map 0x200000+ because:
-        // - User apps load at virtual addresses like 0x400000
-        // - Each process has its own page table mapping those to fresh physical pages
-        // - Identity mapping would conflict and cause the app to access kernel memory!
-
-        // First 2MB: kernel code (identity mapped for interrupt handlers)
-        self.map_large_page(0, 0, kernel_only_flags);
-
-        // High canonical mappings for kernel to access physical memory during syscalls
-        // Maps physical 0-8MB to 0xFFFF_8000_0000_0000+
-        for i in 0..4 {
-            let phys_addr = (i as u64) * LARGE_PAGE_SIZE as u64;
-            let high_virt = KERNEL_SPACE_START + phys_addr;
-            self.map_large_page(high_virt, phys_addr, kernel_only_flags);
+        // Identity map 0 to PHYS_IDENTITY_MAP_END (8MB) using 2MB pages
+        // This covers: kernel code, boot data, stacks, heap, AHCI DMA
+        let identity_pages = (PHYS_IDENTITY_MAP_END as usize) / LARGE_PAGE_SIZE;
+        for i in 0..identity_pages {
+            let addr = (i * LARGE_PAGE_SIZE) as u64;
+            self.map_large_page(addr, addr, kernel_flags);
         }
 
-        // User applications will be mapped at their virtual addresses (e.g., 0x400000)
-        // by the ELF loader, with fresh physical pages allocated for each process.
+        // High canonical mappings for kernel to access physical memory during syscalls
+        // Maps physical 0 to PHYS_IDENTITY_MAP_END at KERNEL_HIGH_BASE+
+        for i in 0..identity_pages {
+            let phys = (i * LARGE_PAGE_SIZE) as u64;
+            let high_virt = KERNEL_HIGH_BASE + phys;
+            self.map_large_page(high_virt, phys, kernel_flags);
+        }
     }
 
     /// Map a 2MB large page
@@ -228,8 +213,9 @@ impl ProcessPageTable {
     /// Map a 4KB page for user space
     ///
     /// Automatically adds USER flag to allow Ring 3 access.
+    /// Virtual address must be within user space (< VIRT_USER_MAX).
     pub fn map_user_page(&mut self, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), &'static str> {
-        if virt_addr > USER_SPACE_MAX {
+        if virt_addr >= VIRT_USER_MAX {
             return Err("Virtual address outside user space");
         }
 
@@ -445,7 +431,7 @@ impl Drop for ProcessPageTable {
     fn drop(&mut self) {
         // Free all physical pages allocated for this process (stack, heap, segments)
         for &phys_addr in &self.allocated_phys_pages {
-            crate::phys::free_page(phys_addr);
+            crate::pmm::free_page(phys_addr);
         }
 
         // Free all allocated sub-tables

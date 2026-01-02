@@ -207,11 +207,13 @@ pub fn session_clear(session_id: u32, color: Color) {
 pub fn session_blit(session_id: u32, data: &[u8], width: usize, height: usize, stride: usize) {
     if let Some(fb) = SESSION_MANAGER.lock().get_session_mut(session_id) {
         let bytes_per_pixel = (fb.mode.bpp as usize + 7) / 8;
+        // stride is in pixels, convert to bytes for row offset
+        let row_stride = stride * bytes_per_pixel;
         for y in 0..height.min(fb.mode.height as usize) {
             for x in 0..width.min(fb.mode.width as usize) {
-                let src_offset = y * stride + x * bytes_per_pixel;
+                let src_offset = y * row_stride + x * bytes_per_pixel;
                 if src_offset + bytes_per_pixel <= data.len() {
-                    // For simplicity, assume 8-bit indexed color for now
+                    // For 8-bit indexed, store byte directly
                     let color = data[src_offset] as Color;
                     fb.set_pixel(x as u32, y as u32, color);
                 }
@@ -220,29 +222,91 @@ pub fn session_blit(session_id: u32, data: &[u8], width: usize, height: usize, s
     }
 }
 
+/// EGA/VGA 16-color palette for indexed modes
+const PALETTE_16: [u32; 16] = [
+    0x000000, // 0: Black
+    0x0000AA, // 1: Blue
+    0x00AA00, // 2: Green
+    0x00AAAA, // 3: Cyan
+    0xAA0000, // 4: Red
+    0xAA00AA, // 5: Magenta
+    0xAA5500, // 6: Brown
+    0xAAAAAA, // 7: Light Gray
+    0x555555, // 8: Dark Gray
+    0x5555FF, // 9: Light Blue
+    0x55FF55, // 10: Light Green
+    0x55FFFF, // 11: Light Cyan
+    0xFF5555, // 12: Light Red
+    0xFF55FF, // 13: Light Magenta
+    0xFFFF55, // 14: Yellow
+    0xFFFFFF, // 15: White
+];
+
+/// Convert indexed color to RGB
+fn indexed_to_rgb(index: u8) -> u32 {
+    if index < 16 {
+        PALETTE_16[index as usize]
+    } else {
+        // Grayscale for 16-255
+        let g = index as u32;
+        (g << 16) | (g << 8) | g
+    }
+}
+
 /// Composite a session to the physical display (flip/swap buffers)
 pub fn session_flip(session_id: u32) {
-    // Create a temporary copy of the session data to avoid lock conflicts
-    let session_data: Option<alloc::vec::Vec<(u32, u32, Color)>> = {
+    // Get session info and physical display info
+    let (session_mode, phys_mode) = {
         let manager = SESSION_MANAGER.lock();
-        if let Some(fb) = manager.get_session(session_id) {
-            let mut pixels = alloc::vec::Vec::new();
-            for y in 0..fb.mode.height {
-                for x in 0..fb.mode.width {
-                    let color = fb.get_pixel(x, y);
-                    pixels.push((x, y, color));
+        let sm = manager.get_session(session_id).map(|fb| fb.mode);
+        let pm = get_current_mode();
+        (sm, pm)
+    };
+
+    let (session_mode, phys_mode) = match (session_mode, phys_mode) {
+        (Some(s), Some(p)) => (s, p),
+        _ => return,
+    };
+
+    // Calculate scaling factors
+    let scale_x = phys_mode.width / session_mode.width.max(1);
+    let scale_y = phys_mode.height / session_mode.height.max(1);
+    let scale = scale_x.min(scale_y).max(1);
+
+    // Offset to center the scaled image
+    let offset_x = (phys_mode.width - session_mode.width * scale) / 2;
+    let offset_y = (phys_mode.height - session_mode.height * scale) / 2;
+
+    // Clear physical display first
+    clear(0);
+
+    // Copy pixels with scaling and palette conversion
+    let manager = SESSION_MANAGER.lock();
+    if let Some(fb) = manager.get_session(session_id) {
+        let is_indexed = fb.mode.bpp <= 8;
+
+        for y in 0..fb.mode.height {
+            for x in 0..fb.mode.width {
+                let color = fb.get_pixel(x, y);
+
+                // Convert indexed to RGB if needed
+                let rgb = if is_indexed {
+                    indexed_to_rgb(color as u8)
+                } else {
+                    color
+                };
+
+                // Draw scaled pixel
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = offset_x + x * scale + sx;
+                        let py = offset_y + y * scale + sy;
+                        if px < phys_mode.width && py < phys_mode.height {
+                            set_pixel(px, py, rgb);
+                        }
+                    }
                 }
             }
-            Some(pixels)
-        } else {
-            None
-        }
-    };
-    
-    // Now write the pixels without holding the session lock
-    if let Some(pixels) = session_data {
-        for (x, y, color) in pixels {
-            set_pixel(x, y, color);
         }
     }
 }

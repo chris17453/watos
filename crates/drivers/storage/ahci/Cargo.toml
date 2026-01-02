@@ -8,6 +8,7 @@ description = "WATOS AHCI (SATA) driver"
 watos-driver-traits = { path = "../../traits" }
 watos-driver-pci = { path = "../../bus/pci" }
 watos-arch = { path = "../../../core/arch" }
+watos-mem = { path = "../../../core/mem" }
 
 [features]
 default = []

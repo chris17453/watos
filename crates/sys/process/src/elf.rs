@@ -246,7 +246,8 @@ impl Elf64 {
     ///
     /// Allocates fresh physical pages for each segment to ensure process isolation.
     pub fn load_segments_protected(&self, data: &[u8], load_base: u64, page_table: &mut watos_mem::paging::ProcessPageTable) -> Result<(), &'static str> {
-        use watos_mem::paging::{flags as page_flags, PAGE_SIZE};
+        use watos_mem::paging::flags as page_flags;
+        use watos_mem::layout::PAGE_SIZE;
         use super::{debug_serial, debug_hex};
 
         unsafe {
@@ -337,8 +338,8 @@ impl Elf64 {
                 // Check if this page is already mapped from a previous segment
                 let existing_phys = page_table.lookup(page_virt);
 
-                // Allocate physical page
-                let phys_page = watos_mem::phys::alloc_page()
+                // Allocate physical page using PMM
+                let phys_page = watos_mem::pmm::alloc_page()
                     .ok_or("Out of physical memory")?;
 
                 // Track the physical page for cleanup when process exits

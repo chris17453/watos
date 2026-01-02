@@ -61,8 +61,9 @@ use watos_procfs::{ProcFs, SystemProvider};
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const HEAP_START: usize = 0x200000;
-const HEAP_SIZE: usize = 4 * 1024 * 1024;
+// Use layout constants - heap starts at 0x300000 (after kernel stacks)
+const HEAP_START: usize = watos_mem::layout::PHYS_KERNEL_HEAP as usize;
+const HEAP_SIZE: usize = watos_mem::layout::PHYS_KERNEL_HEAP_SIZE as usize;
 
 /// Maximum number of preloaded apps
 const MAX_PRELOADED_APPS: usize = 32;
@@ -620,12 +621,12 @@ impl SystemProvider for WatosSystemProvider {
 
     fn mem_info(&self) -> alloc::string::String {
         use alloc::format;
-        let phys_stats = watos_mem::phys::stats();
+        let phys_stats = watos_mem::pmm::stats();
         let heap_stats = watos_mem::heap::stats();
 
-        let total_kb = phys_stats.total_bytes() / 1024;
-        let free_kb = phys_stats.free_bytes() / 1024;
-        let used_kb = phys_stats.used_bytes() / 1024;
+        let total_kb = phys_stats.total_bytes / 1024;
+        let free_kb = phys_stats.free_bytes / 1024;
+        let used_kb = (phys_stats.total_bytes - phys_stats.free_bytes) / 1024;
         let heap_total_kb = heap_stats.total / 1024;
         let heap_used_kb = heap_stats.used / 1024;
         let heap_free_kb = (heap_stats.total - heap_stats.used) / 1024;
@@ -1054,10 +1055,10 @@ pub extern "C" fn _start() -> ! {
     watos_arch::idt::install_syscall_handler(syscall_handler);
     unsafe { watos_arch::serial_write(b"[KERNEL] Syscall handler installed\r\n"); }
 
-    // 4.5. Initialize physical page allocator
-    // Start at 16MB (0x1000000), give 128MB for process physical pages
-    // This memory is used for process code, stack, and heap pages
-    watos_mem::phys::init(0x1000000, 128 * 1024 * 1024);
+    // 4.5. Initialize Physical Memory Manager (PMM)
+    // Uses layout::PHYS_ALLOCATOR_START (16MB) as base
+    // Gives 128MB for user process physical pages
+    watos_mem::pmm::init(watos_mem::PHYS_ALLOCATOR_START, 128 * 1024 * 1024);
     unsafe { watos_arch::serial_write(b"[KERNEL] Physical allocator initialized (128MB @ 16MB)\r\n"); }
 
 // 5. Initialize process subsystem
@@ -1198,6 +1199,8 @@ mod syscall {
     pub const SYS_MALLOC: u64 = 14;
     pub const SYS_FREE: u64 = 15;
     pub const SYS_PUTCHAR: u64 = 16;
+    pub const SYS_SBRK: u64 = 17;      // Set heap break (returns old break)
+    pub const SYS_HEAP_BREAK: u64 = 18; // Get current heap break
 
     // Console handle management
     pub const SYS_CONSOLE_IN: u64 = 20;    // Get stdin handle (returns 0)
@@ -1405,6 +1408,19 @@ static mut SAVED_SYSCALL_REGS: SavedSyscallRegs = SavedSyscallRegs {
 /// return_rip and return_rsp are from the interrupt frame for saving parent context
 #[inline(never)]
 extern "C" fn handle_syscall_inner(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, return_rsp: u64) -> u64 {
+    // Enable user memory access (SMAP bypass) for the duration of syscall handling.
+    // This is required because syscalls often need to read/write user buffers.
+    watos_mem::stac();
+
+    let result = handle_syscall_impl(num, arg1, arg2, arg3, return_rip, return_rsp);
+
+    // Restore SMAP protection before returning to user mode
+    watos_mem::clac();
+
+    result
+}
+
+fn handle_syscall_impl(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, return_rsp: u64) -> u64 {
     // For file I/O syscalls that access disk, we need to switch to kernel page table
     // to access AHCI MMIO. But we must copy user data first since user pointers
     // become invalid after CR3 switch.
@@ -1706,31 +1722,29 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         }
 
         syscall::SYS_MALLOC => {
-            // arg1 = size, returns pointer
-            use alloc::alloc::{alloc, Layout};
+            // arg1 = size, returns pointer in user heap (0x800000+)
+            // Uses per-process user heap, NOT kernel heap
             let size = arg1 as usize;
-            if size == 0 {
-                return 0;
-            }
-            unsafe {
-                let layout = Layout::from_size_align(size, 8).unwrap();
-                alloc(layout) as u64
-            }
+            watos_process::heap_alloc(size)
         }
 
         syscall::SYS_FREE => {
             // arg1 = pointer, arg2 = size
-            use alloc::alloc::{dealloc, Layout};
-            let ptr = arg1 as *mut u8;
-            let size = arg2 as usize;
-            if ptr.is_null() || size == 0 {
-                return 0;
-            }
-            unsafe {
-                let layout = Layout::from_size_align(size, 8).unwrap();
-                dealloc(ptr, layout);
-            }
+            // Currently a no-op - user heap is bump-allocated, freed on process exit
+            // User-space can implement proper malloc/free on top of sbrk
             0
+        }
+
+        syscall::SYS_SBRK => {
+            // arg1 = new break address
+            // Returns old break on success, u64::MAX on failure
+            let new_break = arg1;
+            watos_process::set_heap_break(new_break)
+        }
+
+        syscall::SYS_HEAP_BREAK => {
+            // Returns current heap break
+            watos_process::heap_break()
         }
 
         syscall::SYS_FB_INFO => {
@@ -2062,12 +2076,12 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
             }
 
             unsafe {
-                let phys_stats = watos_mem::phys::stats();
+                let phys_stats = watos_mem::pmm::stats();
                 let heap_stats = watos_mem::heap::stats();
 
-                *buf_ptr.offset(0) = phys_stats.total_bytes() as u64;
-                *buf_ptr.offset(1) = phys_stats.free_bytes() as u64;
-                *buf_ptr.offset(2) = phys_stats.used_bytes() as u64;
+                *buf_ptr.offset(0) = phys_stats.total_bytes as u64;
+                *buf_ptr.offset(1) = phys_stats.free_bytes as u64;
+                *buf_ptr.offset(2) = (phys_stats.total_bytes - phys_stats.free_bytes) as u64;
                 *buf_ptr.offset(3) = heap_stats.total as u64;
                 *buf_ptr.offset(4) = heap_stats.used as u64;
             }
@@ -2456,41 +2470,60 @@ fn handle_syscall(num: u64, arg1: u64, arg2: u64, arg3: u64, return_rip: u64, re
         }
 
         syscall::SYS_VGA_BLIT => {
-            // arg1 = buffer pointer, arg2 = width, arg3 = height, arg4 = stride
+            // arg1 = buffer pointer, arg2 = width, arg3 = height
             let buf_ptr = arg1 as *const u8;
             let width = arg2 as usize;
             let height = arg3 as usize;
-            let stride = arg3 as usize; // Note: should be r10 for 4th arg
-            
+            let stride = width; // stride in pixels = width for packed buffer
+
             if buf_ptr.is_null() || width == 0 || height == 0 {
                 return u64::MAX;
             }
 
-            unsafe {
-                let data = core::slice::from_raw_parts(buf_ptr, stride * height);
-                // Blit to active session if exists, otherwise to physical framebuffer
-                if let Some(session_id) = watos_driver_video::get_active_session() {
-                    watos_driver_video::session_blit(session_id, data, width, height, stride);
-                } else {
-                    // Direct blit to physical framebuffer
-                    for y in 0..height {
-                        for x in 0..width {
-                            let offset = y * stride + x;
-                            if offset < data.len() {
-                                let color = data[offset] as u32;
-                                watos_driver_video::set_pixel(x as u32, y as u32, color);
+            // Get session's bpp for proper buffer size calculation
+            let bytes_per_pixel = if let Some(session_id) = watos_driver_video::get_active_session() {
+                watos_driver_video::get_session_info(session_id)
+                    .map(|m| ((m.bpp as usize + 7) / 8))
+                    .unwrap_or(1)
+            } else {
+                1 // Default to 8-bit
+            };
+
+            let buf_size = stride * height * bytes_per_pixel;
+
+            // Use SMAP bypass to access user buffer
+            watos_mem::with_user_access(|| {
+                unsafe {
+                    let data = core::slice::from_raw_parts(buf_ptr, buf_size);
+                    // Blit to active session if exists, otherwise to physical framebuffer
+                    if let Some(session_id) = watos_driver_video::get_active_session() {
+                        watos_driver_video::session_blit(session_id, data, width, height, stride);
+                    } else {
+                        // Direct blit to physical framebuffer
+                        for y in 0..height {
+                            for x in 0..width {
+                                let offset = y * stride + x;
+                                if offset < data.len() {
+                                    let color = data[offset] as u32;
+                                    watos_driver_video::set_pixel(x as u32, y as u32, color);
+                                }
                             }
                         }
                     }
                 }
-            }
+            });
             0
         }
 
         syscall::SYS_VGA_CLEAR => {
             // arg1 = color (8-bit indexed or low byte of RGB)
             let color = arg1 as u32;
-            watos_driver_video::clear(color);
+            // Clear the active session's virtual framebuffer, not physical
+            if let Some(session_id) = watos_driver_video::get_active_session() {
+                watos_driver_video::session_clear(session_id, color);
+            } else {
+                watos_driver_video::clear(color);
+            }
             0
         }
 

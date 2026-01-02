@@ -7,7 +7,8 @@
 extern crate alloc;
 use alloc::string::String;
 use alloc::collections::BTreeMap;
-use watos_mem::paging::{ProcessPageTable, flags as page_flags, PAGE_SIZE};
+use watos_mem::paging::{ProcessPageTable, flags as page_flags};
+use watos_mem::layout::PAGE_SIZE;
 
 pub mod elf;
 
@@ -185,7 +186,8 @@ pub struct Process {
     pub entry_point: u64,
     pub stack_top: u64,
     pub heap_base: u64,
-    pub heap_size: usize,
+    pub heap_break: u64,  // Current end of heap (grows up from heap_base)
+    pub heap_mapped: u64, // How many bytes of heap are currently mapped
     pub page_table: ProcessPageTable,
     pub handle_table: HandleTable,
     pub uid: u32,  // User ID
@@ -202,17 +204,17 @@ static mut NEXT_PID: u32 = 1;
 static mut CURRENT_PROCESS: Option<u32> = None;
 static mut KERNEL_PML4: u64 = 0;
 
-// Virtual memory layout (SAME for all processes - each has own page table):
-//   0x400000: Code/data (loaded from ELF)
-//   0x800000: Heap start
-//   0xF00000: Stack (1MB, grows down from 0x1000000)
-//
-// Each process maps these virtual addresses to DIFFERENT physical pages.
-// This is proper virtual memory - all apps use same virtual addresses.
-const PROCESS_CODE_BASE: u64 = 0x400000;   // Where ELF loads (linker script)
-const PROCESS_HEAP_BASE: u64 = 0x800000;   // Heap starts here
-const PROCESS_STACK_TOP: u64 = 0x1000000;  // Stack grows down from here
-const PROCESS_STACK_SIZE: u64 = 0x100000;  // 1MB stack
+// Virtual memory layout - uses constants from watos_mem::layout
+// All addresses defined in ONE place (layout.rs)
+use watos_mem::layout::{
+    VIRT_USER_CODE, VIRT_USER_HEAP, VIRT_USER_STACK_TOP, VIRT_USER_STACK_SIZE,
+    KERNEL_STACK_SIZE, PHYS_KERNEL_STACKS, kernel_stack_top,
+};
+
+const PROCESS_CODE_BASE: u64 = VIRT_USER_CODE;    // 0x400000
+const PROCESS_HEAP_BASE: u64 = VIRT_USER_HEAP;    // 0x800000
+const PROCESS_STACK_TOP: u64 = VIRT_USER_STACK_TOP; // 0x1000000
+const PROCESS_STACK_SIZE: u64 = VIRT_USER_STACK_SIZE; // ~1MB
 
 static mut KERNEL_RSP: u64 = 0;
 static mut KERNEL_RBP: u64 = 0;
@@ -431,11 +433,9 @@ pub fn resume_parent() -> ! {
         PARENT_CONTEXT.valid = false;
         CURRENT_PROCESS = Some(parent_pid);
 
-        // Calculate parent's kernel stack
-        const KERNEL_STACK_SIZE: usize = 0x10000;
-        let kernel_stack_base = 0x280000 + (parent_pid as usize * KERNEL_STACK_SIZE);
-        let kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
-        watos_arch::tss::set_kernel_stack(kernel_stack_top as u64);
+        // Calculate parent's kernel stack using layout constants
+        let kstack_top = kernel_stack_top(parent_pid as usize);
+        watos_arch::tss::set_kernel_stack(kstack_top);
 
         let user_ds = watos_arch::gdt::selectors::USER_DATA as u64;
 
@@ -593,8 +593,8 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
 
     for i in 0..stack_pages {
         let virt_addr = stack_top - (i as u64 + 1) * PAGE_SIZE as u64;
-        let phys_addr = watos_mem::phys::alloc_page()
-            .ok_or("Out of physical memory for stack")? as u64;
+        let phys_addr = watos_mem::pmm::alloc_page()
+            .ok_or("Out of physical memory for stack")?;
         unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
         page_table.track_phys_page(phys_addr);
         page_table.map_user_page(virt_addr, phys_addr,
@@ -608,8 +608,8 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
     let heap_pages = 64u64;
     for i in 0..heap_pages {
         let virt_addr = heap_base + i * PAGE_SIZE as u64;
-        let phys_addr = watos_mem::phys::alloc_page()
-            .ok_or("Out of physical memory for heap")? as u64;
+        let phys_addr = watos_mem::pmm::alloc_page()
+            .ok_or("Out of physical memory for heap")?;
         unsafe { core::ptr::write_bytes(phys_addr as *mut u8, 0, PAGE_SIZE); }
         page_table.track_phys_page(phys_addr);
         page_table.map_user_page(virt_addr, phys_addr,
@@ -662,6 +662,7 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         }
     };
 
+    let heap_mapped_bytes = (heap_pages as u64) * PAGE_SIZE as u64;
     let process = Process {
         id: pid,
         name: name_copy,
@@ -670,7 +671,8 @@ pub fn exec(name: &str, data: &[u8], args: &str) -> Result<u32, &'static str> {
         entry_point: entry,
         stack_top,
         heap_base,
-        heap_size: (heap_pages as usize) * PAGE_SIZE,
+        heap_break: heap_base,  // Start at base, grows up
+        heap_mapped: heap_mapped_bytes,  // Initial mapped heap
         page_table,
         handle_table: HandleTable::new(),
         uid: get_current_uid(),  // Inherit from current process
@@ -738,15 +740,14 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
         KERNEL_RSP = saved_rsp;
         KERNEL_RBP = saved_rbp;
 
-        const KERNEL_STACK_SIZE: usize = 0x10000;
-        let kernel_stack_base = 0x280000 + (pid as usize * KERNEL_STACK_SIZE);
-        let kernel_stack_top = kernel_stack_base + KERNEL_STACK_SIZE;
+        // Use layout constants for kernel stack
+        let kstack_top = kernel_stack_top(pid as usize);
 
         debug_serial(b"[PROCESS] Kernel stack for interrupts: 0x");
-        debug_hex(kernel_stack_top as u64);
+        debug_hex(kstack_top);
         debug_serial(b"\r\n");
 
-        watos_arch::tss::set_kernel_stack(kernel_stack_top as u64);
+        watos_arch::tss::set_kernel_stack(kstack_top);
     }
 
     unsafe {
@@ -815,10 +816,15 @@ fn run_process(pid: u32) -> Result<(), &'static str> {
 
         debug_serial(b"[PROCESS] Switching to user page table...\r\n");
 
-        // Switch to a kernel stack within the mapped 8MB region
+        // Enable SMAP bypass - after CR3 switch we may access user-mapped pages
+        // while still in supervisor mode (before IRETQ). Without stac(), SMAP would
+        // block any access to pages with USER bit set.
+        watos_mem::stac();
+
+        // Switch to a kernel stack within the mapped 4MB region (0-4MB identity mapped)
         // This is necessary because CR3 switch will make our current stack inaccessible
-        let mapped_kernel_stack: u64 = 0x5FF000;  // Within first 8MB, mapped in process page table
-        debug_serial(b"[DEBUG] Switching to mapped kernel stack at 0x5FF000\r\n");
+        let mapped_kernel_stack: u64 = 0x3FF000;  // Within first 4MB, mapped in process page table
+        debug_serial(b"[DEBUG] Switching to mapped kernel stack at 0x3FF000\r\n");
         core::arch::asm!(
             "mov rsp, {stack}",
             "mov rbp, {stack}",
@@ -1240,5 +1246,155 @@ pub fn listenv() -> alloc::vec::Vec<String> {
             }
         }
         Vec::new()
+    }
+}
+
+// =============================================================================
+// User Heap Management
+// =============================================================================
+
+/// Allocate memory from the current process's user heap
+/// Returns the virtual address of the allocated memory, or 0 on failure
+///
+/// This is a simple bump allocator - memory is never freed until process exits.
+/// For proper malloc/free, user-space should implement its own allocator on top.
+pub fn heap_alloc(size: usize) -> u64 {
+    use watos_mem::layout::{PAGE_SIZE, VIRT_USER_GUARD};
+
+    if size == 0 {
+        return 0;
+    }
+
+    // Align size to 8 bytes
+    let aligned_size = (size + 7) & !7;
+
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(p) = slot {
+                    if p.id == pid {
+                        let old_break = p.heap_break;
+                        let new_break = old_break + aligned_size as u64;
+
+                        // Check we don't overflow into guard page
+                        if new_break > VIRT_USER_GUARD {
+                            debug_serial(b"[HEAP] Allocation would overflow into guard page\r\n");
+                            return 0;
+                        }
+
+                        // Check if we need to map more pages
+                        let heap_end_mapped = p.heap_base + p.heap_mapped;
+                        if new_break > heap_end_mapped {
+                            // Need to allocate more pages
+                            let pages_needed = ((new_break - heap_end_mapped + PAGE_SIZE as u64 - 1)
+                                / PAGE_SIZE as u64) as usize;
+
+                            for i in 0..pages_needed {
+                                let virt = heap_end_mapped + (i as u64 * PAGE_SIZE as u64);
+                                let phys = match watos_mem::pmm::alloc_page() {
+                                    Some(p) => p,
+                                    None => {
+                                        debug_serial(b"[HEAP] Out of physical memory\r\n");
+                                        return 0;
+                                    }
+                                };
+
+                                // Zero the page
+                                core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE);
+
+                                // Map with user flags
+                                let flags = watos_mem::paging::flags::PRESENT
+                                    | watos_mem::paging::flags::WRITABLE
+                                    | watos_mem::paging::flags::USER;
+                                p.page_table.map_4k_page(virt, phys, flags);
+                                p.page_table.track_phys_page(phys);
+                            }
+
+                            p.heap_mapped += (pages_needed as u64) * PAGE_SIZE as u64;
+                        }
+
+                        p.heap_break = new_break;
+                        return old_break;
+                    }
+                }
+            }
+        }
+        0
+    }
+}
+
+/// Get current heap break for the current process
+pub fn heap_break() -> u64 {
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter() {
+                if let Some(p) = slot {
+                    if p.id == pid {
+                        return p.heap_break;
+                    }
+                }
+            }
+        }
+        0
+    }
+}
+
+/// Set heap break (sbrk-style)
+/// Returns the OLD break on success, or u64::MAX on failure
+pub fn set_heap_break(new_break: u64) -> u64 {
+    use watos_mem::layout::{PAGE_SIZE, VIRT_USER_GUARD};
+
+    unsafe {
+        if let Some(pid) = CURRENT_PROCESS {
+            for slot in PROCESSES.iter_mut() {
+                if let Some(p) = slot {
+                    if p.id == pid {
+                        // Can't go below heap base
+                        if new_break < p.heap_base {
+                            return u64::MAX;
+                        }
+
+                        // Can't go above guard page
+                        if new_break > VIRT_USER_GUARD {
+                            return u64::MAX;
+                        }
+
+                        let old_break = p.heap_break;
+
+                        // If growing, may need to map more pages
+                        if new_break > old_break {
+                            let heap_end_mapped = p.heap_base + p.heap_mapped;
+                            if new_break > heap_end_mapped {
+                                let pages_needed = ((new_break - heap_end_mapped + PAGE_SIZE as u64 - 1)
+                                    / PAGE_SIZE as u64) as usize;
+
+                                for i in 0..pages_needed {
+                                    let virt = heap_end_mapped + (i as u64 * PAGE_SIZE as u64);
+                                    let phys = match watos_mem::pmm::alloc_page() {
+                                        Some(p) => p,
+                                        None => return u64::MAX,
+                                    };
+
+                                    core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE);
+
+                                    let flags = watos_mem::paging::flags::PRESENT
+                                        | watos_mem::paging::flags::WRITABLE
+                                        | watos_mem::paging::flags::USER;
+                                    p.page_table.map_4k_page(virt, phys, flags);
+                                    p.page_table.track_phys_page(phys);
+                                }
+
+                                p.heap_mapped += (pages_needed as u64) * PAGE_SIZE as u64;
+                            }
+                        }
+                        // Note: shrinking doesn't unmap pages (they're freed on process exit)
+
+                        p.heap_break = new_break;
+                        return old_break;
+                    }
+                }
+            }
+        }
+        u64::MAX
     }
 }

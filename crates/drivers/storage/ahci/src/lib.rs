@@ -135,9 +135,8 @@ pub struct AhciDriver {
 
 impl AhciDriver {
     /// Base memory address for AHCI structures
-    /// Use 0x700000 (7MB) - after kernel heap (2MB-6MB), before physical allocator (16MB+)
-    /// CRITICAL: Must NOT overlap with kernel heap at 0x200000-0x600000!
-    const AHCI_MEM_BASE: u64 = 0x700000;
+    /// Uses layout::PHYS_AHCI_DMA (0x700000) from the central memory layout
+    const AHCI_MEM_BASE: u64 = watos_mem::layout::PHYS_AHCI_DMA;
     const PORT_MEM_SIZE: u64 = 0x4000;
 
     fn port_cmd_list(port: u8) -> u64 {

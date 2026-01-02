@@ -2,11 +2,54 @@
 //!
 //! Provides safe mechanisms for the kernel to access user space memory.
 //! All syscalls that receive user pointers MUST validate them using these functions.
+//!
+//! # SMAP (Supervisor Mode Access Prevention)
+//!
+//! Modern x86_64 CPUs have SMAP which prevents the kernel from accessing user
+//! memory unless explicitly allowed. This module uses `stac` and `clac` instructions
+//! to temporarily enable/disable user memory access.
 
 /// Maximum user space address (canonical form for x86_64)
 /// User space: 0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF
 /// Kernel space: 0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF
 pub const USER_SPACE_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// Enable access to user memory (SMAP bypass)
+/// Sets the AC flag in RFLAGS to allow supervisor access to user pages.
+///
+/// Note: This modifies RFLAGS, so we don't use preserves_flags.
+#[inline(always)]
+pub fn stac() {
+    unsafe {
+        core::arch::asm!("stac", options(nostack));
+    }
+}
+
+/// Disable access to user memory (restore SMAP protection)
+/// Clears the AC flag in RFLAGS to prevent supervisor access to user pages.
+///
+/// Note: This modifies RFLAGS, so we don't use preserves_flags.
+#[inline(always)]
+pub fn clac() {
+    unsafe {
+        core::arch::asm!("clac", options(nostack));
+    }
+}
+
+/// Execute a closure with user memory access enabled (SMAP disabled)
+///
+/// This is the preferred way to access user memory - it ensures SMAP is
+/// properly restored even if the closure panics.
+#[inline]
+pub fn with_user_access<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    stac();
+    let result = f();
+    clac();
+    result
+}
 
 /// Memory access validation errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,23 +121,30 @@ pub fn validate_user_ptr(ptr: u64, len: u64) -> Result<(), UserAccessError> {
 ///
 /// # Safety
 /// This function performs bounds checking but cannot prevent TOCTOU issues.
+/// Uses SMAP bypass (stac/clac) to access user memory.
 pub fn read_user_string(ptr: u64, max_len: u64) -> Result<alloc::string::String, UserAccessError> {
     use alloc::string::String;
-    
+    use alloc::vec::Vec;
+
     validate_user_ptr(ptr, max_len)?;
-    
-    // Safety: We've validated the pointer is in user space
-    let slice = unsafe {
-        core::slice::from_raw_parts(ptr as *const u8, max_len as usize)
-    };
-    
-    // Find null terminator or use max_len
-    let len = slice.iter()
-        .position(|&b| b == 0)
-        .unwrap_or(max_len as usize);
-    
+
+    // Read with SMAP bypass
+    let data = with_user_access(|| {
+        // Safety: We've validated the pointer is in user space
+        let slice = unsafe {
+            core::slice::from_raw_parts(ptr as *const u8, max_len as usize)
+        };
+
+        // Find null terminator or use max_len
+        let len = slice.iter()
+            .position(|&b| b == 0)
+            .unwrap_or(max_len as usize);
+
+        slice[..len].to_vec()
+    });
+
     // Convert to string, validating UTF-8
-    String::from_utf8(slice[..len].to_vec())
+    String::from_utf8(data)
         .map_err(|_| UserAccessError::InvalidUtf8)
 }
 
@@ -110,15 +160,18 @@ pub fn read_user_string(ptr: u64, max_len: u64) -> Result<alloc::string::String,
 ///
 /// # Safety
 /// This function validates the user pointer but the kernel buffer must be valid.
+/// Uses SMAP bypass (stac/clac) to access user memory.
 pub fn copy_from_user(user_ptr: u64, kernel_buf: &mut [u8]) -> Result<(), UserAccessError> {
     validate_user_ptr(user_ptr, kernel_buf.len() as u64)?;
-    
-    // Safety: We've validated the user pointer
-    let user_slice = unsafe {
-        core::slice::from_raw_parts(user_ptr as *const u8, kernel_buf.len())
-    };
-    
-    kernel_buf.copy_from_slice(user_slice);
+
+    with_user_access(|| {
+        // Safety: We've validated the user pointer
+        let user_slice = unsafe {
+            core::slice::from_raw_parts(user_ptr as *const u8, kernel_buf.len())
+        };
+        kernel_buf.copy_from_slice(user_slice);
+    });
+
     Ok(())
 }
 
@@ -134,15 +187,18 @@ pub fn copy_from_user(user_ptr: u64, kernel_buf: &mut [u8]) -> Result<(), UserAc
 ///
 /// # Safety
 /// This function validates the user pointer but the kernel buffer must be valid.
+/// Uses SMAP bypass (stac/clac) to access user memory.
 pub fn copy_to_user(kernel_buf: &[u8], user_ptr: u64) -> Result<(), UserAccessError> {
     validate_user_ptr(user_ptr, kernel_buf.len() as u64)?;
-    
-    // Safety: We've validated the user pointer
-    let user_slice = unsafe {
-        core::slice::from_raw_parts_mut(user_ptr as *mut u8, kernel_buf.len())
-    };
-    
-    user_slice.copy_from_slice(kernel_buf);
+
+    with_user_access(|| {
+        // Safety: We've validated the user pointer
+        let user_slice = unsafe {
+            core::slice::from_raw_parts_mut(user_ptr as *mut u8, kernel_buf.len())
+        };
+        user_slice.copy_from_slice(kernel_buf);
+    });
+
     Ok(())
 }
 
